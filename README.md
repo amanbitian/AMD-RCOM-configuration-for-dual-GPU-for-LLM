@@ -17,6 +17,22 @@ This repo was built by extracting the good dual-GPU ideas from:
 
 and turning them into a cleaner, config-driven service layer.
 
+## Screenshots
+
+The web app ([app.py](app.py)) gives you a full local console for loading, chatting with, and comparing models across both GPUs — see [How It Works](#how-it-works) below for what is happening behind each view.
+
+**Performance overview** — total runs, tokens processed, prompt-processing (prefill) vs. token-generation (decode) throughput per model, resource peaks, and 14-day activity, all aggregated live from every run's telemetry.
+
+![Overview dashboard showing per-model prompt processing and token generation throughput](docs/screenshots/overview.png)
+
+**Chat / compare workspace** — deploy one model split across both GPUs, two independent models (one per GPU), or a single model on one GPU, then send a prompt and watch both answers, token counts, and speeds side by side.
+
+![Chat workspace running Qwen3.5-4B on the R9700 and gemma-3-270m on the 9070 XT at the same time](docs/screenshots/chat.png)
+
+**Run history** — every prompt, output, token count, timing, and VRAM/RAM sample is persisted to SQLite and searchable afterward.
+
+![Run history table with per-run prefill/decode throughput and resource columns](docs/screenshots/run-history.png)
+
 ## What This Project Does
 
 This project does not evaluate models by itself.
@@ -58,6 +74,35 @@ So if another application wants to use this service, it should either:
 
 The current version already supports the first two very well.
 
+## How It Works
+
+There are two ways to drive this repo. Both end up going through the same GPU-discovery and `llama-server` lifecycle code, they just expose it differently.
+
+### 1. Batch orchestration (the `dual-gpu` CLI)
+
+1. [config.py](dual_gpu_setup/config.py) loads and validates your TOML file — lanes, models, tasks, and policy defaults (context sizes, VRAM safety fraction, flash attention, etc).
+2. [lmstudio.py](dual_gpu_setup/lmstudio.py) asks the LM Studio runtime for its device list and matches each configured lane (`match = "R9700"`, `match = "9070 XT"`) to a physical `ROCm` device id.
+3. [orchestrator.py](dual_gpu_setup/orchestrator.py) sorts the model queue by size and drains it from both ends at once: the large GPU keeps pulling the biggest model that still fits while the small GPU keeps pulling the smallest, so neither card sits idle waiting on the other's long-running model (see [How Scheduling Works](#how-scheduling-works)).
+4. For each model, [server.py](dual_gpu_setup/server.py) launches `llama-server.exe` pinned to that GPU's device id, polls its health endpoint until it is ready, and watches memory to flag VRAM spill into shared/system memory.
+5. [tasks.py](dual_gpu_setup/tasks.py) runs your configured command(s) against that model's local OpenAI-compatible endpoint, substituting placeholders like `{base_url}` and `{model_name}` and injecting the `DGPU_*` environment variables.
+6. The server is stopped and the next model in the queue loads. Models marked `multi_gpu = true` are held back and run last, spanning both lanes in a single `llama-server` process.
+7. Everything lands in a run folder under `log_dir`: `summary.json`, per-model `load.json`, server logs, and task logs.
+
+Use this path for unattended benchmark or eval sweeps where you just want every configured model exercised once and logged.
+
+### 2. Interactive web app (`app.py`)
+
+[app.py](app.py) is a dependency-free local web server (Python's standard-library `http.server` plus SQLite — no extra packages required) that wraps the same discovery and server-launch code in an interactive console, shown in the [screenshots](#screenshots) above:
+
+1. On startup it reads your TOML config and scans LM Studio's settings and model directory for every installed GGUF quantization, then serves a single-page UI plus a small JSON API: `/api/bootstrap`, `/api/deploy`, `/api/chat`, `/api/unload`, `/api/status`, `/api/dashboard`, `/api/runs`.
+2. In the **Chat** view you pick a deployment mode — one model split across both GPUs, two independent models (one per GPU), or one model on a single chosen GPU — and click **Load deployment**. That request reuses `server.py`/`orchestrator.py` to spawn the right `llama-server` process(es), exactly like the CLI would.
+3. Prompts you send are routed to whichever server(s) are active. In "two models" mode the same prompt goes to both GPUs at once, so you can compare answers, speed, and resource use side by side in real time.
+4. Every call records full token accounting (input/output/thinking/cached), timing (prefill tokens/sec, decode tokens/sec, end-to-end latency), and a resource snapshot (process CPU/RAM, dedicated VRAM, shared GPU memory, spill detection) into [chat_runs/chatbot.sqlite3](chat_runs/chatbot.sqlite3).
+5. The **Overview** dashboard aggregates that data live: total runs, tokens processed, prompt-processing vs. token-generation throughput per model, latency percentiles, VRAM/RAM peaks, and a 14-day activity chart.
+6. The **Run history** view lets you search past runs and open any one to inspect the exact prompt, output, native backend response, and every resource sample collected during that call.
+
+Use this path when you want to interactively load models, compare them head to head, and watch GPU behavior as it happens.
+
 ## Architecture
 
 The repo is split into small modules:
@@ -79,7 +124,7 @@ A detailed design is available for adding a persistent chatbot, live monitoring,
 - [Chat, deployment, monitoring, and history UI](F:/Projects/Dual_gpu_setup/docs/UI_SPECIFICATION.md)
 - [Implementation phases and validation plan](F:/Projects/Dual_gpu_setup/docs/IMPLEMENTATION_PLAN.md)
 
-These files are a proposed implementation specification. The current code remains batch-oriented and does not yet include the persistent API, browser UI, conversation database, or continuous telemetry collector described there.
+These files were the original design proposal for that layer. [app.py](app.py) now implements most of it — the local API, browser UI, SQLite run database, and live resource telemetry described in these documents are working today; see [How It Works](#how-it-works) above for the current mechanics. Token-by-token streaming, cancellation, and richer per-physical-GPU charts remain future work (see [Current Limitations](#current-limitations)).
 
 ## Why This Setup Is Useful
 
