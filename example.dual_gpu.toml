@@ -17,6 +17,7 @@ ctx_mid = 32768
 ctx_max = 49152
 ctx_mid_headroom_gb = 5
 ctx_max_headroom_gb = 10
+safety_tokens = 256
 reasoning_mode = "off"
 reasoning_budget = 0
 cache_reuse = 256

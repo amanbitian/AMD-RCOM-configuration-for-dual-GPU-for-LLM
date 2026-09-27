@@ -15,7 +15,7 @@ import uuid
 import webbrowser
 from collections import deque
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,12 +26,54 @@ from urllib.parse import urlparse
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig, load_config
 from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
-from dual_gpu_setup.orchestrator import ctx_for, lane_capacity_gb
-from dual_gpu_setup.server import LlamaServerProcess, gpu_process_metrics
+from dual_gpu_setup.orchestrator import ctx_for, estimate_kv_cache_gb, lane_capacity_gb, resolve_context_window
+from dual_gpu_setup.server import LlamaServerProcess, gpu_process_metrics_batch
 
 
 APP_VERSION = "0.1.0"
 DEFAULT_REASONING_PRESETS = {"off": 0, "low": 1024, "medium": 4096, "high": 8192}
+
+# Documents exactly the fields ChatService already computes (see _normalize_usage,
+# _normalize_timing, _resource_summary) and hands to clients unchanged via /api/chat's
+# response and the client_id delivery file. Served at GET /api/clients/schema.
+CLIENT_METRICS_SCHEMA = {
+    "usage": {
+        "input_tokens": "Prompt tokens sent to the model.",
+        "cached_input_tokens": "Prompt tokens served from KV cache reuse, if reported by the backend.",
+        "uncached_input_tokens": "input_tokens minus cached_input_tokens.",
+        "prefill_tokens": "Tokens processed during the prefill/prompt phase.",
+        "thinking_tokens": "Reasoning/thinking tokens, when the model produced any.",
+        "visible_output_tokens": "output_tokens minus thinking_tokens.",
+        "output_tokens": "Total completion tokens generated.",
+        "total_tokens": "input_tokens + output_tokens as reported by the backend.",
+    },
+    "timing": {
+        "time_to_first_token_ms": "Latency before the first output token.",
+        "prefill_duration_ms": "Wall time spent on the prefill/prompt phase.",
+        "decode_duration_ms": "Wall time spent generating output tokens.",
+        "end_to_end_duration_ms": "Total wall time for the request.",
+        "prefill_tokens_per_second": "Prefill rate: prompt tokens / prefill duration.",
+        "tokens_per_second": "Decode rate: output tokens / decode duration.",
+        "backend_prompt_tokens": "Prompt token count as reported natively by llama-server.",
+        "backend_output_tokens": "Output token count as reported natively by llama-server.",
+        "native_timing": "Raw timings object returned by the backend, unmodified.",
+    },
+    "resources": {
+        "avg_process_cpu_pct": "Average CPU percent of the model process during the run.",
+        "peak_process_cpu_pct": "Peak CPU percent of the model process during the run.",
+        "avg_gpu_utilization_pct": "Average GPU utilization percent during the run.",
+        "peak_gpu_utilization_pct": "Peak GPU utilization percent during the run.",
+        "peak_process_rss_bytes": "Peak resident memory (working set) of the model process.",
+        "peak_process_private_bytes": "Peak committed/private memory (pagefile usage) of the model process.",
+        "process_page_fault_delta": "Page faults incurred by the model process during this run's window.",
+        "peak_dedicated_vram_bytes": "Peak dedicated VRAM used by the model process.",
+        "peak_shared_gpu_memory_bytes": "Peak shared/system GPU memory used (VRAM-spill indicator).",
+        "spill_suspected": "True if shared GPU memory usage suggests VRAM spill.",
+        "avg_system_cpu_pct": "Average whole-system CPU percent during the run.",
+        "peak_system_ram_used_bytes": "Peak whole-system RAM used during the run.",
+        "peak_system_pagefile_used_bytes": "Peak whole-system commit charge (pagefile usage) during the run.",
+    },
+}
 
 
 def utc_now() -> str:
@@ -156,14 +198,17 @@ class ResourceSampler:
         now = time.monotonic()
         with self.manager.lock:
             handles = list(self.manager.handles.items())
+        live = [(target, handle) for target, handle in handles if handle.process.proc is not None]
+        # One PowerShell call for every active server's PID instead of one per server: the
+        # process spawn + Get-Counter cost is what makes this loop expensive, not the counter
+        # lookup itself, so batching is the win regardless of how many servers are active.
+        gpu_by_pid = gpu_process_metrics_batch([handle.process.pid for _, handle in live])
         servers = []
-        for target, handle in handles:
+        for target, handle in live:
             process = handle.process
-            if process.proc is None:
-                continue
             pid = process.pid
             process_metrics = self._process_metrics(pid, now)
-            gpu = gpu_process_metrics(pid)
+            gpu = gpu_by_pid.get(pid)
             servers.append(
                 {
                     "target": target,
@@ -174,6 +219,9 @@ class ResourceSampler:
                     "cpu_pct": process_metrics.get("cpu_pct"),
                     "rss_bytes": process_metrics.get("rss_bytes"),
                     "private_bytes": process_metrics.get("private_bytes"),
+                    "peak_rss_bytes": process_metrics.get("peak_rss_bytes"),
+                    "peak_private_bytes": process_metrics.get("peak_private_bytes"),
+                    "page_fault_count": process_metrics.get("page_fault_count"),
                     "gpu_utilization_pct": gpu.get("utilization_pct") if gpu else None,
                     "dedicated_vram_bytes": int(gpu["dedicated_gb"] * 1024**3) if gpu else None,
                     "shared_gpu_memory_bytes": int(gpu["shared_gb"] * 1024**3) if gpu else None,
@@ -221,6 +269,9 @@ class ResourceSampler:
                 "cpu_pct": round(cpu_pct, 2) if cpu_pct is not None else None,
                 "rss_bytes": int(counters.working_set_size) if memory_ok else None,
                 "private_bytes": int(counters.pagefile_usage) if memory_ok else None,
+                "peak_rss_bytes": int(counters.peak_working_set_size) if memory_ok else None,
+                "peak_private_bytes": int(counters.peak_pagefile_usage) if memory_ok else None,
+                "page_fault_count": int(counters.page_fault_count) if memory_ok else None,
             }
         finally:
             kernel32.CloseHandle(handle)
@@ -249,6 +300,7 @@ class ResourceSampler:
             "ram_used_bytes": int(memory.total_physical - memory.available_physical) if memory_ok else None,
             "ram_used_pct": float(memory.memory_load) if memory_ok else None,
             "pagefile_used_bytes": int(memory.total_page_file - memory.available_page_file) if memory_ok else None,
+            "pagefile_total_bytes": int(memory.total_page_file) if memory_ok else None,
         }
 
 
@@ -316,6 +368,14 @@ class RunStore:
                     sample_json TEXT NOT NULL,
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS clients (
+                    id TEXT PRIMARY KEY,
+                    project_name TEXT NOT NULL,
+                    github_repo TEXT,
+                    output_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_comparison_id ON runs(comparison_id);
                 CREATE INDEX IF NOT EXISTS idx_metric_samples_run_id ON metric_samples(run_id, id);
@@ -330,11 +390,15 @@ class RunStore:
                 "reasoning_budget": "INTEGER",
                 "configuration_json": "TEXT",
                 "finish_reason": "TEXT",
+                "client_id": "TEXT",
+                "task_label": "TEXT",
             }
             for name, data_type in migrations.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {data_type}")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_deployment_id ON runs(deployment_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_client_id ON runs(client_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_label ON runs(task_label)")
 
     def begin_deployment(self, deployment_id: str, mode: str, profile: dict[str, Any]) -> None:
         with self.lock, self.connect() as connection:
@@ -382,8 +446,8 @@ class RunStore:
                 INSERT INTO runs (
                     id, comparison_id, deployment_id, created_at, status, mode, target,
                     model_name, model_path, lane_keys_json, device_json, context_window,
-                    reasoning_budget, request_json, configuration_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reasoning_budget, request_json, configuration_json, client_id, task_label
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -401,6 +465,8 @@ class RunStore:
                     record.get("reasoning_budget"),
                     json.dumps(record["request"], ensure_ascii=False),
                     json.dumps(record.get("configuration"), ensure_ascii=False),
+                    record.get("client_id"),
+                    record.get("task_label"),
                 ),
             )
 
@@ -451,6 +517,58 @@ class RunStore:
                 """,
                 rows,
             )
+
+    def register_client(self, project_name: str, github_repo: str | None, output_path: str) -> dict[str, Any]:
+        client_id = str(uuid.uuid4())
+        created_at = utc_now()
+        with self.lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO clients (id, project_name, github_repo, output_path, created_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (client_id, project_name, github_repo, output_path, created_at, created_at),
+            )
+        return {
+            "client_id": client_id,
+            "project_name": project_name,
+            "github_repo": github_repo,
+            "output_path": output_path,
+            "created_at": created_at,
+        }
+
+    def get_client(self, client_id: str) -> dict[str, Any] | None:
+        with self.lock, self.connect() as connection:
+            row = connection.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+        return dict(row) if row else None
+
+    def touch_client(self, client_id: str) -> None:
+        with self.lock, self.connect() as connection:
+            connection.execute("UPDATE clients SET last_seen_at = ? WHERE id = ?", (utc_now(), client_id))
+
+    def runs_for_client(self, client_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 500))
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runs WHERE client_id = ? ORDER BY created_at DESC LIMIT ?",
+                (client_id, limit),
+            ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def prune_older_than(self, days: int) -> dict[str, Any]:
+        """Delete runs (and their metric_samples, via ON DELETE CASCADE) and deployments
+        older than `days`. Opt-in only -- nothing calls this unless the operator passes
+        --prune-older-than-days, so the default stays "keep everything forever". There is
+        no automatic retention policy otherwise: this database grows without bound."""
+        if days <= 0:
+            raise ValueError("days must be positive.")
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="milliseconds")
+        with self.lock, self.connect() as connection:
+            deleted_runs = connection.execute("DELETE FROM runs WHERE created_at < ?", (cutoff,)).rowcount
+            deleted_deployments = connection.execute(
+                "DELETE FROM deployments WHERE created_at < ?", (cutoff,)
+            ).rowcount
+        return {"cutoff": cutoff, "deleted_runs": deleted_runs, "deleted_deployments": deleted_deployments}
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
@@ -506,29 +624,50 @@ class RunStore:
             return round(values[index], 2)
 
         completed = [run for run in runs if run.get("status") == "completed"]
+
+        def summarize(group: list[dict[str, Any]]) -> dict[str, Any]:
+            group_completed = [run for run in group if run.get("status") == "completed"]
+            return {
+                "runs": len(group),
+                "success_rate": round(len(group_completed) / len(group) * 100, 1) if group else None,
+                "input_tokens": total(("usage", "input_tokens"), group),
+                "output_tokens": total(("usage", "output_tokens"), group),
+                "thinking_tokens": total(("usage", "thinking_tokens"), group),
+                "avg_tokens_per_second": average(("timing", "tokens_per_second"), group_completed),
+                "avg_prefill_tokens_per_second": average(
+                    ("timing", "prefill_tokens_per_second"), group_completed
+                ),
+                "avg_latency_ms": average(("timing", "end_to_end_duration_ms"), group_completed),
+                "avg_gpu_utilization_pct": average(
+                    ("resources", "avg_gpu_utilization_pct"), group_completed
+                ),
+                "peak_vram_bytes": max(nums(("resources", "peak_dedicated_vram_bytes"), group) or [0]),
+            }
+
         models: list[dict[str, Any]] = []
         for model_name in sorted({run["model_name"] for run in runs}):
             group = [run for run in runs if run["model_name"] == model_name]
-            group_completed = [run for run in group if run.get("status") == "completed"]
-            models.append(
-                {
-                    "model": model_name,
-                    "runs": len(group),
-                    "success_rate": round(len(group_completed) / len(group) * 100, 1),
-                    "input_tokens": total(("usage", "input_tokens"), group),
-                    "output_tokens": total(("usage", "output_tokens"), group),
-                    "thinking_tokens": total(("usage", "thinking_tokens"), group),
-                    "avg_tokens_per_second": average(("timing", "tokens_per_second"), group_completed),
-                    "avg_prefill_tokens_per_second": average(
-                        ("timing", "prefill_tokens_per_second"), group_completed
-                    ),
-                    "avg_latency_ms": average(("timing", "end_to_end_duration_ms"), group_completed),
-                    "avg_gpu_utilization_pct": average(
-                        ("resources", "avg_gpu_utilization_pct"), group_completed
-                    ),
-                    "peak_vram_bytes": max(nums(("resources", "peak_dedicated_vram_bytes"), group) or [0]),
-                }
-            )
+            models.append({"model": model_name, **summarize(group)})
+
+        # task_label is optional, freeform metadata a caller passes to /api/chat (see
+        # CLIENT_API.md) to tag what kind of work a call was -- e.g. "relevance",
+        # "resume_extraction", "fraud_d2_fusion". Runs that never set it are left out of
+        # these two breakdowns (they still count in `models` and the overall `summary`).
+        labeled_runs = [run for run in runs if run.get("task_label")]
+        categories: list[dict[str, Any]] = []
+        for label in sorted({run["task_label"] for run in labeled_runs}):
+            group = [run for run in labeled_runs if run["task_label"] == label]
+            categories.append({"category": label, **summarize(group)})
+
+        category_models: list[dict[str, Any]] = []
+        pairs = sorted({(run["task_label"], run["model_name"]) for run in labeled_runs})
+        for label, model_name in pairs:
+            group = [
+                run for run in labeled_runs
+                if run["task_label"] == label and run["model_name"] == model_name
+            ]
+            category_models.append({"category": label, "model": model_name, **summarize(group)})
+
         daily: dict[str, dict[str, Any]] = {}
         for run in reversed(runs):
             day = str(run.get("created_at", ""))[:10]
@@ -574,6 +713,8 @@ class RunStore:
                 ),
             },
             "models": models,
+            "categories": categories,
+            "category_models": category_models,
             "daily": list(daily.values())[-14:],
             "recent_runs": runs[:20],
         }
@@ -956,6 +1097,15 @@ class DeploymentManager:
         context = int(raw.get("context_window") or source.ctx_size or ctx_for(self.config, model_size_gb(self.config, source), lane_vram_gb))
         if context < 256:
             raise AppError("Context window must be at least 256 tokens.")
+        input_tokens = raw.get("input_tokens")
+        max_output_tokens = raw.get("max_output_tokens")
+        if input_tokens is not None or max_output_tokens is not None:
+            if input_tokens is None or max_output_tokens is None:
+                raise AppError("input_tokens and max_output_tokens must be provided together.")
+            try:
+                context = resolve_context_window(self.config, context, int(input_tokens), int(max_output_tokens))
+            except ValueError as exc:
+                raise AppError(str(exc)) from exc
         budget = int(raw.get("reasoning_budget", source.reasoning_budget if source.reasoning_budget is not None else self.config.policy.reasoning_budget))
         if budget < 0:
             raise AppError("Reasoning budget cannot be negative.")
@@ -973,13 +1123,14 @@ class DeploymentManager:
             backends = {lane.backend for lane in self.config.lanes}
             if len(backends) != 1:
                 raise AppError("Both lanes must use the same backend for multi-GPU mode.")
+            self._validate_capacity(model, list(self.config.lanes))
             return [{"target": "primary", "model": model, "lanes": list(self.config.lanes), "context": context, "multi": True}]
 
         if mode == "single_gpu":
             raw = profile.get("model") or {}
             lane = self._lane(str(raw.get("lane", "")))
             model, context = self._configured_model(raw, lane.vram_gb)
-            self._validate_single_fit(model, lane)
+            self._validate_capacity(model, [lane])
             return [{"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False}]
 
         raw_models = profile.get("models") or []
@@ -993,19 +1144,75 @@ class DeploymentManager:
                 raise AppError("Parallel mode must use two different lanes.")
             seen_lanes.add(lane.key)
             model, context = self._configured_model(raw, lane.vram_gb)
-            self._validate_single_fit(model, lane)
+            self._validate_capacity(model, [lane])
             specs.append({"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False})
         return specs
 
-    def _validate_single_fit(self, model: ModelConfig, lane: LaneConfig) -> None:
+    def _validate_capacity(self, model: ModelConfig, lanes: list[LaneConfig]) -> None:
+        """Check the model actually fits the lane(s) it's headed for: file size always,
+        plus a best-effort KV-cache estimate for the requested context when the model's
+        GGUF metadata is one we're confident reading (see estimate_kv_cache_gb) -- this is
+        the check that was missing for context sizes bumped up by input_tokens/
+        max_output_tokens or requested explicitly, and was never run at all for
+        single_large_model deploys before this."""
         size = model_size_gb(self.config, model)
-        if model.pin_lane and model.pin_lane != lane.key:
-            raise AppError(f"{model.name} is pinned to lane {model.pin_lane}, not {lane.key}.")
-        if size > lane_capacity_gb(self.config, lane):
+        if len(lanes) == 1 and model.pin_lane and model.pin_lane != lanes[0].key:
+            raise AppError(f"{model.name} is pinned to lane {model.pin_lane}, not {lanes[0].key}.")
+        capacity = sum(lane_capacity_gb(self.config, lane) for lane in lanes)
+        lane_label = "+".join(lane.key for lane in lanes)
+        if size > capacity:
             raise AppError(
-                f"{model.name} is {size:.2f} GB but {lane.key} has a safe model-file budget of "
-                f"{lane_capacity_gb(self.config, lane):.2f} GB. Choose another GPU/model or multi-GPU mode."
+                f"{model.name} is {size:.2f} GB but {lane_label} has a safe model-file budget of "
+                f"{capacity:.2f} GB. Choose another GPU/model or multi-GPU mode."
             )
+        path = resolve_model_path(self.config, model)
+        kv_gb, _note = estimate_kv_cache_gb(path, model.ctx_size)
+        if kv_gb is None:
+            return
+        total = size + kv_gb
+        if total > capacity:
+            raise AppError(
+                f"{model.name} needs an estimated {total:.2f} GB ({size:.2f} GB model file + "
+                f"~{kv_gb:.2f} GB KV cache at {model.ctx_size} context tokens) but {lane_label} "
+                f"has a safe budget of {capacity:.2f} GB. Lower the context window, choose another "
+                "GPU, or use multi-GPU mode."
+            )
+
+    def _auto_lane_for_model(self, model: ModelConfig) -> LaneConfig:
+        """Pick a lane for a client that didn't specify one: the smallest lane the model fits in,
+        so the largest lane stays free for other work. Falls back to the smallest lane so the
+        capacity-error message from _validate_capacity stays clear when nothing fits."""
+        if model.pin_lane:
+            return self._lane(model.pin_lane)
+        candidates = sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        size = model_size_gb(self.config, model)
+        for lane in candidates:
+            if size <= lane_capacity_gb(self.config, lane):
+                return lane
+        return candidates[0]
+
+    def deploy_for_client(
+        self,
+        model_name: str,
+        gpu: str | None,
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Client-facing deploy: resolves a lane automatically when gpu is omitted, then delegates
+        to deploy() so the feasibility verdict (fit/pin/context checks) is identical to the UI's.
+        When the client reports its real input/output token budget, the allocated context window
+        is sized to fit it (see resolve_context_window) instead of trusting a guessed default."""
+        model = self._model(model_name)
+        lane = self._lane(gpu) if gpu else self._auto_lane_for_model(model)
+        raw: dict[str, Any] = {"model": model_name, "lane": lane.key}
+        if context_window is not None:
+            raw["context_window"] = context_window
+        if input_tokens is not None:
+            raw["input_tokens"] = input_tokens
+        if max_output_tokens is not None:
+            raw["max_output_tokens"] = max_output_tokens
+        return self.deploy({"mode": "single_gpu", "model": raw})
 
     def _make_process(self, spec: dict[str, Any], run_dir: Path) -> LlamaServerProcess:
         model = spec["model"]
@@ -1023,8 +1230,20 @@ class ChatService:
     def __init__(self, manager: DeploymentManager, store: RunStore):
         self.manager = manager
         self.store = store
+        self._client_output_lock = threading.Lock()
 
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client: dict[str, Any] | None = None
+        client_id = payload.get("client_id")
+        if client_id:
+            client = self.store.get_client(str(client_id))
+            if client is None:
+                raise AppError(f"Unknown client_id: {client_id}", HTTPStatus.NOT_FOUND)
+            self.store.touch_client(client["id"])
+        task_label = payload.get("task_label")
+        # Normalized (lowercase + stripped) so "Resume_Extraction" and "resume_extraction"
+        # land in the same dashboard category instead of silently fragmenting into two.
+        task_label = str(task_label).strip().lower() or None if task_label else None
         with self.manager.lock:
             if self.manager.state != "ready" or not self.manager.handles:
                 raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
@@ -1053,7 +1272,7 @@ class ChatService:
         threads = []
 
         def run(target: str, handle: ServerHandle) -> None:
-            results[target] = self._run_one(target, handle, messages, payload, comparison_id)
+            results[target] = self._run_one(target, handle, messages, payload, comparison_id, client, task_label)
 
         for target, handle in handles.items():
             thread = threading.Thread(target=run, args=(target, handle), daemon=True)
@@ -1070,6 +1289,8 @@ class ChatService:
         messages: list[dict[str, Any]],
         payload: dict[str, Any],
         comparison_id: str | None,
+        client: dict[str, Any] | None = None,
+        task_label: str | None = None,
     ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         request_payload: dict[str, Any] = {
@@ -1129,6 +1350,8 @@ class ChatService:
                 "reasoning_budget": handle.model.reasoning_budget,
                 "request": request_payload,
                 "configuration": configuration,
+                "client_id": client["id"] if client else None,
+                "task_label": task_label,
             }
         )
         baseline = self.manager.sampler.capture()
@@ -1161,7 +1384,11 @@ class ChatService:
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
-            return {"run_id": run_id, "model": handle.model.name, **final, "backend_response": None}
+            delivery = self._deliver_to_client(client, run_id, target, handle, final)
+            result = {"run_id": run_id, "model": handle.model.name, **final, "backend_response": None}
+            if delivery is not None:
+                result["client_delivery"] = delivery
+            return result
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - started
             self.manager.sampler.capture()
@@ -1179,7 +1406,49 @@ class ChatService:
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
-            return {"run_id": run_id, "model": handle.model.name, **final}
+            delivery = self._deliver_to_client(client, run_id, target, handle, final)
+            result = {"run_id": run_id, "model": handle.model.name, **final}
+            if delivery is not None:
+                result["client_delivery"] = delivery
+            return result
+
+    def _deliver_to_client(
+        self,
+        client: dict[str, Any] | None,
+        run_id: str,
+        target: str,
+        handle: ServerHandle,
+        final: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Append this run's metrics as a JSON line to the client's own output_path, so a
+        consuming codebase gets its own durable copy of the performance data alongside the
+        response. Never fails the chat call itself if the client's path can't be written."""
+        if client is None:
+            return None
+        record = {
+            "run_id": run_id,
+            "client_id": client["id"],
+            "project_name": client["project_name"],
+            "github_repo": client.get("github_repo"),
+            "recorded_at": utc_now(),
+            "target": target,
+            "model": handle.model.name,
+            "device": handle.process.device,
+            "context_window": handle.process.ctx_size,
+            "status": final.get("status"),
+            "usage": final.get("usage"),
+            "timing": final.get("timing"),
+            "resources": final.get("resources"),
+            "error_text": final.get("error_text"),
+        }
+        output_path = Path(client["output_path"]).expanduser()
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._client_output_lock, output_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            return {"written": False, "path": str(output_path), "error": str(exc)}
+        return {"written": True, "path": str(output_path)}
 
     def _sample_window(self, started: float, baseline: dict[str, Any] | None) -> list[dict[str, Any]]:
         samples = self.manager.sampler.since(started)
@@ -1274,10 +1543,13 @@ class ChatService:
         cpu = values(process_rows, "cpu_pct")
         gpu_utilization = values(process_rows, "gpu_utilization_pct")
         rss = values(process_rows, "rss_bytes")
+        private = values(process_rows, "private_bytes")
         dedicated = values(process_rows, "dedicated_vram_bytes")
         shared = values(process_rows, "shared_gpu_memory_bytes")
+        page_faults = values(process_rows, "page_fault_count")
         system_cpu = values(system_rows, "cpu_pct")
         ram = values(system_rows, "ram_used_bytes")
+        pagefile = values(system_rows, "pagefile_used_bytes")
         spill = bool(shared and dedicated and max(shared) > 1024**3 and max(shared) > max(dedicated) * 0.15)
         return {
             "sample_count": len(process_rows),
@@ -1286,11 +1558,16 @@ class ChatService:
             "avg_gpu_utilization_pct": average(gpu_utilization),
             "peak_gpu_utilization_pct": max(gpu_utilization) if gpu_utilization else None,
             "peak_process_rss_bytes": int(max(rss)) if rss else None,
+            "peak_process_private_bytes": int(max(private)) if private else None,
+            # page_fault_count is a cumulative counter since process start; the delta across
+            # this run's window is what's actually informative (memory pressure during THIS run).
+            "process_page_fault_delta": int(page_faults[-1] - page_faults[0]) if len(page_faults) >= 2 else None,
             "peak_dedicated_vram_bytes": int(max(dedicated)) if dedicated else None,
             "peak_shared_gpu_memory_bytes": int(max(shared)) if shared else None,
             "spill_suspected": spill if shared and dedicated else None,
             "avg_system_cpu_pct": average(system_cpu),
             "peak_system_ram_used_bytes": int(max(ram)) if ram else None,
+            "peak_system_pagefile_used_bytes": int(max(pagefile)) if pagefile else None,
             "samples_started_at": samples[0].get("sampled_at") if samples else None,
             "samples_finished_at": samples[-1].get("sampled_at") if samples else None,
         }
@@ -1322,6 +1599,17 @@ class ApplicationState:
             "status": self.manager.status(),
             "runs": self.store.recent(20),
         }
+
+    def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_name = str(payload.get("project_name") or "").strip()
+        if not project_name:
+            raise AppError("project_name is required.")
+        output_path = str(payload.get("output_path") or "").strip()
+        if not output_path:
+            raise AppError("output_path is required (where run metrics will be appended as JSON lines).")
+        github_repo = payload.get("github_repo")
+        github_repo = str(github_repo).strip() or None if github_repo else None
+        return self.store.register_client(project_name, github_repo, output_path)
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -1356,6 +1644,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(HTTPStatus.OK, run)
             return
+        if path == "/api/clients/schema":
+            self._send_json(HTTPStatus.OK, CLIENT_METRICS_SCHEMA)
+            return
+        if path.startswith("/api/clients/") and path.endswith("/runs"):
+            client_id = path.split("/")[3]
+            self._send_json(HTTPStatus.OK, {"runs": self.server.app_state.store.runs_for_client(client_id)})
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1371,6 +1666,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = self.server.app_state.manager.unload()
             elif path == "/api/chat":
                 result = self.server.app_state.chat.chat(payload)
+            elif path == "/api/clients/register":
+                result = self.server.app_state.register_client(payload)
+            elif path == "/api/clients/deploy":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.deploy_for_client(
+                    str(payload.get("model", "")),
+                    str(payload["gpu"]) if payload.get("gpu") else None,
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
@@ -1527,6 +1835,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", default="./chat_runs", help="Directory for SQLite data and server logs.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the UI in the default browser.")
     parser.add_argument("--check", action="store_true", help="Validate configuration and storage, then exit.")
+    parser.add_argument(
+        "--prune-older-than-days",
+        type=int,
+        default=None,
+        help=(
+            "One-shot maintenance: delete runs (and their resource samples) older than "
+            "this many days, then continue starting normally. There is no automatic "
+            "retention policy otherwise -- the run database keeps everything forever "
+            "unless this is passed."
+        ),
+    )
     return parser
 
 
@@ -1537,6 +1856,12 @@ def main() -> int:
     if not data_dir.is_absolute():
         data_dir = (config_path.parent / data_dir).resolve()
     state = ApplicationState(config_path, data_dir)
+    if args.prune_older_than_days is not None:
+        result = state.store.prune_older_than(args.prune_older_than_days)
+        print(
+            f"Pruned {result['deleted_runs']} run(s) and {result['deleted_deployments']} "
+            f"deployment(s) older than {result['cutoff']}."
+        )
     if args.check:
         print(json.dumps({"status": "ok", "config": str(config_path), "data_dir": str(data_dir)}, indent=2))
         state.manager.shutdown()

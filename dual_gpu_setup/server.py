@@ -63,18 +63,35 @@ def _wait_port_free(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def gpu_process_metrics(pid: int) -> dict[str, float] | None:
+def gpu_process_metrics_batch(pids: list[int]) -> dict[int, dict[str, float]]:
+    """Read GPU dedicated/shared memory and utilization for several PIDs in one PowerShell
+    invocation. Get-Counter's PDH counter-set resolution is the dominant cost here (multiple
+    seconds cold), roughly halved by requesting all three counter paths in a single Get-Counter
+    call instead of three, and only paid once per tick by collapsing N per-server calls (the
+    resource sampler and every chat request's before/after capture) into one per sampling tick.
+
+    Instance names look like 'pid_1234_luid_...' -- the filter anchors on the trailing
+    underscore so pid 123 can't accidentally match an instance for pid 1234."""
+    unique_pids = sorted(set(pids))
+    if not unique_pids:
+        return {}
+    pid_array = ",".join(str(pid) for pid in unique_pids)
     script = (
-        "$d=(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' -EA SilentlyContinue)"
-        f".CounterSamples | Where-Object {{$_.InstanceName -like 'pid_{pid}*'}} | "
-        "Measure-Object CookedValue -Sum; "
-        "$s=(Get-Counter '\\GPU Process Memory(*)\\Shared Usage' -EA SilentlyContinue)"
-        f".CounterSamples | Where-Object {{$_.InstanceName -like 'pid_{pid}*'}} | "
-        "Measure-Object CookedValue -Sum; "
-        "$u=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -EA SilentlyContinue)"
-        f".CounterSamples | Where-Object {{$_.InstanceName -like 'pid_{pid}*'}} | "
-        "Measure-Object CookedValue -Sum; "
-        "Write-Output \"$([double]$d.Sum) $([double]$s.Sum) $([double]$u.Sum)\""
+        f"$targets=@({pid_array}); "
+        "$samples=(Get-Counter -Counter @("
+        "'\\GPU Process Memory(*)\\Dedicated Usage',"
+        "'\\GPU Process Memory(*)\\Shared Usage',"
+        "'\\GPU Engine(*)\\Utilization Percentage'"
+        ") -EA SilentlyContinue).CounterSamples; "
+        "$d=$samples | Where-Object {$_.Path -like '*dedicated usage'}; "
+        "$s=$samples | Where-Object {$_.Path -like '*shared usage'}; "
+        "$u=$samples | Where-Object {$_.Path -like '*utilization percentage'}; "
+        "foreach ($targetPid in $targets) { "
+        "$pattern=\"pid_${targetPid}_*\"; "
+        "$dd=($d | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
+        "$ss=($s | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
+        "$uu=($u | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
+        "Write-Output \"$targetPid $([double]$dd) $([double]$ss) $([double]$uu)\" }"
     )
     try:
         output = subprocess.run(
@@ -82,19 +99,28 @@ def gpu_process_metrics(pid: int) -> dict[str, float] | None:
             capture_output=True,
             text=True,
             timeout=30,
-        ).stdout.split()
+        ).stdout
     except (OSError, subprocess.SubprocessError):
-        return None
-    if len(output) < 3:
-        return None
-    try:
-        return {
-            "dedicated_gb": float(output[0]) / 1024**3,
-            "shared_gb": float(output[1]) / 1024**3,
-            "utilization_pct": max(0.0, min(100.0, float(output[2]))),
+        return {}
+    results: dict[int, dict[str, float]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        try:
+            pid, dedicated, shared, utilization = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+        except ValueError:
+            continue
+        results[pid] = {
+            "dedicated_gb": dedicated / 1024**3,
+            "shared_gb": shared / 1024**3,
+            "utilization_pct": max(0.0, min(100.0, utilization)),
         }
-    except ValueError:
-        return None
+    return results
+
+
+def gpu_process_metrics(pid: int) -> dict[str, float] | None:
+    return gpu_process_metrics_batch([pid]).get(pid)
 
 
 def vram_placement(pid: int) -> tuple[float, float] | None:

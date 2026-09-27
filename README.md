@@ -112,8 +112,23 @@ The repo is split into small modules:
 - [dual_gpu_setup/server.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/server.py): starts and stops `llama-server`, checks health, and warns on VRAM spill
 - [dual_gpu_setup/orchestrator.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/orchestrator.py): manages the dual-lane queue and the multi-GPU phase
 - [dual_gpu_setup/tasks.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/tasks.py): runs external tasks against each loaded model
+- [dual_gpu_setup/gguf.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/gguf.py): dependency-free GGUF metadata reader, used to estimate KV-cache VRAM cost at deploy time
 - [dual_gpu_setup/cli.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/cli.py): CLI entrypoint
+- [launch_service.py](F:/Projects/Dual_gpu_setup/launch_service.py): one-shot, on-demand launcher for `app.py` (see [CLIENT_API.md](CLIENT_API.md))
 - [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml): sample config
+
+## Testing
+
+```powershell
+python -m pip install -e ".[dev]"
+pytest
+```
+
+37 tests cover the GGUF reader, the KV-cache estimator and context-window sizing logic, the
+config loader, `RunStore` (migrations, client registration, dashboard aggregation, pruning),
+and the deploy-time capacity check across all three deployment modes. The capacity-check tests
+use synthetic GGUF fixtures ([tests/conftest.py](F:/Projects/Dual_gpu_setup/tests/conftest.py)),
+not real model files, so the suite runs the same anywhere.
 
 ## Chatbot Layer Design
 
@@ -218,6 +233,15 @@ python .\app.py --config .\example.dual_gpu.toml --port 8095 --no-browser
 ```
 
 To deliberately restrict the application to the Windows machine again, pass `--host 127.0.0.1`.
+
+The run database (`chat_runs/chatbot.sqlite3`) keeps every run and resource sample forever by
+default — there's no automatic retention policy. To prune old data, pass
+`--prune-older-than-days N`; this runs once at startup (before serving, or standalone with
+`--check`) and deletes runs and resource samples older than `N` days:
+
+```powershell
+python .\app.py --config .\example.dual_gpu.toml --prune-older-than-days 30 --check
+```
 
 The app provides:
 
@@ -513,6 +537,7 @@ vram_safety_fraction = 0.90
 ctx_min = 16384
 ctx_mid = 32768
 ctx_max = 49152
+safety_tokens = 256
 reasoning_mode = "off"
 reasoning_budget = 0
 cache_reuse = 256
@@ -525,6 +550,9 @@ Important fields:
 
 - `vram_safety_fraction`: only use this fraction of VRAM for placement decisions
 - `ctx_min`, `ctx_mid`, `ctx_max`: context sizes selected from available headroom
+- `safety_tokens`: margin added on top of `input_tokens + max_output_tokens` when a deploy
+  request reports its real token budget (see `resolve_context_window` in
+  `dual_gpu_setup/orchestrator.py`); covers chat-template/tokenizer boundary differences
 - `reasoning_mode`: default `--reasoning` mode
 - `reasoning_budget`: default thinking-token budget
 - `cache_reuse`: llama.cpp prompt cache reuse setting
@@ -776,7 +804,29 @@ const data = await response.json();
 console.log(data);
 ```
 
-### Integration Option 6: Connect from curl or Postman
+### Integration Option 6: Client Integration API (register, get a feasibility verdict, and receive shared metrics)
+
+While [app.py](app.py) is running, another local codebase can skip the dashboard entirely and
+drive it over HTTP: register a project, ask "can you run model X on GPU Y with context Z" and
+get an authoritative load/reject verdict, then run prompts tagged to that client and receive
+full token/timing/resource metrics back — with its own copy appended to a file path it chooses.
+
+See [CLIENT_API.md](CLIENT_API.md) for a walkthrough of that flow (`/api/clients/register`,
+`/api/clients/deploy`, `/api/chat` with `client_id`, `/api/clients/{id}/runs`,
+`/api/clients/schema`), or [API_CONTRACT.md](API_CONTRACT.md) for the exhaustive
+request/response reference — every field this service needs from a caller and every field it
+shares back, for every endpoint it exposes, not just the client-facing ones.
+
+All of that requires `app.py` to already be running. If a client wants to trigger the service
+on demand instead of assuming a human already started it, [launch_service.py](launch_service.py)
+is a one-shot command (not an always-on daemon) that starts it if needed and exits once it's
+healthy:
+
+```powershell
+python launch_service.py --config .\example.dual_gpu.toml
+```
+
+### Integration Option 7: Connect from curl or Postman
 
 ```powershell
 curl http://127.0.0.1:8081/v1/chat/completions `
@@ -914,22 +964,36 @@ Check:
 
 ## Current Limitations
 
-- current CLI is run-oriented, not a persistent serve daemon
 - expects exactly 2 lanes
 - currently optimized for Windows
 - current backend support is focused on LM Studio `rocm` and `vulkan`
-- no built-in scheduler API yet for live external app reservation
+- one active deployment at a time — a new deploy always replaces whatever was previously
+  loaded, whether triggered from the dashboard or the [Client Integration API](CLIENT_API.md)
+- no authentication — the HTTP API (`app.py`) is a local-trust-boundary service; don't bind
+  `--host` beyond `127.0.0.1`/`localhost` without your own network-level access control
+- the KV-cache VRAM feasibility check (see [CHANGELOG.md](CHANGELOG.md)) is best-effort: a
+  hybrid state-space/attention architecture, or a sliding-window architecture whose GGUF
+  doesn't expose a per-layer pattern, falls back to the older file-size-only check rather
+  than a guess it isn't confident in
+- `task_label` categories on the Analytics tab have no fixed enum — it's whatever string a
+  caller passes, normalized to lowercase/stripped
 
 ## Future Extensions
 
 Good next additions would be:
 
-- persistent `serve` mode
-- REST control plane for lane reservation
-- queue API for external apps
 - model tags and filtering in CLI
 - task groups by project type
-- richer run dashboards
+- authentication/access control for the HTTP API, if it ever needs to bind beyond localhost
+- automatic (not just opt-in) data retention once the run database's growth actually becomes
+  a problem in practice
+
+## Changelog
+
+Notable changes, including the Client Integration API and the telemetry/performance fixes to
+the GPU resource sampler, are tracked in [CHANGELOG.md](CHANGELOG.md). For the KV-cache VRAM
+feasibility fix and the other gaps closed on 2026-09-27, [optimised.md](optimised.md) walks
+through how each bug was actually found and confirmed before it was fixed.
 
 ## Summary
 
