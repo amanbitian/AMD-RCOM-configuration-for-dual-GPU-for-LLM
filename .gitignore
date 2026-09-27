@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+chat_runs/
+runs/
+desktop.ini
+*.egg-info/
+build/
+dist/
+.venv/
+venv/

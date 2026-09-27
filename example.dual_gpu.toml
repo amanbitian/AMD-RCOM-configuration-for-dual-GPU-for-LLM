@@ -1,0 +1,74 @@
+[project]
+name = "shared-eval-stack"
+suite_prefix = "dualgpu"
+log_dir = "./runs"
+host = "127.0.0.1"
+cleanup_ports_on_start = true
+start_timeout_seconds = 900
+
+[discovery]
+lmstudio_home = "C:/Users/user/.lmstudio"
+models_dir = "G:/LLM models"
+
+[policy]
+vram_safety_fraction = 0.90
+ctx_min = 16384
+ctx_mid = 32768
+ctx_max = 49152
+ctx_mid_headroom_gb = 5
+ctx_max_headroom_gb = 10
+reasoning_mode = "off"
+reasoning_budget = 0
+cache_reuse = 256
+flash_attn = "auto"
+gpu_layers = 999
+parallel = 1
+no_mmproj = true
+jinja = true
+kill_busy_ports = true
+health_poll_seconds = 1.0
+settle_seconds_after_restart = 2.0
+
+[[lanes]]
+key = "r9700"
+display = "AMD Radeon AI PRO R9700"
+match = "R9700"
+vram_gb = 32
+port = 8081
+backend = "rocm"
+
+[[lanes]]
+key = "9070xt"
+display = "AMD Radeon RX 9070 XT"
+match = "9070 XT"
+vram_gb = 16
+port = 8082
+backend = "rocm"
+
+[[models]]
+name = "gpt-oss-20b-GGUF"
+path = "lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
+size_gb = 12.11
+pin_lane = "r9700"
+parallel = 1
+
+[[models]]
+name = "Qwen3-32B-GGUF"
+path = "lmstudio-community/Qwen3-32B-GGUF/Qwen3-32B-Q4_K_M.gguf"
+size_gb = 19.76
+
+[[models]]
+name = "gpt-oss-120b-GGUF"
+path = "lmstudio-community/gpt-oss-120b-GGUF/gpt-oss-120b-MXFP4-00001-of-00002.gguf"
+size_gb = 59.03
+multi_gpu = true
+tensor_split = "36,12"
+ctx_size = 16384
+extra_args = ["--n-cpu-moe", "20"]
+
+[[tasks]]
+name = "eval"
+cwd = "F:/Projects/LLM_evaluator"
+command = ["py", "benchmark.py", "--base-url", "{base_url}", "--model", "{model_name}", "--suite-id", "{suite_id}"]
+continue_on_error = false
+env = { EVAL_RUN_DIR = "{run_dir}", EVAL_CTX = "{actual_ctx}" }
