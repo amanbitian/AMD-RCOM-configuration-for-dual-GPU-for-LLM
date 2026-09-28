@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 import json
@@ -12,6 +13,15 @@ from urllib import request as urlrequest
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
 from dual_gpu_setup.lmstudio import backend_env, resolve_device, runtime_dir, server_binary
+
+# Every helper process spawned in this module (netstat/tasklist/taskkill/powershell for
+# metrics, the llama-server process itself) is launched without an inherited console --
+# app.py normally runs detached (see launch_service.py), so a plain subprocess.run/Popen on
+# Windows would otherwise allocate and briefly show a brand-new console window for EACH call.
+# gpu_process_metrics_batch alone runs every ResourceSampler tick (every 2s, for the whole
+# life of the process -- see app.py's ResourceSampler), so without this flag that's a new
+# console window popping up every 2 seconds, forever.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -27,6 +37,7 @@ def _pid_listening_on(port: int) -> int | None:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -48,6 +59,7 @@ def _is_llama_server(pid: int) -> bool:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return False
@@ -99,6 +111,7 @@ def gpu_process_metrics_batch(pids: list[int]) -> dict[int, dict[str, float]]:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -247,7 +260,8 @@ class LlamaServerProcess:
             return
         if not _is_llama_server(pid):
             raise RuntimeError(f"Port {port} is held by PID {pid}, which is not llama-server.exe.")
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True, timeout=30)
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True, timeout=30,
+                        creationflags=_NO_WINDOW)
         _wait_port_free(port, timeout=30)
 
     def build_command(self) -> list[str]:
@@ -315,6 +329,7 @@ class LlamaServerProcess:
             stderr=subprocess.STDOUT,
             env=backend_env(self.config, self.backend),
             cwd=str(runtime_dir(self.config, self.backend)),
+            creationflags=_NO_WINDOW,
         )
 
         deadline = time.time() + self.config.project.start_timeout_seconds
@@ -359,6 +374,7 @@ class LlamaServerProcess:
                     capture_output=True,
                     text=True,
                     timeout=30,
+                    creationflags=_NO_WINDOW,
                 )
                 try:
                     self.proc.wait(timeout=30)

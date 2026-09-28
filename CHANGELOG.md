@@ -1,5 +1,75 @@
 # Changelog
 
+## 2026-09-28 — `deploy_lane` now honors the documented join key, and the client docs cover the queue
+
+Found by auditing this repo against the first client that actually built the two-queue scheduler
+`deploy_lane` was added for (`talent-llm-eval`'s `main.py`).
+
+### Fixed — `profile.models[]` silently stopped echoing caller strings after a lane replace
+
+`deploy()` stores the caller's own raw profile as `active_profile`, so `profile.models[].model` is
+the exact string the caller requested — which both `API_CONTRACT.md` and `CLIENT_API.md` document
+in bold as the *only* reliable join key for matching your requested models back to lanes
+(`servers[].model` is the resolved short display name and never matches a catalog id).
+`deploy_lane_for_client` instead rebuilt `active_profile` from its live handles using
+`ServerHandle.model.name` — the resolved short name — so the documented join key was wrong for
+exactly the endpoint the documented multi-model scheduler depends on. A client following the docs
+would match nothing, with no error.
+
+Fixed with `DeploymentManager._requested_model_names_by_lane()`: a lane replacement now carries
+this call's own `model` string for the lane it replaces, and forwards the previously recorded
+request strings for the lanes it preserves. A lane whose request string was never recorded (a
+direct `/api/deploy` that omitted `lane`) still falls back to the resolved name for that entry.
+Three regression tests in `tests/test_lane_policy.py` cover the replaced lane, the preserved lane,
+and the fallback.
+
+### Fixed — `API_CONTRACT.md` documented error codes `check_fit` never returns
+
+The `check_fit` entry claimed `400` for an unknown model/lane and `409` while a deployment change
+was in flight. Neither happens: the endpoint takes no deployment lock (so never `409`), and its
+own `except AppError` converts unknown lanes, unknown models, missing model files, unpaired
+`input_tokens`/`max_output_tokens` and sub-256 contexts into `{"fits": false, "reason": ...}` at
+`200`. The section also contradicted itself two paragraphs later. Rewritten to describe the real
+behavior, including the consequence worth designing around: a typo'd `lane` returns `fits: false`
+for every model tested, which is indistinguishable from a real "nothing fits this GPU" verdict.
+
+### Documented — the independent per-lane queue, end to end
+
+`check_fit` was absent from `CLIENT_API.md` entirely and `deploy_lane` had a single trailing
+sentence, so the walkthrough described no way to keep both GPUs busy across a batch — the whole
+point of both endpoints. Added step 1b (plan placement with `check_fit` before loading anything,
+and the lane-key trap above) and step 2c (the full sequence: register once, bucket the list, start
+each lane with `deploy_lane`, one pinned worker thread per lane, re-`deploy_lane` as each lane
+frees up). Also newly documented: `deploy_lane` works from an idle service, so a scheduler does
+**not** need a `deploy_parallel` first; a deployment is not owned by a `client_id`, which only
+controls run attribution at chat time; and the whole-system resource fields
+(`peak_system_ram_used_bytes`, `peak_system_pagefile_used_bytes`) are not comparable between
+parallel and sequential runs, because one lane loading a model inflates the other lane's reading.
+
+`README.md` mentioned neither endpoint. Its "How Scheduling Works" section describes the `dual-gpu`
+CLI's own both-ends queue, which is unavailable over HTTP — now labeled as such, and pointed at
+`CLIENT_API.md` step 2c for the client-side equivalent.
+
+## 2026-09-27 — Independent per-lane model replacement
+
+Added `POST /api/clients/deploy_lane`. It stops and replaces only the requested GPU lane while
+preserving every other active lane, enabling work-conserving schedulers where a faster GPU loads
+its next assigned model immediately instead of waiting at a fixed-pair barrier. Concurrent lane
+replacement requests are serialized; chat traffic on the other lane continues during the load.
+
+## 2026-09-27 — Context-aware smallest-fit GPU placement
+
+Client auto-placement and parallel placement now use the full capacity verdict at the requested
+context (model file plus estimated KV cache), not relative model size within a pair. Every model
+that fits the 16 GB `9070xt` at 51,200 tokens stays on that lane. Only models that fail that check
+are assigned to the 32 GB `r9700`. Parallel deploy accepts one model from each class; two small
+models or two large-only models must run sequentially on their common lane instead of spreading
+across both GPUs.
+
+Removed the example config's stale `gpt-oss-20b-GGUF` pin to `r9700`, allowing the same fit rule
+to decide its lane. Added regression tests for small/small rejection, cross-class pairing, and
+context-aware single-model auto-placement.
+
 Notable changes to this repo, in reverse-chronological order. See [CLIENT_API.md](CLIENT_API.md)
 for a walkthrough of the client-integration flow and [API_CONTRACT.md](API_CONTRACT.md) for the
 exhaustive field-by-field request/response reference of every endpoint. For the 2026-09-27
@@ -7,6 +77,62 @@ gap-fixing work specifically, [optimised.md](optimised.md) has the narrative ver
 each bug below was actually found and confirmed, not just what changed.
 
 ## 2026-09-27
+
+### Fixed — `ResourceSampler` popped a new console window every 2 seconds
+
+`app.py` is normally launched detached/without a console (see `launch_service.py`'s
+`DETACHED_PROCESS` flag, meant to let it run as an invisible background service). Its
+`ResourceSampler` background thread polls GPU/process metrics via `gpu_process_metrics_batch`
+(PowerShell `Get-Counter`) every `interval_seconds` (2s) for the entire life of the process,
+and `dual_gpu_setup/server.py`'s handful of other helper-process calls (`netstat`, `tasklist`,
+`taskkill`, the `llama-server` launch itself, plus `dual_gpu_setup/lmstudio.py`'s
+`list_devices`) never passed `creationflags=subprocess.CREATE_NO_WINDOW`. On Windows, a child
+process spawned by a parent with no console of its own gets a brand-new console window unless
+told not to — so every 2-second sample popped one. Harmless functionally, but a visible,
+repeating nuisance for anyone running the service.
+
+Fixed by adding a module-level `_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform ==
+"win32" else 0` to both `dual_gpu_setup/server.py` and `dual_gpu_setup/lmstudio.py`, passed via
+`creationflags=` on every `subprocess.run`/`subprocess.Popen` call in those two files.
+`dual_gpu_setup/tasks.py` (the separate CLI `run`/`plan`/`inspect` command path, always run in
+the user's own foreground terminal, never detached) was deliberately left unchanged — that path
+never lacks a console in the first place, so the bug doesn't apply there.
+
+Verified live: stopped the running (pre-fix) service, confirmed no console flashes with it
+fully stopped, restarted it with the fix via `launch_service.py`, and had the reporting
+codebase's user confirm directly that the flashing stopped.
+
+### Added — `POST /api/clients/deploy_parallel`: auto-lane-picking parallel deploy
+
+New `DeploymentManager.deploy_parallel_for_client()` + `POST /api/clients/deploy_parallel`.
+Given a plain list of model names (one per configured lane, today 2), auto-assigns each the
+best-fitting lane (largest lane first, each time taking the largest remaining model that still
+fits it) and deploys via the *existing* `deploy()`/`_validate_profile("parallel_models", ...)`
+path — no duplicated capacity/KV-cache/pin-lane validation. Previously a caller had to already
+know which model belongs on which lane to use `parallel_models` mode at all; this is the
+2-model equivalent of `deploy_for_client`'s existing single-model auto-lane-pick. Documented in
+[API_CONTRACT.md](API_CONTRACT.md).
+
+Built for `talent-llm-eval`'s automatic dual-GPU batch evaluation (pairs models 2-at-a-time,
+deploys+runs each pair across both lanes concurrently instead of one lane at a time), but the
+endpoint itself is generic — any client of this service's Client Integration API can call it.
+
+**A real integration bug surfaced and was documented, not just fixed client-side:** the first
+integration attempt matched requested model names against `servers[].model`, which is the
+orchestrator's *resolved short display name* (e.g. `"gemma-3-270m-it-Q8_0"`), not the full
+catalog id a caller requests with — every match silently failed and the client fell back to
+sequential every time, with no visible error. `profile.models[]` (which echoes the exact
+requested strings back, paired with their resolved lane) is the correct join key. Documented as
+its own callout in `API_CONTRACT.md`'s `/api/clients/deploy_parallel` section — this ambiguity
+was pre-existing in every deploy endpoint's response shape (`/api/deploy`, `/api/clients/deploy`
+too), just newly surfaced by having two models to disambiguate between at once.
+
+Verified live end-to-end, not just at the code level: deployed `gemma-3-270m-it-Q8_0` +
+`SmolLM2-360M.Q8_0` in parallel (best-fit correctly put the larger SmolLM2 on the larger `r9700`
+lane, the smaller gemma on `9070xt`), then ran real concurrent chat completions against both --
+both threads started and finished together (not one-then-the-other), each returned distinct
+real `timing`/`resources` telemetry (different tokens/sec, different GPU utilization, different
+VRAM), confirming genuinely separate backends, not one lane silently double-serving both.
 
 ### Added — KV-cache-aware VRAM feasibility check for deploy
 

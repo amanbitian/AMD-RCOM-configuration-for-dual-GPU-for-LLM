@@ -400,6 +400,13 @@ Purpose:
 
 ## How Scheduling Works
 
+> **This section describes the `dual-gpu` CLI's own scheduler** — the one that drains a
+> size-sorted queue from both ends when *this repo* runs your models for you (Integration
+> Options 1-3). It is not available to a codebase driving the service over HTTP. An external
+> client that wants both GPUs busy across a batch of models builds its own two-queue scheduler
+> from `/api/clients/check_fit` and `/api/clients/deploy_lane` — see
+> [CLIENT_API.md](CLIENT_API.md) step 2c for the sequence.
+
 This setup assumes 2 lanes and asymmetric VRAM is allowed.
 
 Example:
@@ -812,10 +819,19 @@ get an authoritative load/reject verdict, then run prompts tagged to that client
 full token/timing/resource metrics back — with its own copy appended to a file path it chooses.
 
 See [CLIENT_API.md](CLIENT_API.md) for a walkthrough of that flow (`/api/clients/register`,
-`/api/clients/deploy`, `/api/chat` with `client_id`, `/api/clients/{id}/runs`,
+`/api/clients/check_fit` (read-only: which lane does this model fit, loading nothing),
+`/api/clients/deploy`, `/api/clients/deploy_parallel` (load N models across N lanes at once,
+auto-picking which model goes where), `/api/clients/deploy_lane` (swap one lane's model, leaving
+the other GPU's running), `/api/chat` with `client_id`, `/api/clients/{id}/runs`,
 `/api/clients/schema`), or [API_CONTRACT.md](API_CONTRACT.md) for the exhaustive
 request/response reference — every field this service needs from a caller and every field it
 shares back, for every endpoint it exposes, not just the client-facing ones.
+
+**Running a whole batch of models this way?** Keeping both GPUs busy is the client's job over
+HTTP — this service exposes the pieces but schedules nothing on its own. `check_fit` buckets your
+model list by which lane each model fits, and `deploy_lane` lets each GPU advance through its own
+queue without waiting for the other. [CLIENT_API.md](CLIENT_API.md) step 2c is the full working
+sequence, including the ordering rules and the two mistakes that fail silently.
 
 All of that requires `app.py` to already be running. If a client wants to trigger the service
 on demand instead of assuming a human already started it, [launch_service.py](launch_service.py)

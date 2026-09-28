@@ -389,6 +389,123 @@ invalid context, required context exceeds `policy.ctx_max`, or `input_tokens`/`m
 given without the other; `409` another deployment change in progress. **Note:** like
 `/api/deploy`, this replaces whatever was previously loaded.
 
+## POST `/api/clients/deploy_parallel`
+
+Like `/api/clients/deploy`, but for N models where N is the lane count (today: 2) — auto-assigns
+each model a distinct lane instead of requiring the caller to already know which model goes where.
+A thin wrapper around `/api/deploy` in `parallel_models` mode that resolves lanes automatically.
+
+**Needs:**
+
+| field | type | required? | notes |
+|---|---|---|---|
+| `models` | `["name1", "name2"]` | **required** | exactly one model per configured lane; each a name or catalog id from `/api/bootstrap` → `catalog.models` |
+| `context_window` | int | optional | same defaulting/validation as `/api/deploy`, applied identically to every model in the request |
+| `input_tokens` | int | optional, with `max_output_tokens` | same sizing guarantee as `/api/deploy`/`/api/clients/deploy`, applied identically to every model |
+| `max_output_tokens` | int | optional, with `input_tokens` | expected completion length; required together with `input_tokens` |
+
+Lane assignment is strict smallest-fit at the requested context: a model that passes the full
+model-file + KV-cache check on the smallest lane is assigned there. Only a model that fails that
+check may use the larger lane. Therefore two models that both fit the small lane, or two models
+that both require the large lane, return `400` and must be run sequentially on their common lane;
+the service never promotes a small model merely to keep both GPUs occupied. Every capacity,
+context, and pin-lane check is the same check used by `/api/deploy`.
+
+**Shares:** same shape as `GET /api/status` on success (the resolved `device`, `base_url`,
+`context_window`, etc. are in `servers[]`, one entry per model/lane pair).
+
+**Finding which lane a given requested model landed on:** use `profile.models[]`
+(`[{"model": <exact string you sent>, "lane": <key>}, ...]`), **not** `servers[]`.
+`servers[].model` is the orchestrator's *resolved* short display name (e.g.
+`"gemma-3-270m-it-Q8_0"`), which will not equal a catalog id you requested with (e.g.
+`"lmstudio:lmstudio-community/gemma-3-270m-it-GGUF/gemma-3-270m-it-Q8_0.gguf"`) — matching against
+`servers[].model` silently fails to find every model. `profile.models[].model` echoes your input
+strings back verbatim, making it the only reliable join key. (Same caveat applies to
+`/api/deploy`'s `single_large_model`/`single_gpu` modes and `/api/clients/deploy`'s response,
+for the same reason — `servers[].model` is always the resolved short name there too.)
+
+**Errors:** `400` if `models` isn't exactly one entry per lane, plus everything `/api/deploy`
+can return for `parallel_models` mode (unknown model/lane, doesn't fit, pinned elsewhere, invalid
+context, required context exceeds `policy.ctx_max`); `409` another deployment change in progress.
+**Note:** like `/api/deploy`, this replaces whatever was previously loaded.
+
+## POST `/api/clients/deploy_lane`
+
+Replace the model on one lane while preserving every other active lane. This supports
+work-conserving schedulers: when one GPU finishes earlier, it can load its next assigned model
+without waiting for or interrupting the other GPU.
+
+**Needs:** `model` (catalog name/id), `lane` (lane key), and optional `context_window`,
+`input_tokens`, and `max_output_tokens` with the same validation rules as
+`/api/clients/deploy`. The caller must have no outstanding chat request on the lane being
+replaced. Simultaneous lane replacements are serialized server-side rather than returning 409.
+
+**Works from an idle service — you do not need `/api/clients/deploy_parallel` first.** With
+nothing loaded on the named lane there is simply nothing to stop, so a scheduler can bring both
+lanes up by calling this endpoint once per lane: after the first call `mode` is `single_gpu`, and
+it becomes `parallel_models` when the second lane lands. "Replace" describes the effect on the
+one lane named, not a precondition that something is already running there.
+
+**Shares:** the normal status response containing all active servers, including preserved lanes.
+Only the requested lane's process/model changes.
+
+**`profile.models[]` stays a valid join key across a lane replacement.** The entry for the
+replaced lane carries the exact `model` string this call sent, and entries for preserved lanes
+carry the exact strings their own deploy call sent, forwarded unchanged. A lane loaded by some
+path that recorded no request string (a direct `/api/deploy` that omitted `lane`, for example)
+falls back to the resolved short display name for that one entry — the same value `servers[]`
+reports. `servers[].model` remains the resolved short name for every lane and is still not
+comparable against a catalog id you requested with.
+
+## POST `/api/clients/check_fit`
+
+Read-only feasibility check: "would this model fit this lane at this context window" — without
+loading anything. Runs the exact same resolution/validation `/api/deploy` would (model+lane
+resolution, then the capacity/KV-cache check every deploy mode uses), but never calls `deploy()`
+and never starts a process. Built for a client that wants to **plan a schedule ahead of time** —
+e.g. partition a whole model list into "fits the small lane" / "needs the big lane" buckets
+before deploying anything — instead of discovering fit only by trial deploy, which would
+actually load a model just to find out it doesn't fit.
+
+**Needs:**
+
+| field | type | required? | notes |
+|---|---|---|---|
+| `model` | string | **required** | name or catalog id from `/api/bootstrap` → `catalog.models` |
+| `lane` | string | **required** | a lane key from `catalog.lanes[].key` |
+| `context_window` | int | optional | same defaulting as `/api/deploy`; omit to use the model's configured/policy default |
+| `input_tokens` | int | optional, with `max_output_tokens` | same sizing guarantee as `/api/deploy` — the context is grown to fit this before the capacity check runs |
+| `max_output_tokens` | int | optional, with `input_tokens` | expected completion length; required together with `input_tokens` |
+
+**Shares:**
+```jsonc
+{
+  "fits": "bool",
+  "reason": "string | null — the exact AppError message a real /api/deploy would have raised, present only when fits is false",
+  "resolved_context_window": "int | null — the context window actually checked against (after any input_tokens/max_output_tokens growth), present only when fits is true"
+}
+```
+
+**Errors:** this endpoint answers `200` with `fits: false` for essentially everything that can
+go wrong, including cases you may expect to be a `400`. An unknown `model`, an unknown `lane`, a
+model file missing from disk, `input_tokens` without `max_output_tokens`, and a `context_window`
+below 256 all come back as `{"fits": false, "reason": "<message>"}` rather than an HTTP error,
+because the check reports every validation failure the same way a capacity failure is reported.
+
+**So validate lane keys yourself before bucketing a model list.** A typo in `lane` returns
+`fits: false` with `reason: "Unknown lane: <key>"` for *every* model you test, which looks
+exactly like a real "nothing fits this GPU" verdict and will silently push your whole list onto
+the other lane. Take lane keys from `/api/bootstrap` → `catalog.lanes[].key`, and treat a
+`reason` that does not describe capacity as a bug in your request, not a placement answer.
+
+It does **not** return `409` while a deployment change is in flight — it takes no deployment
+lock at all, which is what makes it safe to call in a loop (see below). Only a request that
+cannot be parsed at the HTTP layer (a non-integer `context_window`, say) fails with a status
+code rather than a verdict.
+
+**Never mutates state and never conflicts with an active deployment** — safe to call in a loop,
+once per candidate model, without affecting whatever is currently loaded.
+
 ## GET `/api/clients/{client_id}/runs`
 
 **Needs:** `client_id` as a path segment.
