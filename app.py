@@ -1116,6 +1116,31 @@ class DeploymentManager:
             raise AppError(f"Model file does not exist: {path}")
         return model, context
 
+    def _requested_model_names_by_lane(self) -> dict[str, str]:
+        """Map lane key -> the exact model string the caller last asked for on that lane.
+
+        `profile.models[]` is the documented join key a client uses to match its own
+        requested model strings back to resolved lanes, so a lane replacement must not
+        downgrade the lanes it preserves to `ModelConfig.name` (the resolved short display
+        name, which never equals a catalog id a caller requests with). active_profile holds
+        the caller's own raw profile as deploy() stored it -- either a single `model` dict
+        (single_gpu / single_large_model) or a `models` list (parallel_models).
+        """
+        profile = self.active_profile or {}
+        entries = list(profile.get("models") or [])
+        single = profile.get("model")
+        if single is not None:
+            entries.append(single)
+        requested: dict[str, str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            lane_key = entry.get("lane")
+            name = entry.get("model")
+            if lane_key and name:
+                requested[str(lane_key)] = str(name)
+        return requested
+
     def _validate_profile(self, mode: str, profile: dict[str, Any]) -> list[dict[str, Any]]:
         if mode == "single_large_model":
             raw = profile.get("model") or {}
@@ -1178,18 +1203,114 @@ class DeploymentManager:
                 "GPU, or use multi-GPU mode."
             )
 
-    def _auto_lane_for_model(self, model: ModelConfig) -> LaneConfig:
-        """Pick a lane for a client that didn't specify one: the smallest lane the model fits in,
-        so the largest lane stays free for other work. Falls back to the smallest lane so the
-        capacity-error message from _validate_capacity stays clear when nothing fits."""
-        if model.pin_lane:
-            return self._lane(model.pin_lane)
+    def _auto_lane_for_model(
+        self,
+        model_name: str,
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> LaneConfig:
+        """Pick the smallest lane that passes the complete fit check.
+
+        This intentionally uses ``check_fit`` rather than model file size alone: at a 51k
+        context, KV cache can make a model that appears to fit the 9070 require the 9700.
+        """
         candidates = sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
-        size = model_size_gb(self.config, model)
         for lane in candidates:
-            if size <= lane_capacity_gb(self.config, lane):
+            verdict = self.check_fit(
+                model_name, lane.key, context_window, input_tokens, max_output_tokens
+            )
+            if verdict["fits"]:
                 return lane
-        return candidates[0]
+        # Let deploy() produce the authoritative error against the largest lane when
+        # nothing fits, instead of returning the smaller lane and hiding that it was tried.
+        return candidates[-1]
+
+    def deploy_parallel_for_client(
+        self,
+        model_names: list[str],
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Deploy one model per lane without promoting small models to the large lane.
+
+        Each model is tested against the smallest lane at the requested context. A model that
+        fits there belongs there; only a model that does not fit there may use the larger lane.
+        Consequently, two small models (or two large-only models) are not a valid parallel pair
+        and must be run sequentially on their common lane.
+        """
+        if len(model_names) != len(self.config.lanes):
+            raise AppError(
+                f"deploy_parallel needs exactly {len(self.config.lanes)} model(s) "
+                f"(one per lane), got {len(model_names)}."
+            )
+        small_lane, large_lane = sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        assignments: list[tuple[str, LaneConfig]] = []
+        for name in model_names:
+            small_fit = self.check_fit(
+                name, small_lane.key, context_window, input_tokens, max_output_tokens
+            )
+            if small_fit["fits"]:
+                assignments.append((name, small_lane))
+                continue
+            large_fit = self.check_fit(
+                name, large_lane.key, context_window, input_tokens, max_output_tokens
+            )
+            if not large_fit["fits"]:
+                raise AppError(
+                    f"{name} fits neither {small_lane.key} nor {large_lane.key} at the requested "
+                    f"context: {large_fit['reason'] or small_fit['reason']}"
+                )
+            assignments.append((name, large_lane))
+
+        assigned_keys = [lane.key for _, lane in assignments]
+        if len(set(assigned_keys)) != len(assignments):
+            raise AppError(
+                "Parallel placement would promote a model to a larger GPU merely to fill both "
+                f"lanes ({assigned_keys}). Run these models sequentially on their assigned lane."
+            )
+
+        raw_models = []
+        for name, lane in assignments:
+            raw: dict[str, Any] = {"model": name, "lane": lane.key}
+            if context_window is not None:
+                raw["context_window"] = context_window
+            if input_tokens is not None:
+                raw["input_tokens"] = input_tokens
+            if max_output_tokens is not None:
+                raw["max_output_tokens"] = max_output_tokens
+            raw_models.append(raw)
+        return self.deploy({"mode": "parallel_models", "models": raw_models})
+
+    def check_fit(
+        self,
+        model_name: str,
+        lane_key: str,
+        context_window: int | None = None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only feasibility check: "would this model fit this lane at this context window,"
+        without loading anything. Runs the exact same resolution/validation deploy() would
+        (_configured_model + _validate_capacity) so the answer is authoritative, not a client-side
+        guess -- but never calls deploy() itself. For a client planning a schedule ahead of time
+        (e.g. partitioning a model list by which lane each one fits) instead of discovering fit by
+        trial deploy, which would actually load the model just to find out."""
+        try:
+            lane = self._lane(lane_key)
+            raw: dict[str, Any] = {"model": model_name}
+            if context_window is not None:
+                raw["context_window"] = context_window
+            if input_tokens is not None:
+                raw["input_tokens"] = input_tokens
+            if max_output_tokens is not None:
+                raw["max_output_tokens"] = max_output_tokens
+            model, resolved_context = self._configured_model(raw, lane.vram_gb)
+            self._validate_capacity(model, [lane])
+            return {"fits": True, "reason": None, "resolved_context_window": resolved_context}
+        except AppError as exc:
+            return {"fits": False, "reason": str(exc), "resolved_context_window": None}
 
     def deploy_for_client(
         self,
@@ -1203,8 +1324,9 @@ class DeploymentManager:
         to deploy() so the feasibility verdict (fit/pin/context checks) is identical to the UI's.
         When the client reports its real input/output token budget, the allocated context window
         is sized to fit it (see resolve_context_window) instead of trusting a guessed default."""
-        model = self._model(model_name)
-        lane = self._lane(gpu) if gpu else self._auto_lane_for_model(model)
+        lane = self._lane(gpu) if gpu else self._auto_lane_for_model(
+            model_name, context_window, input_tokens, max_output_tokens
+        )
         raw: dict[str, Any] = {"model": model_name, "lane": lane.key}
         if context_window is not None:
             raw["context_window"] = context_window
@@ -1213,6 +1335,88 @@ class DeploymentManager:
         if max_output_tokens is not None:
             raw["max_output_tokens"] = max_output_tokens
         return self.deploy({"mode": "single_gpu", "model": raw})
+
+    def deploy_lane_for_client(
+        self,
+        model_name: str,
+        lane_key: str,
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace one GPU lane without stopping models on the other lanes.
+
+        The caller must only replace a lane after its own outstanding chat call has
+        completed. Deployment changes are serialized, but chat traffic on preserved
+        lanes continues while this lane stops and loads its next model.
+        """
+        lane = self._lane(lane_key)
+        raw: dict[str, Any] = {"model": model_name, "lane": lane.key}
+        if context_window is not None:
+            raw["context_window"] = context_window
+        if input_tokens is not None:
+            raw["input_tokens"] = input_tokens
+        if max_output_tokens is not None:
+            raw["max_output_tokens"] = max_output_tokens
+        profile = {"mode": "single_gpu", "model": raw}
+        spec = self._validate_profile("single_gpu", profile)[0]
+
+        # Blocking is intentional: two lane workers can finish together, and the
+        # second should wait for the first model load instead of failing with 409.
+        self.transition_lock.acquire()
+        with self.lock:
+            requested_by_lane = self._requested_model_names_by_lane()
+        requested_by_lane[lane.key] = model_name
+        deployment_id = str(uuid.uuid4())
+        self.store.begin_deployment(deployment_id, "lane_replace", profile)
+        try:
+            with self.lock:
+                old_handle = self.handles.pop(lane.key, None)
+                if not self.handles:
+                    self.state = "switching"
+                self.error = None
+            if old_handle is not None:
+                old_handle.process.stop()
+
+            run_dir = self.data_dir / "deployments" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                process = self._make_process(spec, run_dir)
+                process.start()
+                handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process)
+            except BaseException as exc:
+                message = f"{lane.key}: {exc}"
+                with self.lock:
+                    self.state = "ready" if self.handles else "error"
+                    self.mode = "parallel_models" if len(self.handles) > 1 else (
+                        "single_gpu" if self.handles else "idle"
+                    )
+                    self.error = message
+                self.store.update_deployment(deployment_id, "failed", error=message)
+                raise AppError(message, HTTPStatus.INTERNAL_SERVER_ERROR) from exc
+
+            with self.lock:
+                self.handles[lane.key] = handle
+                self.deployment_id = deployment_id
+                self.state = "ready"
+                self.mode = "parallel_models" if len(self.handles) > 1 else "single_gpu"
+                self.active_profile = {
+                    "mode": self.mode,
+                    "models": [
+                        {
+                            "model": requested_by_lane.get(target, active.model.name),
+                            "lane": target,
+                            "context_window": active.process.ctx_size,
+                        }
+                        for target, active in self.handles.items()
+                    ],
+                }
+                self.error = None
+                servers = [active.public() for active in self.handles.values()]
+            self.store.update_deployment(deployment_id, "ready", servers=servers)
+            return self.status()
+        finally:
+            self.transition_lock.release()
 
     def _make_process(self, spec: dict[str, Any], run_dir: Path) -> LlamaServerProcess:
         model = spec["model"]
@@ -1675,6 +1879,38 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = self.server.app_state.manager.deploy_for_client(
                     str(payload.get("model", "")),
                     str(payload["gpu"]) if payload.get("gpu") else None,
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+            elif path == "/api/clients/deploy_parallel":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.deploy_parallel_for_client(
+                    [str(name) for name in (payload.get("models") or [])],
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+            elif path == "/api/clients/deploy_lane":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.deploy_lane_for_client(
+                    str(payload.get("model", "")),
+                    str(payload.get("lane", "")),
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+            elif path == "/api/clients/check_fit":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.check_fit(
+                    str(payload.get("model", "")),
+                    str(payload.get("lane", "")),
                     int(context_window) if context_window is not None else None,
                     int(input_tokens) if input_tokens is not None else None,
                     int(max_output_tokens) if max_output_tokens is not None else None,

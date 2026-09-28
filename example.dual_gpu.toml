@@ -50,7 +50,6 @@ backend = "rocm"
 name = "gpt-oss-20b-GGUF"
 path = "lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
 size_gb = 12.11
-pin_lane = "r9700"
 parallel = 1
 
 [[models]]
