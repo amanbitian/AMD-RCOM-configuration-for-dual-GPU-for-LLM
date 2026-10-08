@@ -668,6 +668,10 @@ gateway rather than connecting directly to llama-server. The complete Cline + Op
 project attribution, worktree workflow, and privacy defaults are in
 [CODING_AGENTS.md](CODING_AGENTS.md).
 
+For interactive setup, open the dashboard and click **Setup wizard**. It walks through project
+registration, model-to-GPU assignment, parallel deployment, agent roles, and copy-ready connection
+settings without requiring API commands.
+
 Other applications connect through the OpenAI-compatible HTTP endpoint started by `llama-server`.
 
 During execution, each model is exposed at:
