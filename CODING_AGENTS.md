@@ -13,6 +13,11 @@ py app.py --config .\example.dual_gpu.toml --no-browser
 
 The service now binds to `127.0.0.1` by default. Register each repository once:
 
+You can do the complete setup without these API commands: open the dashboard and use **Setup
+wizard**. It creates the project, registers the shared metrics key, assigns models to both GPUs,
+loads the parallel deployment, creates the developer/QA sessions, and displays copy-ready Cline and
+OpenCode settings. The API example below is useful for automation or repeatable scripts.
+
 ```powershell
 $body = @{
   project_name = "Cutline"
