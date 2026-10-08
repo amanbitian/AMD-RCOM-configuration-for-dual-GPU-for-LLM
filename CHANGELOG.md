@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-09 — Project-aware dual coding-agent mode
+
+Added a coding-agent preset without removing or changing the existing evaluation modes or metric
+schema. Runs can now carry project, workload, agent-role, session and coding-task attribution.
+Projects, agent sessions, coding tasks and tool events are persisted in SQLite, with project and
+GPU breakdowns exposed in the existing dashboard.
+
+Added a streaming OpenAI-compatible gateway at `/v1/.../chat/completions`, including lane- and
+role-pinned URLs suitable for running Cline and OpenCode concurrently. A registered client id used
+as the API key supplies project attribution. Coding prompt and completion content is redacted from
+storage by default while usage, prefill/decode timing, latency and resource telemetry are retained.
+
+Dashboard totals now aggregate the complete matching history rather than inheriting the 500-row
+cap from `recent()`. Run-history queries gained pagination and project/workload filters. The default
+web bind was tightened to `127.0.0.1`; LAN access remains available with an explicit
+`--host 0.0.0.0`.
+
 ## 2026-09-28 — `deploy_lane` now honors the documented join key, and the client docs cover the queue
 
 Found by auditing this repo against the first client that actually built the two-queue scheduler

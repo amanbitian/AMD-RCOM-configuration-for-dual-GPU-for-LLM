@@ -9,6 +9,9 @@ This is a walkthrough of the flow. For the exhaustive field-by-field request/res
 reference of every endpoint (this one and the rest of the app's API), see
 [API_CONTRACT.md](API_CONTRACT.md).
 
+For interactive coding agents, including the exact Cline + OpenCode configuration and the
+lane-pinned streaming gateway URLs, see [CODING_AGENTS.md](CODING_AGENTS.md).
+
 ## 0. Make sure the service is actually running
 
 Every endpoint below needs `app.py` already running — there's no HTTP "start" endpoint,

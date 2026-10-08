@@ -10,13 +10,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import app  # noqa: E402
 
 
-def make_run(store: "app.RunStore", run_id: str, model_name: str, task_label, tokens_per_second, latency_ms, client_id=None):
+def make_run(
+    store: "app.RunStore",
+    run_id: str,
+    model_name: str,
+    task_label,
+    tokens_per_second,
+    latency_ms,
+    client_id=None,
+    project_id=None,
+    workload_kind="evaluation",
+    agent_role=None,
+):
     store.begin_run({
         "id": run_id, "comparison_id": None, "deployment_id": None,
         "created_at": app.utc_now(), "mode": "single_gpu", "target": "primary",
         "model_name": model_name, "model_path": "x.gguf", "lane_keys": ["primary"],
         "device": "rocm:0", "context_window": 8192, "reasoning_budget": 0,
         "request": {}, "configuration": {}, "client_id": client_id, "task_label": task_label,
+        "project_id": project_id, "workload_kind": workload_kind, "agent_role": agent_role,
     })
     store.finish_run(run_id, {
         "status": "completed",
@@ -33,7 +45,13 @@ def test_migrations_create_expected_schema(tmp_path: Path):
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "client_id" in columns
     assert "task_label" in columns
+    assert "project_id" in columns
+    assert "workload_kind" in columns
     assert "clients" in tables
+    assert "projects" in tables
+    assert "agent_sessions" in tables
+    assert "coding_tasks" in tables
+    assert "tool_events" in tables
 
 
 def test_client_registration_round_trip(tmp_path: Path):
@@ -41,6 +59,7 @@ def test_client_registration_round_trip(tmp_path: Path):
     registered = store.register_client("MyRepo", "github.com/user/repo", "/tmp/out.jsonl")
     fetched = store.get_client(registered["client_id"])
     assert fetched["project_name"] == "MyRepo"
+    assert fetched["project_id"] == registered["project_id"]
     assert fetched["output_path"] == "/tmp/out.jsonl"
     assert store.get_client("does-not-exist") is None
 
@@ -118,3 +137,38 @@ def test_runs_for_client_only_returns_that_clients_runs(tmp_path: Path):
     runs = store.runs_for_client(client["client_id"])
     assert len(runs) == 1
     assert runs[0]["id"] == "r1"
+
+
+def test_dashboard_uses_complete_history_beyond_recent_cap(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    for index in range(505):
+        make_run(store, f"r{index}", "modelA", None, 50.0, 1000)
+
+    assert len(store.recent(1000)) == 500
+    dashboard = store.dashboard()
+    assert dashboard["summary"]["total_runs"] == 505
+    assert dashboard["summary"]["total_tokens"] == 505 * 150
+
+
+def test_project_filtered_dashboard_and_gpu_breakdown(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    project_a = store.upsert_project("Project A", "F:/Projects/A")
+    project_b = store.upsert_project("Project B", "F:/Projects/B")
+    make_run(store, "a", "modelA", "edit", 60.0, 1000, project_id=project_a["id"], workload_kind="coding_agent", agent_role="developer")
+    make_run(store, "b", "modelB", "test", 30.0, 2000, project_id=project_b["id"], workload_kind="coding_agent", agent_role="qa")
+
+    dashboard = store.dashboard(project_id=project_a["id"])
+    assert dashboard["summary"]["total_runs"] == 1
+    assert dashboard["projects"][0]["project"] == "Project A"
+    assert dashboard["agents"][0]["agent_role"] == "developer"
+    assert dashboard["gpus"][0]["gpu"] == "primary"
+
+
+def test_tool_events_are_aggregated_per_project(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    project = store.upsert_project("Project")
+    store.record_tool_event({"project_id": project["id"], "tool_type": "test", "status": "completed", "exit_code": 0})
+    store.record_tool_event({"project_id": project["id"], "tool_type": "build", "status": "failed", "exit_code": 1})
+
+    tools = store.dashboard(project_id=project["id"])["tool_summary"]
+    assert tools == {"events": 2, "failed": 1, "success_rate": 50.0}

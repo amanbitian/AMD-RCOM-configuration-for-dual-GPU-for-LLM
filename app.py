@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig, load_config
 from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
@@ -374,11 +374,60 @@ class RunStore:
                     github_repo TEXT,
                     output_path TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    last_seen_at TEXT
+                    last_seen_at TEXT,
+                    project_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    repo_path TEXT,
+                    git_remote TEXT,
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    agent_role TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    FOREIGN KEY (project_id) REFERENCES projects(id)
+                );
+                CREATE TABLE IF NOT EXISTS coding_tasks (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    branch TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY (project_id) REFERENCES projects(id)
+                );
+                CREATE TABLE IF NOT EXISTS tool_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL,
+                    session_id TEXT,
+                    task_id TEXT,
+                    run_id TEXT,
+                    occurred_at TEXT NOT NULL,
+                    tool_type TEXT NOT NULL,
+                    duration_ms REAL,
+                    exit_code INTEGER,
+                    status TEXT NOT NULL,
+                    detail_json TEXT,
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (session_id) REFERENCES agent_sessions(id),
+                    FOREIGN KEY (task_id) REFERENCES coding_tasks(id),
+                    FOREIGN KEY (run_id) REFERENCES runs(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_comparison_id ON runs(comparison_id);
                 CREATE INDEX IF NOT EXISTS idx_metric_samples_run_id ON metric_samples(run_id, id);
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON agent_sessions(project_id, started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON coding_tasks(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_tool_events_project_id ON tool_events(project_id, occurred_at DESC);
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
@@ -392,6 +441,11 @@ class RunStore:
                 "finish_reason": "TEXT",
                 "client_id": "TEXT",
                 "task_label": "TEXT",
+                "project_id": "TEXT",
+                "agent_session_id": "TEXT",
+                "coding_task_id": "TEXT",
+                "agent_role": "TEXT",
+                "workload_kind": "TEXT NOT NULL DEFAULT 'evaluation'",
             }
             for name, data_type in migrations.items():
                 if name not in columns:
@@ -399,6 +453,12 @@ class RunStore:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_deployment_id ON runs(deployment_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_client_id ON runs(client_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_label ON runs(task_label)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs(project_id, created_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(agent_session_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_coding_task_id ON runs(coding_task_id)")
+            client_columns = {row[1] for row in connection.execute("PRAGMA table_info(clients)")}
+            if "project_id" not in client_columns:
+                connection.execute("ALTER TABLE clients ADD COLUMN project_id TEXT")
 
     def begin_deployment(self, deployment_id: str, mode: str, profile: dict[str, Any]) -> None:
         with self.lock, self.connect() as connection:
@@ -446,8 +506,9 @@ class RunStore:
                 INSERT INTO runs (
                     id, comparison_id, deployment_id, created_at, status, mode, target,
                     model_name, model_path, lane_keys_json, device_json, context_window,
-                    reasoning_budget, request_json, configuration_json, client_id, task_label
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reasoning_budget, request_json, configuration_json, client_id, task_label,
+                    project_id, agent_session_id, coding_task_id, agent_role, workload_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -467,6 +528,11 @@ class RunStore:
                     json.dumps(record.get("configuration"), ensure_ascii=False),
                     record.get("client_id"),
                     record.get("task_label"),
+                    record.get("project_id"),
+                    record.get("agent_session_id"),
+                    record.get("coding_task_id"),
+                    record.get("agent_role"),
+                    record.get("workload_kind", "evaluation"),
                 ),
             )
 
@@ -518,19 +584,154 @@ class RunStore:
                 rows,
             )
 
+    def upsert_project(
+        self,
+        name: str,
+        repo_path: str | None = None,
+        git_remote: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("Project name is required.")
+        with self.lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE name = ? COLLATE NOCASE", (normalized,)
+            ).fetchone()
+            if row is None:
+                project_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO projects (id, name, repo_path, git_remote, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (project_id, normalized, repo_path, git_remote, utc_now()),
+                )
+            else:
+                project_id = row["id"]
+                connection.execute(
+                    """
+                    UPDATE projects SET repo_path = COALESCE(?, repo_path),
+                        git_remote = COALESCE(?, git_remote)
+                    WHERE id = ?
+                    """,
+                    (repo_path, git_remote, project_id),
+                )
+            result = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(result)
+
+    def projects(self) -> list[dict[str, Any]]:
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.*,
+                    COUNT(r.id) AS run_count,
+                    COALESCE(SUM(CAST(json_extract(r.usage_json, '$.total_tokens') AS INTEGER)), 0) AS total_tokens,
+                    MAX(r.created_at) AS last_run_at
+                FROM projects p
+                LEFT JOIN runs r ON r.project_id = p.id
+                WHERE p.archived_at IS NULL
+                GROUP BY p.id
+                ORDER BY COALESCE(MAX(r.created_at), p.created_at) DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_project(self, project_id_or_name: str) -> dict[str, Any] | None:
+        with self.lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE id = ? OR name = ? COLLATE NOCASE",
+                (project_id_or_name, project_id_or_name),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_agent_session(self, project_id: str, agent_role: str, runtime: str) -> dict[str, Any]:
+        session = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "agent_role": agent_role.strip() or "developer",
+            "runtime": runtime.strip() or "unknown",
+            "started_at": utc_now(),
+            "status": "active",
+        }
+        with self.lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_sessions (id, project_id, agent_role, runtime, started_at, status)
+                VALUES (:id, :project_id, :agent_role, :runtime, :started_at, :status)
+                """,
+                session,
+            )
+        return session
+
+    def create_coding_task(
+        self, project_id: str, title: str, branch: str | None = None
+    ) -> dict[str, Any]:
+        task = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "title": title.strip(),
+            "status": "active",
+            "branch": branch,
+            "created_at": utc_now(),
+        }
+        if not task["title"]:
+            raise ValueError("Task title is required.")
+        with self.lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO coding_tasks (id, project_id, title, status, branch, created_at)
+                VALUES (:id, :project_id, :title, :status, :branch, :created_at)
+                """,
+                task,
+            )
+        return task
+
+    def record_tool_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        record = {
+            "project_id": event["project_id"],
+            "session_id": event.get("session_id"),
+            "task_id": event.get("task_id"),
+            "run_id": event.get("run_id"),
+            "occurred_at": event.get("occurred_at") or utc_now(),
+            "tool_type": str(event.get("tool_type") or "unknown"),
+            "duration_ms": event.get("duration_ms"),
+            "exit_code": event.get("exit_code"),
+            "status": str(event.get("status") or "completed"),
+            "detail_json": json.dumps(event.get("detail"), ensure_ascii=False),
+        }
+        with self.lock, self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO tool_events (
+                    project_id, session_id, task_id, run_id, occurred_at, tool_type,
+                    duration_ms, exit_code, status, detail_json
+                ) VALUES (
+                    :project_id, :session_id, :task_id, :run_id, :occurred_at, :tool_type,
+                    :duration_ms, :exit_code, :status, :detail_json
+                )
+                """,
+                record,
+            )
+            record["id"] = cursor.lastrowid
+        record["detail"] = json.loads(record.pop("detail_json"))
+        return record
+
     def register_client(self, project_name: str, github_repo: str | None, output_path: str) -> dict[str, Any]:
+        project = self.upsert_project(project_name, git_remote=github_repo)
         client_id = str(uuid.uuid4())
         created_at = utc_now()
         with self.lock, self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO clients (id, project_name, github_repo, output_path, created_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO clients (
+                    id, project_name, github_repo, output_path, created_at, last_seen_at, project_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (client_id, project_name, github_repo, output_path, created_at, created_at),
+                (client_id, project_name, github_repo, output_path, created_at, created_at, project["id"]),
             )
         return {
             "client_id": client_id,
+            "project_id": project["id"],
             "project_name": project_name,
             "github_repo": github_repo,
             "output_path": output_path,
@@ -545,6 +746,10 @@ class RunStore:
     def touch_client(self, client_id: str) -> None:
         with self.lock, self.connect() as connection:
             connection.execute("UPDATE clients SET last_seen_at = ? WHERE id = ?", (utc_now(), client_id))
+
+    def link_client_project(self, client_id: str, project_id: str) -> None:
+        with self.lock, self.connect() as connection:
+            connection.execute("UPDATE clients SET project_id = ? WHERE id = ?", (project_id, client_id))
 
     def runs_for_client(self, client_id: str, limit: int = 100) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
@@ -570,12 +775,58 @@ class RunStore:
             ).rowcount
         return {"cutoff": cutoff, "deleted_runs": deleted_runs, "deleted_deployments": deleted_deployments}
 
-    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+    def recent(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        project_id: str | None = None,
+        workload_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if workload_kind:
+            conditions.append("workload_kind = ?")
+            params.append(workload_kind)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.lock, self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+                f"SELECT * FROM runs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
             ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def count_runs(self, project_id: str | None = None, workload_kind: str | None = None) -> int:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if workload_kind:
+            conditions.append("workload_kind = ?")
+            params.append(workload_kind)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.lock, self.connect() as connection:
+            return int(connection.execute(f"SELECT COUNT(*) FROM runs{where}", params).fetchone()[0])
+
+    def _dashboard_runs(
+        self, project_id: str | None = None, workload_kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if workload_kind:
+            conditions.append("workload_kind = ?")
+            params.append(workload_kind)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(f"SELECT * FROM runs{where} ORDER BY created_at DESC", params).fetchall()
         return [self._decode(row) for row in rows]
 
     def get(self, run_id: str) -> dict[str, Any] | None:
@@ -598,8 +849,12 @@ class RunStore:
         ]
         return item
 
-    def dashboard(self) -> dict[str, Any]:
-        runs = self.recent(1000)
+    def dashboard(
+        self, project_id: str | None = None, workload_kind: str | None = None
+    ) -> dict[str, Any]:
+        # Dashboard aggregates intentionally use the complete matching history. The prior
+        # implementation called recent(1000), which was silently capped to 500 records.
+        runs = self._dashboard_runs(project_id, workload_kind)
 
         def nums(path: tuple[str, str], selected: list[dict[str, Any]] = runs) -> list[float]:
             parent, child = path
@@ -627,6 +882,8 @@ class RunStore:
 
         def summarize(group: list[dict[str, Any]]) -> dict[str, Any]:
             group_completed = [run for run in group if run.get("status") == "completed"]
+            output_tokens = total(("usage", "output_tokens"), group_completed)
+            decode_ms = sum(nums(("timing", "decode_duration_ms"), group_completed))
             return {
                 "runs": len(group),
                 "success_rate": round(len(group_completed) / len(group) * 100, 1) if group else None,
@@ -634,6 +891,9 @@ class RunStore:
                 "output_tokens": total(("usage", "output_tokens"), group),
                 "thinking_tokens": total(("usage", "thinking_tokens"), group),
                 "avg_tokens_per_second": average(("timing", "tokens_per_second"), group_completed),
+                "aggregate_tokens_per_second": (
+                    round(output_tokens / (decode_ms / 1000), 2) if decode_ms > 0 else None
+                ),
                 "avg_prefill_tokens_per_second": average(
                     ("timing", "prefill_tokens_per_second"), group_completed
                 ),
@@ -668,6 +928,57 @@ class RunStore:
             ]
             category_models.append({"category": label, "model": model_name, **summarize(group)})
 
+        gpu_lanes: list[dict[str, Any]] = []
+        for lane in sorted({lane for run in runs for lane in (run.get("lane_keys") or [])}):
+            group = [run for run in runs if lane in (run.get("lane_keys") or [])]
+            gpu_lanes.append({"gpu": lane, **summarize(group)})
+
+        project_rows: list[dict[str, Any]] = []
+        known_projects = {project["id"]: project for project in self.projects()}
+        project_keys_set: set[str | None] = set(known_projects) if not project_id else {project_id}
+        project_keys_set.update(run.get("project_id") for run in runs)
+        project_keys = sorted(project_keys_set, key=lambda value: str(value or ""))
+        for key in project_keys:
+            group = [run for run in runs if run.get("project_id") == key]
+            project = known_projects.get(key or "", {})
+            project_rows.append(
+                {
+                    "project_id": key,
+                    "project": project.get("name") or "Unassigned / Legacy",
+                    **summarize(group),
+                }
+            )
+
+        agent_rows: list[dict[str, Any]] = []
+        for role in sorted({run.get("agent_role") for run in runs if run.get("agent_role")}):
+            group = [run for run in runs if run.get("agent_role") == role]
+            agent_rows.append({"agent_role": role, **summarize(group)})
+
+        tool_summary = {"events": 0, "failed": 0, "success_rate": None}
+        tool_conditions: list[str] = []
+        tool_params: list[Any] = []
+        if project_id:
+            tool_conditions.append("project_id = ?")
+            tool_params.append(project_id)
+        tool_where = f" WHERE {' AND '.join(tool_conditions)}" if tool_conditions else ""
+        with self.lock, self.connect() as connection:
+            tool_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS events,
+                    SUM(CASE WHEN status IN ('failed', 'error', 'timeout') OR COALESCE(exit_code, 0) != 0 THEN 1 ELSE 0 END) AS failed
+                FROM tool_events{tool_where}
+                """,
+                tool_params,
+            ).fetchone()
+        if tool_row:
+            event_count = int(tool_row["events"] or 0)
+            failed_count = int(tool_row["failed"] or 0)
+            tool_summary = {
+                "events": event_count,
+                "failed": failed_count,
+                "success_rate": round((event_count - failed_count) / event_count * 100, 1) if event_count else None,
+            }
+
         daily: dict[str, dict[str, Any]] = {}
         for run in reversed(runs):
             day = str(run.get("created_at", ""))[:10]
@@ -689,6 +1000,7 @@ class RunStore:
                 "visible_output_tokens": total(("usage", "visible_output_tokens")),
                 "total_tokens": total(("usage", "total_tokens")),
                 "avg_tokens_per_second": average(("timing", "tokens_per_second"), completed),
+                "aggregate_tokens_per_second": summarize(runs)["aggregate_tokens_per_second"],
                 "avg_prefill_tokens_per_second": average(
                     ("timing", "prefill_tokens_per_second"), completed
                 ),
@@ -713,6 +1025,10 @@ class RunStore:
                 ),
             },
             "models": models,
+            "gpus": gpu_lanes,
+            "projects": project_rows,
+            "agents": agent_rows,
+            "tool_summary": tool_summary,
             "categories": categories,
             "category_models": category_models,
             "daily": list(daily.values())[-14:],
@@ -1444,6 +1760,23 @@ class ChatService:
             if client is None:
                 raise AppError(f"Unknown client_id: {client_id}", HTTPStatus.NOT_FOUND)
             self.store.touch_client(client["id"])
+        project_id = str(payload.get("project_id") or "").strip() or None
+        if client:
+            project_id = client.get("project_id") or project_id
+            if not project_id:
+                project = self.store.upsert_project(
+                    client["project_name"], git_remote=client.get("github_repo")
+                )
+                project_id = project["id"]
+                self.store.link_client_project(client["id"], project_id)
+        if project_id and self.store.get_project(project_id) is None:
+            raise AppError(f"Unknown project_id: {project_id}", HTTPStatus.NOT_FOUND)
+        workload_kind = str(payload.get("workload_kind") or "evaluation").strip().lower()
+        if workload_kind not in {"evaluation", "coding_agent"}:
+            raise AppError("workload_kind must be 'evaluation' or 'coding_agent'.")
+        agent_role = str(payload.get("agent_role") or "").strip().lower() or None
+        agent_session_id = str(payload.get("agent_session_id") or "").strip() or None
+        coding_task_id = str(payload.get("coding_task_id") or "").strip() or None
         task_label = payload.get("task_label")
         # Normalized (lowercase + stripped) so "Resume_Extraction" and "resume_extraction"
         # land in the same dashboard category instead of silently fragmenting into two.
@@ -1476,7 +1809,20 @@ class ChatService:
         threads = []
 
         def run(target: str, handle: ServerHandle) -> None:
-            results[target] = self._run_one(target, handle, messages, payload, comparison_id, client, task_label)
+            results[target] = self._run_one(
+                target,
+                handle,
+                messages,
+                payload,
+                comparison_id,
+                client,
+                task_label,
+                project_id,
+                agent_session_id,
+                coding_task_id,
+                agent_role,
+                workload_kind,
+            )
 
         for target, handle in handles.items():
             thread = threading.Thread(target=run, args=(target, handle), daemon=True)
@@ -1495,6 +1841,11 @@ class ChatService:
         comparison_id: str | None,
         client: dict[str, Any] | None = None,
         task_label: str | None = None,
+        project_id: str | None = None,
+        agent_session_id: str | None = None,
+        coding_task_id: str | None = None,
+        agent_role: str | None = None,
+        workload_kind: str = "evaluation",
     ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         request_payload: dict[str, Any] = {
@@ -1556,6 +1907,11 @@ class ChatService:
                 "configuration": configuration,
                 "client_id": client["id"] if client else None,
                 "task_label": task_label,
+                "project_id": project_id,
+                "agent_session_id": agent_session_id,
+                "coding_task_id": coding_task_id,
+                "agent_role": agent_role,
+                "workload_kind": workload_kind,
             }
         )
         baseline = self.manager.sampler.capture()
@@ -1681,13 +2037,13 @@ class ChatService:
     @staticmethod
     def _normalize_usage(payload: dict[str, Any]) -> dict[str, Any]:
         usage = payload.get("usage") or {}
+        timings = payload.get("timings") or payload.get("timing") or {}
         details = usage.get("completion_tokens_details") or {}
-        input_tokens = usage.get("prompt_tokens")
-        output_tokens = usage.get("completion_tokens")
+        input_tokens = usage.get("prompt_tokens") or timings.get("prompt_n") or timings.get("prompt_tokens")
+        output_tokens = usage.get("completion_tokens") or timings.get("predicted_n") or timings.get("generated_tokens")
         thinking_tokens = details.get("reasoning_tokens")
         prompt_details = usage.get("prompt_tokens_details") or {}
         cached_tokens = prompt_details.get("cached_tokens")
-        timings = payload.get("timings") or payload.get("timing") or {}
         prefill_tokens = timings.get("prompt_n") or timings.get("prompt_tokens") or input_tokens
         visible_tokens = output_tokens
         if output_tokens is not None and thinking_tokens is not None:
@@ -1704,7 +2060,11 @@ class ChatService:
             "thinking_tokens": thinking_tokens,
             "visible_output_tokens": visible_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": usage.get("total_tokens"),
+            "total_tokens": usage.get("total_tokens") or (
+                input_tokens + output_tokens
+                if input_tokens is not None and output_tokens is not None
+                else None
+            ),
         }
 
     @staticmethod
@@ -1802,6 +2162,13 @@ class ApplicationState:
             "catalog": self.manager.catalog(),
             "status": self.manager.status(),
             "runs": self.store.recent(20),
+            "projects": self.store.projects(),
+            "coding_presets": {
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "max_tokens": 4096,
+                "workload_kind": "coding_agent",
+            },
         }
 
     def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1815,6 +2182,46 @@ class ApplicationState:
         github_repo = str(github_repo).strip() or None if github_repo else None
         return self.store.register_client(project_name, github_repo, output_path)
 
+    def create_project(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self.store.upsert_project(
+                str(payload.get("name") or ""),
+                str(payload.get("repo_path") or "").strip() or None,
+                str(payload.get("git_remote") or "").strip() or None,
+            )
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+
+    def create_agent_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id or self.store.get_project(project_id) is None:
+            raise AppError("A valid project_id is required.")
+        return self.store.create_agent_session(
+            project_id,
+            str(payload.get("agent_role") or "developer"),
+            str(payload.get("runtime") or "unknown"),
+        )
+
+    def create_coding_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id or self.store.get_project(project_id) is None:
+            raise AppError("A valid project_id is required.")
+        try:
+            return self.store.create_coding_task(
+                project_id,
+                str(payload.get("title") or ""),
+                str(payload.get("branch") or "").strip() or None,
+            )
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+
+    def record_tool_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id or self.store.get_project(project_id) is None:
+            raise AppError("A valid project_id is required.")
+        payload = {**payload, "project_id": project_id}
+        return self.store.record_tool_event(payload)
+
 
 class RequestHandler(BaseHTTPRequestHandler):
     server: ChatbotHTTPServer
@@ -1824,7 +2231,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {format % args}")
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if path == "/":
             self._send_bytes(HTTPStatus.OK, HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -1835,10 +2244,48 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, self.server.app_state.manager.status())
             return
         if path == "/api/dashboard":
-            self._send_json(HTTPStatus.OK, self.server.app_state.store.dashboard())
+            project_id = (query.get("project_id") or [None])[0]
+            workload_kind = (query.get("workload_kind") or [None])[0]
+            self._send_json(
+                HTTPStatus.OK,
+                self.server.app_state.store.dashboard(project_id, workload_kind),
+            )
             return
         if path == "/api/runs":
-            self._send_json(HTTPStatus.OK, {"runs": self.server.app_state.store.recent(100)})
+            try:
+                limit = int((query.get("limit") or [100])[0])
+                offset = int((query.get("offset") or [0])[0])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "limit and offset must be integers"})
+                return
+            project_id = (query.get("project_id") or [None])[0]
+            workload_kind = (query.get("workload_kind") or [None])[0]
+            store = self.server.app_state.store
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "runs": store.recent(limit, offset, project_id, workload_kind),
+                    "total": store.count_runs(project_id, workload_kind),
+                    "limit": max(1, min(limit, 500)),
+                    "offset": max(0, offset),
+                },
+            )
+            return
+        if path == "/api/projects":
+            self._send_json(HTTPStatus.OK, {"projects": self.server.app_state.store.projects()})
+            return
+        if path == "/v1/models" or (path.startswith("/v1/") and path.endswith("/models")):
+            servers = self.server.app_state.manager.status().get("servers", [])
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": server["target"], "object": "model", "owned_by": "dual-gpu-studio"}
+                        for server in servers
+                    ],
+                },
+            )
             return
         if path.startswith("/api/runs/"):
             run_id = path.rsplit("/", 1)[-1]
@@ -1861,6 +2308,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             payload = self._read_json()
+            if path == "/v1/chat/completions" or (
+                path.startswith("/v1/") and path.endswith("/chat/completions")
+            ):
+                self._proxy_openai_chat(path, payload)
+                return
             if path == "/api/deploy":
                 result = self.server.app_state.manager.deploy(payload)
             elif path == "/api/models/refresh":
@@ -1872,6 +2324,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = self.server.app_state.chat.chat(payload)
             elif path == "/api/clients/register":
                 result = self.server.app_state.register_client(payload)
+            elif path == "/api/projects":
+                result = self.server.app_state.create_project(payload)
+            elif path == "/api/agent-sessions":
+                result = self.server.app_state.create_agent_session(payload)
+            elif path == "/api/coding-tasks":
+                result = self.server.app_state.create_coding_task(payload)
+            elif path == "/api/tool-events":
+                result = self.server.app_state.record_tool_event(payload)
             elif path == "/api/clients/deploy":
                 context_window = payload.get("context_window")
                 input_tokens = payload.get("input_tokens")
@@ -1925,6 +2385,237 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
         except Exception as exc:  # noqa: BLE001
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+    def _proxy_openai_chat(self, path: str, payload: dict[str, Any]) -> None:
+        """Stream an OpenAI-compatible coding-agent request through an active GPU lane.
+
+        Supported base URLs are /v1 (model selects a lane), /v1/<lane>, and
+        /v1/<lane>/<role>. A registered client_id used as the Bearer key supplies project
+        attribution, which works with clients such as Cline that expose an API-key field but
+        do not expose arbitrary HTTP headers.
+        """
+        state = self.server.app_state
+        path_parts = [part for part in path.split("/") if part]
+        path_target = path_parts[1] if len(path_parts) >= 4 else None
+        path_role = path_parts[2] if len(path_parts) >= 5 else None
+        header_target = self.headers.get("X-DGPU-Target")
+        requested_model = str(payload.get("model") or "")
+        target_hint = header_target or path_target
+
+        with state.manager.lock:
+            if state.manager.state != "ready" or not state.manager.handles:
+                raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
+            handles = dict(state.manager.handles)
+            target = target_hint if target_hint in handles else None
+            if target is None:
+                model_hint = requested_model.removeprefix("dgpu:")
+                if model_hint in handles:
+                    target = model_hint
+                else:
+                    matches = [key for key, handle in handles.items() if handle.model.name == requested_model]
+                    if len(matches) == 1:
+                        target = matches[0]
+            if target is None and len(handles) == 1:
+                target = next(iter(handles))
+            if target is None:
+                raise AppError(
+                    "Select a GPU lane with model='dgpu:<lane>' or a /v1/<lane> base URL."
+                )
+            handle = handles[target]
+
+        authorization = self.headers.get("Authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        client = state.store.get_client(token) if token and token != "local" else None
+        if token and token != "local" and client is None:
+            raise AppError("The API key is not a registered Dual GPU Studio client_id.", HTTPStatus.UNAUTHORIZED)
+        project_ref = self.headers.get("X-DGPU-Project")
+        project = state.store.get_project(project_ref) if project_ref else None
+        project_id = (client or {}).get("project_id") or (project or {}).get("id")
+        if client and not project_id:
+            project = state.store.upsert_project(client["project_name"], git_remote=client.get("github_repo"))
+            project_id = project["id"]
+            state.store.link_client_project(client["id"], project_id)
+        agent_role = (
+            self.headers.get("X-DGPU-Agent-Role")
+            or path_role
+            or ("cline" if "cline" in self.headers.get("User-Agent", "").lower() else "coding-agent")
+        ).strip().lower()
+        session_id = self.headers.get("X-DGPU-Session") or None
+        coding_task_id = self.headers.get("X-DGPU-Task") or None
+        task_label = self.headers.get("X-DGPU-Task-Label") or None
+
+        request_payload = dict(payload)
+        request_payload["model"] = handle.model.name
+        stream = bool(request_payload.get("stream"))
+        capture_content = self.headers.get("X-DGPU-Capture-Content", "").lower() in {"1", "true", "yes"}
+        stored_request = dict(request_payload)
+        if not capture_content and isinstance(stored_request.get("messages"), list):
+            stored_request["messages"] = [
+                {
+                    "role": message.get("role"),
+                    "content_redacted": True,
+                    "content_characters": len(str(message.get("content") or "")),
+                }
+                for message in stored_request["messages"]
+                if isinstance(message, dict)
+            ]
+        run_id = str(uuid.uuid4())
+        model_path = resolve_model_path(state.config, handle.model)
+        state.store.begin_run(
+            {
+                "id": run_id,
+                "comparison_id": None,
+                "deployment_id": state.manager.deployment_id,
+                "created_at": utc_now(),
+                "mode": state.manager.mode,
+                "target": target,
+                "model_name": handle.model.name,
+                "model_path": str(model_path),
+                "lane_keys": [lane.key for lane in handle.lanes],
+                "device": handle.process.device,
+                "context_window": handle.process.ctx_size,
+                "reasoning_budget": handle.model.reasoning_budget,
+                "request": stored_request,
+                "configuration": {
+                    "app_version": APP_VERSION,
+                    "gateway": "openai-compatible",
+                    "endpoint": handle.process.base_url,
+                    "device": handle.process.device,
+                    "lanes": [asdict(lane) for lane in handle.lanes],
+                },
+                "client_id": client["id"] if client else None,
+                "task_label": task_label,
+                "project_id": project_id,
+                "agent_session_id": session_id,
+                "coding_task_id": coding_task_id,
+                "agent_role": agent_role,
+                "workload_kind": "coding_agent",
+            }
+        )
+        baseline = state.manager.sampler.capture()
+        started = time.monotonic()
+        backend_payload: dict[str, Any] = {}
+        output_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        first_token_at: float | None = None
+        response_started = False
+        try:
+            request = urlrequest.Request(
+                f"{handle.process.base_url}/v1/chat/completions",
+                data=json.dumps(request_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
+                method="POST",
+            )
+            with urlrequest.urlopen(request, timeout=900) as response:
+                if not stream:
+                    backend_payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                else:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.send_header("X-DGPU-Run-ID", run_id)
+                    self.end_headers()
+                    response_started = True
+                    while True:
+                        line = response.readline()
+                        if not line:
+                            break
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                        decoded = line.decode("utf-8", errors="replace").strip()
+                        if not decoded.startswith("data:") or decoded == "data: [DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(decoded[5:].strip())
+                        except json.JSONDecodeError:
+                            continue
+                        backend_payload.update({key: value for key, value in chunk.items() if key != "choices"})
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            delta = choices[0].get("delta") or {}
+                            content = delta.get("content") or ""
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                            if (content or reasoning) and first_token_at is None:
+                                first_token_at = time.monotonic()
+                            output_parts.append(content)
+                            reasoning_parts.append(reasoning)
+                            if choices[0].get("finish_reason") is not None:
+                                backend_payload["finish_reason"] = choices[0]["finish_reason"]
+
+            elapsed = time.monotonic() - started
+            if not stream:
+                choice = (backend_payload.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                output_parts = [message.get("content") or choice.get("text") or ""]
+                reasoning_parts = [message.get("reasoning_content") or message.get("reasoning") or ""]
+                backend_payload["finish_reason"] = choice.get("finish_reason")
+            usage = ChatService._normalize_usage(backend_payload)
+            timing = ChatService._normalize_timing(backend_payload, usage, elapsed)
+            if first_token_at is not None:
+                timing["time_to_first_token_ms"] = round((first_token_at - started) * 1000, 2)
+            state.manager.sampler.capture()
+            samples = state.chat._sample_window(started, baseline)
+            resources = ChatService._resource_summary(samples, target)
+            stored_backend = backend_payload if capture_content else {
+                key: value
+                for key, value in backend_payload.items()
+                if key not in {"choices"}
+            }
+            final = {
+                "status": "completed",
+                "output_text": "".join(output_parts) if capture_content else None,
+                "reasoning_text": ("".join(reasoning_parts) or None) if capture_content else None,
+                "finish_reason": backend_payload.get("finish_reason"),
+                "usage": usage,
+                "timing": timing,
+                "resources": resources,
+                "backend_response": stored_backend,
+            }
+            state.store.finish_run(run_id, final)
+            state.store.save_samples(run_id, samples, started)
+            state.chat._deliver_to_client(client, run_id, target, handle, final)
+            if not stream:
+                backend_payload["dgpu_run_id"] = run_id
+                self._send_json(HTTPStatus.OK, backend_payload)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            self._finish_gateway_failure(run_id, target, started, baseline, "cancelled", str(exc))
+        except urlerror.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self._finish_gateway_failure(run_id, target, started, baseline, "failed", detail)
+            if response_started:
+                return
+            raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
+        except Exception as exc:
+            self._finish_gateway_failure(run_id, target, started, baseline, "failed", str(exc))
+            if response_started:
+                return
+            raise
+
+    def _finish_gateway_failure(
+        self,
+        run_id: str,
+        target: str,
+        started: float,
+        baseline: dict[str, Any] | None,
+        status: str,
+        error_text: str,
+    ) -> None:
+        state = self.server.app_state
+        try:
+            state.manager.sampler.capture()
+            samples = state.chat._sample_window(started, baseline)
+            final = {
+                "status": status,
+                "usage": {},
+                "timing": {"end_to_end_duration_ms": round((time.monotonic() - started) * 1000, 2)},
+                "resources": ChatService._resource_summary(samples, target),
+                "error_text": error_text,
+            }
+            state.store.finish_run(run_id, final)
+            state.store.save_samples(run_id, samples, started)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -2064,8 +2755,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Web UI bind address. Defaults to all interfaces for local-network access.",
+        default="127.0.0.1",
+        help="Web UI bind address. Defaults to localhost; use 0.0.0.0 explicitly for LAN access.",
     )
     parser.add_argument("--port", type=int, default=8090, help="Web UI port. Defaults to 8090.")
     parser.add_argument("--data-dir", default="./chat_runs", help="Directory for SQLite data and server logs.")
