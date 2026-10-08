@@ -218,21 +218,20 @@ Then start the application:
 python .\app.py --config .\example.dual_gpu.toml
 ```
 
-The application now listens on the local network by default. The terminal prints both the Windows-local URL and detected LAN URL, for example:
+The application listens on localhost by default, which is the recommended mode for coding agents. The terminal prints the Windows-local URL:
 
 ```text
 Dual GPU Studio is running
   Windows local: http://127.0.0.1:8090
-  Local network: http://192.168.1.50:8090
 ```
 
-Open the local-network URL on your Mac. The Windows browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`:
+The Windows browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`:
 
 ```powershell
 python .\app.py --config .\example.dual_gpu.toml --port 8095 --no-browser
 ```
 
-To deliberately restrict the application to the Windows machine again, pass `--host 127.0.0.1`.
+To deliberately allow LAN access, pass `--host 0.0.0.0` and follow [local_network_setup.md](local_network_setup.md).
 
 The run database (`chat_runs/chatbot.sqlite3`) keeps every run and resource sample forever by
 default — there's no automatic retention policy. To prune old data, pass
@@ -663,6 +662,11 @@ This gives you:
 ## How Other Applications Can Connect
 
 This is the most important integration concept in the repo.
+
+For two coding agents running concurrently on separate GPU lanes, use the instrumented port-8090
+gateway rather than connecting directly to llama-server. The complete Cline + OpenCode setup,
+project attribution, worktree workflow, and privacy defaults are in
+[CODING_AGENTS.md](CODING_AGENTS.md).
 
 Other applications connect through the OpenAI-compatible HTTP endpoint started by `llama-server`.
 

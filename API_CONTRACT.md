@@ -103,7 +103,8 @@ Current deployment state and the latest resource sample. No input.
 
 ## GET `/api/dashboard`
 
-Aggregated analytics across all stored runs (not client-scoped). No input.
+Aggregated analytics across the complete stored history. Optional query parameters:
+`project_id=<uuid>` and `workload_kind=evaluation|coding_agent`.
 
 **Shares:**
 ```jsonc
@@ -115,7 +116,8 @@ Aggregated analytics across all stored runs (not client-scoped). No input.
     "models_used": "int",
     "input_tokens": "int", "output_tokens": "int", "thinking_tokens": "int",
     "visible_output_tokens": "int", "total_tokens": "int",
-    "avg_tokens_per_second": "float | null", "avg_prefill_tokens_per_second": "float | null",
+    "avg_tokens_per_second": "float | null", "aggregate_tokens_per_second": "float | null",
+    "avg_prefill_tokens_per_second": "float | null",
     "avg_latency_ms": "float | null", "p95_latency_ms": "float | null",
     "avg_ttft_ms": "float | null",
     "peak_process_ram_bytes": "int", "peak_vram_bytes": "int",
@@ -131,6 +133,10 @@ Aggregated analytics across all stored runs (not client-scoped). No input.
       "peak_vram_bytes": "int"
     }
   ],
+  "gpus": [ /* same summary fields, plus gpu: lane key */ ],
+  "projects": [ /* same summary fields, plus project_id and project name */ ],
+  "agents": [ /* same summary fields, plus agent_role */ ],
+  "tool_summary": { "events": "int", "failed": "int", "success_rate": "float | null" },
   "categories": [
     {
       "category": "string (a task_label value some /api/chat call used, e.g. 'resume_extraction')",
@@ -160,9 +166,10 @@ Aggregated analytics across all stored runs (not client-scoped). No input.
 
 ## GET `/api/runs`
 
-**Needs:** nothing (always returns the 100 most recent runs across all clients/callers).
+**Needs:** optional query parameters `limit` (1-500), `offset`, `project_id`, and
+`workload_kind`. Defaults to the 100 most recent runs.
 
-**Shares:** `{"runs": [<run row>, ...]}` — each run row:
+**Shares:** `{"runs": [<run row>, ...], "total": int, "limit": int, "offset": int}` — each run row:
 ```jsonc
 {
   "id": "uuid", "comparison_id": "uuid | null", "deployment_id": "uuid | null",
@@ -182,7 +189,10 @@ Aggregated analytics across all stored runs (not client-scoped). No input.
   "error_text": "string | null",
   "backend_response": null,
   "client_id": "uuid | null (set only if this run was made via /api/chat with client_id)",
-  "task_label": "string | null (set only if this run was made via /api/chat with task_label)"
+  "task_label": "string | null (set only if this run was made via /api/chat with task_label)",
+  "project_id": "uuid | null", "agent_session_id": "uuid | null",
+  "coding_task_id": "uuid | null", "agent_role": "string | null",
+  "workload_kind": "evaluation | coding_agent"
 }
 ```
 
@@ -291,6 +301,11 @@ Run a prompt against the currently loaded deployment.
 | `timeout_seconds` | number | optional | default `900` |
 | `client_id` | uuid string | optional | from `/api/clients/register`; tags this run and appends its metrics to that client's `output_path` |
 | `task_label` | string | optional | freeform tag for what kind of work this call was (e.g. `"relevance"`, `"resume_extraction"`, `"fraud_d2_fusion"`). Stored on the run and rolled up into `/api/dashboard`'s `categories`/`category_models`, which back the dashboard's Analytics tab. No enum — any non-empty string works. |
+| `project_id` | uuid string | optional | project from `POST /api/projects`; a registered `client_id` supplies this automatically |
+| `workload_kind` | string | optional | `evaluation` (default) or `coding_agent` |
+| `agent_role` | string | optional | e.g. `developer`, `qa`, or `reviewer` |
+| `agent_session_id` | uuid string | optional | session created with `POST /api/agent-sessions` |
+| `coding_task_id` | uuid string | optional | task created with `POST /api/coding-tasks` |
 
 **Shares:**
 ```jsonc
@@ -341,6 +356,28 @@ Run a prompt against the currently loaded deployment.
 `messages`/`prompt` given, or unknown `client_id`.
 
 ---
+
+## OpenAI-compatible coding-agent gateway
+
+`GET /v1/models` and `POST /v1/chat/completions` provide the standard OpenAI-compatible
+surface. Lane- and role-pinned variants are also supported:
+`/v1/<lane>/<agent-role>/models` and `/v1/<lane>/<agent-role>/chat/completions`.
+
+Use a registered `client_id` as the Bearer API key to attach the request to its project. Streaming
+requests are relayed as SSE and receive an `X-DGPU-Run-ID` response header. Non-streaming responses
+contain `dgpu_run_id`. The optional `X-DGPU-Project`, `X-DGPU-Agent-Role`, `X-DGPU-Session`,
+`X-DGPU-Task`, and `X-DGPU-Task-Label` headers add attribution. Coding prompt and completion content
+is redacted from storage unless `X-DGPU-Capture-Content: true` is supplied.
+
+## Project and agent telemetry endpoints
+
+- `GET /api/projects` lists registered projects with run/token totals.
+- `POST /api/projects` needs `name`; `repo_path` and `git_remote` are optional. It creates or
+  updates by case-insensitive name.
+- `POST /api/agent-sessions` needs `project_id`; `agent_role` and `runtime` are optional.
+- `POST /api/coding-tasks` needs `project_id` and `title`; `branch` is optional.
+- `POST /api/tool-events` needs `project_id`; accepts `session_id`, `task_id`, `run_id`,
+  `tool_type`, `duration_ms`, `exit_code`, `status`, and arbitrary JSON `detail`.
 
 ## POST `/api/clients/register`
 
