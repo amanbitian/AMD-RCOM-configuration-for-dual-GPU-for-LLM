@@ -28,6 +28,7 @@ from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig, load_confi
 from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
 from dual_gpu_setup.orchestrator import ctx_for, estimate_kv_cache_gb, lane_capacity_gb, resolve_context_window
 from dual_gpu_setup.server import LlamaServerProcess, gpu_process_metrics_batch
+from dual_gpu_setup.reasoning import coding_request, model_reasoning
 
 
 APP_VERSION = "0.1.0"
@@ -42,8 +43,14 @@ CLIENT_METRICS_SCHEMA = {
         "cached_input_tokens": "Prompt tokens served from KV cache reuse, if reported by the backend.",
         "uncached_input_tokens": "input_tokens minus cached_input_tokens.",
         "prefill_tokens": "Tokens processed during the prefill/prompt phase.",
-        "thinking_tokens": "Reasoning/thinking tokens, when the model produced any.",
+        "thinking_tokens": "Exact reasoning/thinking tokens as reported by the backend; null when it reports none.",
+        "thinking_tokens_estimated": "Fallback ~4-chars/token estimate of thinking tokens, set only when the backend omits an exact count but reasoning text was observed; null otherwise.",
+        "thinking_characters": "Observed reasoning-text characters (streamed deltas or a non-streamed message's reasoning); the basis for thinking_tokens_estimated.",
+        "thinking_tokens_source": "backend (exact count), estimated_from_characters (fallback estimate), or unavailable (no reasoning observed).",
         "visible_output_tokens": "output_tokens minus thinking_tokens.",
+        "tool_calls_total": "Number of tool calls the model emitted in this response.",
+        "tool_calls_malformed": "Tool calls with no function name or unparseable JSON arguments; grammar/schema constraints reduce this.",
+        "tool_call_valid_rate": "(tool_calls_total - tool_calls_malformed) / tool_calls_total; null when the response made no tool calls.",
         "output_tokens": "Total completion tokens generated.",
         "total_tokens": "input_tokens + output_tokens as reported by the backend.",
     },
@@ -54,9 +61,16 @@ CLIENT_METRICS_SCHEMA = {
         "end_to_end_duration_ms": "Total wall time for the request.",
         "prefill_tokens_per_second": "Prefill rate: prompt tokens / prefill duration.",
         "tokens_per_second": "Decode rate: output tokens / decode duration.",
+        "end_to_end_tokens_per_second": "Output tokens / full request duration, including prefill; not decode speed.",
         "backend_prompt_tokens": "Prompt token count as reported natively by llama-server.",
         "backend_output_tokens": "Output token count as reported natively by llama-server.",
+        "draft_tokens": "Tokens proposed by the speculative draft model; null when speculative decoding is off or unreported.",
+        "draft_accepted_tokens": "Draft tokens the target model accepted; null when speculative decoding is off or unreported.",
+        "draft_acceptance_rate": "draft_accepted_tokens / draft_tokens; higher means the draft is a better match and the speedup is larger. Null when unavailable.",
         "native_timing": "Raw timings object returned by the backend, unmodified.",
+        "reasoning_duration_ms": "Observed time from first to last reasoning chunk in a streamed coding response; not native decode time.",
+        "reasoning_duration_source": "observed_stream_span when reasoning chunks were observed, otherwise null.",
+        "time_to_first_visible_token_ms": "Elapsed time until the first answer or tool-call chunk, excluding reasoning-only chunks.",
     },
     "resources": {
         "avg_process_cpu_pct": "Average CPU percent of the model process during the run.",
@@ -825,8 +839,16 @@ class RunStore:
             conditions.append("workload_kind = ?")
             params.append(workload_kind)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        with self.lock, self.connect() as connection:
-            rows = connection.execute(f"SELECT * FROM runs{where} ORDER BY created_at DESC", params).fetchall()
+        # WAL readers need not hold the writer lock. Do not copy/parse large prompt,
+        # completion, or backend-response bodies for performance aggregates.
+        with self.connect() as connection:
+            rows = connection.execute(f"""
+                SELECT id, created_at, status, mode, target, model_name, lane_keys_json,
+                    context_window, reasoning_budget, project_id, agent_role, task_label,
+                    workload_kind, usage_json, timing_json, resources_json,
+                    json_object('reasoning', json_extract(configuration_json, '$.reasoning')) AS configuration_json
+                FROM runs{where} ORDER BY created_at DESC
+            """, params).fetchall()
         return [self._decode(row) for row in rows]
 
     def get(self, run_id: str) -> dict[str, Any] | None:
@@ -882,15 +904,27 @@ class RunStore:
 
         def summarize(group: list[dict[str, Any]]) -> dict[str, Any]:
             group_completed = [run for run in group if run.get("status") == "completed"]
-            output_tokens = total(("usage", "output_tokens"), group_completed)
-            decode_ms = sum(nums(("timing", "decode_duration_ms"), group_completed))
+            timed = [run for run in group_completed if (run.get("timing") or {}).get("decode_duration_ms", 0)
+                     and (run.get("usage") or {}).get("output_tokens") is not None]
+            output_tokens = total(("usage", "output_tokens"), timed)
+            decode_ms = sum(nums(("timing", "decode_duration_ms"), timed))
             return {
                 "runs": len(group),
                 "success_rate": round(len(group_completed) / len(group) * 100, 1) if group else None,
                 "input_tokens": total(("usage", "input_tokens"), group),
                 "output_tokens": total(("usage", "output_tokens"), group),
                 "thinking_tokens": total(("usage", "thinking_tokens"), group),
+                "thinking_tokens_reported_runs": len(nums(("usage", "thinking_tokens"), group_completed)),
+                "avg_thinking_tokens": average(("usage", "thinking_tokens"), group_completed),
+                "thinking_tokens_estimated_runs": len(nums(("usage", "thinking_tokens_estimated"), group_completed)),
+                "avg_thinking_tokens_estimated": average(("usage", "thinking_tokens_estimated"), group_completed),
+                "avg_thinking_characters": average(("usage", "thinking_characters"), group_completed),
+                "avg_reasoning_duration_ms": average(("timing", "reasoning_duration_ms"), group_completed),
                 "avg_tokens_per_second": average(("timing", "tokens_per_second"), group_completed),
+                "avg_draft_acceptance_rate": average(("timing", "draft_acceptance_rate"), group_completed),
+                "tool_calls_total": total(("usage", "tool_calls_total"), group_completed),
+                "tool_calls_malformed": total(("usage", "tool_calls_malformed"), group_completed),
+                "avg_tool_call_valid_rate": average(("usage", "tool_call_valid_rate"), group_completed),
                 "aggregate_tokens_per_second": (
                     round(output_tokens / (decode_ms / 1000), 2) if decode_ms > 0 else None
                 ),
@@ -955,6 +989,14 @@ class RunStore:
             agent_rows.append({"agent_role": role, **summarize(group)})
 
         tool_summary = {"events": 0, "failed": 0, "success_rate": None}
+        reasoning_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for run in runs:
+            reasoning = (run.get("configuration") or {}).get("reasoning") or {}
+            if run.get("workload_kind") == "coding_agent":
+                level = reasoning.get("effective_effort") or reasoning.get("effort") or "unknown"
+                reasoning_groups.setdefault((run["model_name"], level), []).append(run)
+        reasoning_levels = [{"model": model, "effort": effort, **summarize(group)}
+                            for (model, effort), group in sorted(reasoning_groups.items())]
         tool_conditions: list[str] = []
         tool_params: list[Any] = []
         if project_id:
@@ -1028,6 +1070,7 @@ class RunStore:
             "gpus": gpu_lanes,
             "projects": project_rows,
             "agents": agent_rows,
+            "reasoning_levels": reasoning_levels,
             "tool_summary": tool_summary,
             "categories": categories,
             "category_models": category_models,
@@ -1069,6 +1112,17 @@ class ServerHandle:
         self.model = model
         self.lanes = lanes
         self.process = process
+        self._reasoning_capabilities: dict[str, Any] | None = None
+
+    def reasoning_capabilities(self, config: AppConfig) -> dict[str, Any]:
+        # The model file is fixed for the life of a deployment, so read its native
+        # effort levels once per handle. Reloading the model makes a fresh handle.
+        # Re-resolving/stat-ing the GGUF on every agent tool turn is pure latency.
+        if self._reasoning_capabilities is None:
+            resolved = getattr(self.process, "model_path", None)
+            path = Path(resolved) if resolved is not None else resolve_model_path(config, self.model)
+            self._reasoning_capabilities = model_reasoning(path)
+        return self._reasoning_capabilities
 
     def public(self) -> dict[str, Any]:
         return {
@@ -1081,6 +1135,9 @@ class ServerHandle:
             "alive": bool(self.process.proc and self.process.proc.poll() is None),
             "context_window": self.process.ctx_size,
             "reasoning_budget": self.model.reasoning_budget,
+            "reasoning_mode": self.model.reasoning_mode,
+            "reasoning_effort": self.model.reasoning_effort,
+            "draft_model": self.model.draft_model or None,
         }
 
 
@@ -1250,6 +1307,7 @@ class DeploymentManager:
                 if model.reasoning_budget is not None
                 else self.config.policy.reasoning_budget
             ),
+            "coding_reasoning": model_reasoning(path),
             "tensor_split": model.tensor_split or None,
         }
 
@@ -1410,7 +1468,10 @@ class DeploymentManager:
 
     def _configured_model(self, raw: dict[str, Any], lane_vram_gb: float) -> tuple[ModelConfig, int]:
         source = self._model(str(raw.get("model", "")))
-        context = int(raw.get("context_window") or source.ctx_size or ctx_for(self.config, model_size_gb(self.config, source), lane_vram_gb))
+        # A draft model shares the lane's VRAM, so include it in the footprint the
+        # auto-sizer leaves headroom against (explicit context_window still wins).
+        footprint_gb = model_size_gb(self.config, source) + self._draft_footprint_gb(source)
+        context = int(raw.get("context_window") or source.ctx_size or ctx_for(self.config, footprint_gb, lane_vram_gb))
         if context < 256:
             raise AppError("Context window must be at least 256 tokens.")
         input_tokens = raw.get("input_tokens")
@@ -1423,14 +1484,41 @@ class DeploymentManager:
             except ValueError as exc:
                 raise AppError(str(exc)) from exc
         budget = int(raw.get("reasoning_budget", source.reasoning_budget if source.reasoning_budget is not None else self.config.policy.reasoning_budget))
-        if budget < 0:
-            raise AppError("Reasoning budget cannot be negative.")
+        if budget < -1:
+            raise AppError("Reasoning budget must be -1 (unlimited) or non-negative.")
+        # The UI exposes a budget selector: choosing a positive budget must also
+        # enable thinking, even when the base TOML policy defaults to off.
+        reasoning_mode = raw.get("reasoning_mode")
+        if reasoning_mode is None:
+            reasoning_mode = (
+                ("auto" if budget == -1 else "on" if budget > 0 else "off")
+                if "reasoning_budget" in raw
+                else source.reasoning_mode or self.config.policy.reasoning_mode
+            )
+        if reasoning_mode not in {"on", "off", "auto"}:
+            raise AppError("reasoning_mode must be on, off, or auto.")
+        effort = str(raw.get("reasoning_effort", source.reasoning_effort))
+        if raw.get("workload_kind") == "coding_agent":
+            budget, reasoning_mode = -1, "auto"
+            capabilities = model_reasoning(resolve_model_path(self.config, source))
+            if effort not in capabilities["efforts"]:
+                raise AppError(f"Unsupported reasoning effort '{effort}'. Available: {', '.join(capabilities['efforts'])}.")
         tensor_split = str(raw.get("tensor_split") or source.tensor_split)
-        model = replace(source, ctx_size=context, reasoning_budget=budget, tensor_split=tensor_split)
+        model = replace(source, ctx_size=context, reasoning_budget=budget,
+                        reasoning_mode=reasoning_mode, reasoning_effort=effort, tensor_split=tensor_split)
         path = resolve_model_path(self.config, model)
         if not path.exists():
             raise AppError(f"Model file does not exist: {path}")
+        if model.draft_model:
+            draft_path = resolve_model_path(self.config, replace(model, path=model.draft_model))
+            if not draft_path.exists():
+                raise AppError(f"Draft model file does not exist: {draft_path}")
         return model, context
+
+    def _draft_footprint_gb(self, model: ModelConfig) -> float:
+        if not model.draft_model:
+            return 0.0
+        return model_size_gb(self.config, replace(model, path=model.draft_model))
 
     def _requested_model_names_by_lane(self) -> dict[str, str]:
         """Map lane key -> the exact model string the caller last asked for on that lane.
@@ -1458,6 +1546,10 @@ class DeploymentManager:
         return requested
 
     def _validate_profile(self, mode: str, profile: dict[str, Any]) -> list[dict[str, Any]]:
+        if profile.get("workload_kind") == "coding_agent":
+            profile = {**profile,
+                       "model": {**(profile.get("model") or {}), "workload_kind": "coding_agent"},
+                       "models": [{**raw, "workload_kind": "coding_agent"} for raw in profile.get("models", [])]}
         if mode == "single_large_model":
             raw = profile.get("model") or {}
             model, context = self._configured_model(raw, sum(lane.vram_gb for lane in self.config.lanes))
@@ -1752,6 +1844,70 @@ class ChatService:
         self.store = store
         self._client_output_lock = threading.Lock()
 
+    def _coding_request(self, handle: ServerHandle, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        policy = self.manager.config.policy
+        try:
+            self._validate_structured_output(payload)
+            return coding_request(
+                payload, capabilities=handle.reasoning_capabilities(self.manager.config),
+                default_effort=handle.model.reasoning_effort,
+                server_budget=handle.model.reasoning_budget if handle.model.reasoning_budget is not None else policy.reasoning_budget,
+                server_mode=handle.model.reasoning_mode or policy.reasoning_mode,
+            )
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+
+    @staticmethod
+    def _validate_structured_output(payload: dict[str, Any]) -> None:
+        """Fail fast on malformed structured-output constraints so a coding harness gets a
+        clear error instead of a cryptic backend failure. These fields pass through to
+        llama-server untouched: `grammar` (GBNF), `json_schema`, and `response_format`.
+        Grammar/schema-constrained decoding is the most reliable way to stop a local model
+        emitting malformed tool-call JSON, which is the dominant tool-use failure mode."""
+        grammar = payload.get("grammar")
+        if grammar is not None and (not isinstance(grammar, str) or not grammar.strip()):
+            raise ValueError("`grammar` must be a non-empty GBNF string.")
+        json_schema = payload.get("json_schema")
+        if json_schema is not None and not isinstance(json_schema, dict):
+            raise ValueError("`json_schema` must be an object.")
+        response_format = payload.get("response_format")
+        if response_format is not None:
+            if not isinstance(response_format, dict):
+                raise ValueError("`response_format` must be an object.")
+            kind = response_format.get("type")
+            if kind not in {"text", "json_object", "json_schema"}:
+                raise ValueError("`response_format.type` must be text, json_object, or json_schema.")
+            if kind == "json_schema" and not isinstance(response_format.get("json_schema"), dict):
+                raise ValueError("`response_format` of type json_schema requires a `json_schema` object.")
+        if grammar is not None and response_format is not None:
+            raise ValueError("Set `grammar` or `response_format`, not both.")
+
+    @staticmethod
+    def _tool_call_stats(tool_calls: list[dict[str, Any]] | None) -> dict[str, Any]:
+        """Validity of the model's emitted tool calls. Malformed = a call with no function
+        name, or whose JSON `arguments` string does not parse. Empty arguments are valid (a
+        no-argument call). This is exactly what grammar/schema constraints are meant to fix,
+        so the valid rate is the signal for whether constraining output is helping."""
+        total = 0
+        malformed = 0
+        for call in tool_calls or []:
+            function = (call or {}).get("function") or {}
+            name = function.get("name")
+            arguments = function.get("arguments")
+            total += 1
+            if not name:
+                malformed += 1
+                continue
+            if isinstance(arguments, str) and arguments.strip():
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError:
+                    malformed += 1
+        if total == 0:
+            return {"tool_calls_total": 0, "tool_calls_malformed": 0, "tool_call_valid_rate": None}
+        return {"tool_calls_total": total, "tool_calls_malformed": malformed,
+                "tool_call_valid_rate": round((total - malformed) / total, 3)}
+
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         client: dict[str, Any] | None = None
         client_id = payload.get("client_id")
@@ -1805,6 +1961,11 @@ class ChatService:
                 raise AppError("A prompt or messages array is required.")
             messages = [{"role": "user", "content": prompt}]
         comparison_id = str(uuid.uuid4()) if len(handles) > 1 else None
+        if workload_kind == "coding_agent":
+            # Validate before starting workers, so invalid settings return a proper
+            # HTTP error instead of an uncaught thread exception and empty results.
+            for handle in handles.values():
+                self._coding_request(handle, payload)
         results: dict[str, Any] = {}
         threads = []
 
@@ -1854,11 +2015,20 @@ class ChatService:
             "stream": False,
             "temperature": float(payload.get("temperature", 0.7)),
             "top_p": float(payload.get("top_p", 0.95)),
-            "max_tokens": int(payload.get("max_tokens", 1024)),
         }
+        if payload.get("max_tokens") is not None:
+            request_payload["max_tokens"] = int(payload["max_tokens"])
+        elif workload_kind != "coding_agent":
+            request_payload["max_tokens"] = 1024
+        reasoning_settings = None
+        if workload_kind == "coding_agent":
+            for key in ("reasoning_effort", "chat_template_kwargs", "max_completion_tokens"):
+                if key in payload:
+                    request_payload[key] = payload[key]
+            request_payload, reasoning_settings = self._coding_request(handle, request_payload)
         if payload.get("seed") is not None:
             request_payload["seed"] = int(payload["seed"])
-        model_path = resolve_model_path(self.manager.config, handle.model)
+        model_path = getattr(handle.process, "model_path", None) or resolve_model_path(self.manager.config, handle.model)
         configuration = {
             "app_version": APP_VERSION,
             "deployment_id": self.manager.deployment_id,
@@ -1888,6 +2058,7 @@ class ChatService:
             ),
             "lanes": [asdict(lane) for lane in handle.lanes],
             "server_command": handle.process.build_command(),
+            "reasoning": reasoning_settings,
         }
         self.store.begin_run(
             {
@@ -1914,7 +2085,7 @@ class ChatService:
                 "workload_kind": workload_kind,
             }
         )
-        baseline = self.manager.sampler.capture()
+        baseline = self.manager.sampler.latest() if workload_kind == "coding_agent" else self.manager.sampler.capture()
         started = time.monotonic()
         try:
             backend = self._post_json(
@@ -1928,8 +2099,10 @@ class ChatService:
             output = message.get("content") or choice.get("text") or ""
             reasoning = message.get("reasoning_content") or message.get("reasoning")
             usage = self._normalize_usage(backend)
+            usage.update(self._tool_call_stats(message.get("tool_calls")))
             timing = self._normalize_timing(backend, usage, elapsed)
-            self.manager.sampler.capture()
+            if workload_kind != "coding_agent":
+                self.manager.sampler.capture()
             samples = self._sample_window(started, baseline)
             resources = self._resource_summary(samples, target)
             final = {
@@ -1941,6 +2114,7 @@ class ChatService:
                 "timing": timing,
                 "resources": resources,
                 "backend_response": backend,
+                "reasoning": reasoning_settings,
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
@@ -1951,7 +2125,8 @@ class ChatService:
             return result
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - started
-            self.manager.sampler.capture()
+            if workload_kind != "coding_agent":
+                self.manager.sampler.capture()
             samples = self._sample_window(started, baseline)
             resources = self._resource_summary(samples, target)
             final = {
@@ -1999,6 +2174,7 @@ class ChatService:
             "usage": final.get("usage"),
             "timing": final.get("timing"),
             "resources": final.get("resources"),
+            "reasoning": final.get("reasoning"),
             "error_text": final.get("error_text"),
         }
         output_path = Path(client["output_path"]).expanduser()
@@ -2039,13 +2215,39 @@ class ChatService:
         usage = payload.get("usage") or {}
         timings = payload.get("timings") or payload.get("timing") or {}
         details = usage.get("completion_tokens_details") or {}
-        input_tokens = usage.get("prompt_tokens") or timings.get("prompt_n") or timings.get("prompt_tokens")
-        output_tokens = usage.get("completion_tokens") or timings.get("predicted_n") or timings.get("generated_tokens")
+        def first(*values: Any) -> Any:
+            return next((value for value in values if value is not None), None)
+
+        prefill_tokens = first(timings.get("prompt_n"), timings.get("prompt_tokens"))
+        input_tokens = usage.get("prompt_tokens")
+        if input_tokens is None and prefill_tokens is not None:
+            input_tokens = prefill_tokens + (timings.get("cache_n") or 0)
+        output_tokens = first(usage.get("completion_tokens"), timings.get("predicted_n"), timings.get("generated_tokens"))
         thinking_tokens = details.get("reasoning_tokens")
         prompt_details = usage.get("prompt_tokens_details") or {}
-        cached_tokens = prompt_details.get("cached_tokens")
-        prefill_tokens = timings.get("prompt_n") or timings.get("prompt_tokens") or input_tokens
+        cached_tokens = first(prompt_details.get("cached_tokens"), timings.get("cache_n"))
+        if prefill_tokens is None and input_tokens is not None and cached_tokens is not None:
+            prefill_tokens = max(0, input_tokens - cached_tokens)
+        # Reasoning characters: supplied by the streaming gateway (deltas are not kept
+        # on the payload), else summed from a non-streamed message's reasoning text.
+        reasoning_characters = payload.get("reasoning_characters")
+        if reasoning_characters is None:
+            reasoning_characters = sum(
+                len((choice.get("message") or {}).get("reasoning_content") or
+                    (choice.get("message") or {}).get("reasoning") or "")
+                for choice in payload.get("choices", [])
+            )
         visible_tokens = output_tokens
+        reasoning_observed = bool(payload.get("reasoning_observed") or reasoning_characters)
+        # Native effort levels carry no fixed budget, so track what each run actually
+        # spends on thinking. Prefer the backend's exact reasoning-token count; when it
+        # is omitted, fall back to a labeled ~4-chars/token estimate (never mixed into
+        # the exact-count aggregates, never passed off as a backend figure).
+        thinking_tokens_estimated = None
+        if thinking_tokens is None and reasoning_characters > 0:
+            thinking_tokens_estimated = max(1, round(reasoning_characters / 4))
+        if thinking_tokens is None and reasoning_observed:
+            visible_tokens = None
         if output_tokens is not None and thinking_tokens is not None:
             visible_tokens = max(0, output_tokens - thinking_tokens)
         return {
@@ -2058,24 +2260,43 @@ class ChatService:
             ),
             "prefill_tokens": prefill_tokens,
             "thinking_tokens": thinking_tokens,
+            "thinking_tokens_estimated": thinking_tokens_estimated,
+            "thinking_characters": reasoning_characters or None,
+            "thinking_tokens_source": (
+                "backend" if thinking_tokens is not None
+                else "estimated_from_characters" if thinking_tokens_estimated is not None
+                else "unavailable"
+            ),
             "visible_output_tokens": visible_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": usage.get("total_tokens") or (
+            "total_tokens": first(usage.get("total_tokens"), (
                 input_tokens + output_tokens
                 if input_tokens is not None and output_tokens is not None
                 else None
-            ),
+            )),
         }
 
     @staticmethod
     def _normalize_timing(payload: dict[str, Any], usage: dict[str, Any], elapsed: float) -> dict[str, Any]:
         timings = payload.get("timings") or payload.get("timing") or {}
-        prompt_ms = timings.get("prompt_ms") or timings.get("prompt_eval_time_ms")
-        predicted_ms = timings.get("predicted_ms") or timings.get("generation_time_ms")
-        prefill_rate = timings.get("prompt_per_second") or timings.get("prompt_tokens_per_second")
-        token_rate = timings.get("predicted_per_second") or timings.get("tokens_per_second")
-        if token_rate is None and usage.get("output_tokens") and elapsed > 0:
-            token_rate = usage["output_tokens"] / elapsed
+        def first(*values: Any) -> Any:
+            return next((value for value in values if value is not None), None)
+
+        prompt_ms = first(timings.get("prompt_ms"), timings.get("prompt_eval_time_ms"))
+        predicted_ms = first(timings.get("predicted_ms"), timings.get("generation_time_ms"))
+        prefill_rate = first(timings.get("prompt_per_second"), timings.get("prompt_tokens_per_second"))
+        token_rate = first(timings.get("predicted_per_second"), timings.get("tokens_per_second"))
+        if token_rate is None and predicted_ms is not None and predicted_ms > 0 and usage.get("output_tokens") is not None:
+            token_rate = usage["output_tokens"] / (predicted_ms / 1000)
+        end_to_end_rate = usage["output_tokens"] / elapsed if usage.get("output_tokens") is not None and elapsed > 0 else None
+        # Speculative decoding stats (present only when a draft model is loaded). Key
+        # names vary across llama.cpp builds, so probe timings and the top-level payload.
+        draft_tokens = first(timings.get("draft_n"), timings.get("n_draft"), timings.get("draft_tokens"),
+                             payload.get("draft_n"))
+        draft_accepted = first(timings.get("draft_n_accepted"), timings.get("n_draft_accepted"),
+                               timings.get("draft_accepted"), payload.get("draft_n_accepted"))
+        acceptance = (round(draft_accepted / draft_tokens, 3)
+                      if draft_tokens and draft_accepted is not None and draft_tokens > 0 else None)
         return {
             "time_to_first_token_ms": timings.get("time_to_first_token_ms"),
             "prefill_duration_ms": prompt_ms,
@@ -2083,8 +2304,12 @@ class ChatService:
             "end_to_end_duration_ms": round(elapsed * 1000, 2),
             "prefill_tokens_per_second": round(float(prefill_rate), 3) if prefill_rate is not None else None,
             "tokens_per_second": round(float(token_rate), 3) if token_rate is not None else None,
-            "backend_prompt_tokens": timings.get("prompt_n") or timings.get("prompt_tokens"),
-            "backend_output_tokens": timings.get("predicted_n") or timings.get("generated_tokens"),
+            "end_to_end_tokens_per_second": round(end_to_end_rate, 3) if end_to_end_rate is not None else None,
+            "backend_prompt_tokens": first(timings.get("prompt_n"), timings.get("prompt_tokens")),
+            "backend_output_tokens": first(timings.get("predicted_n"), timings.get("generated_tokens")),
+            "draft_tokens": draft_tokens,
+            "draft_accepted_tokens": draft_accepted,
+            "draft_acceptance_rate": acceptance,
             "native_timing": timings,
         }
 
@@ -2166,7 +2391,9 @@ class ApplicationState:
             "coding_presets": {
                 "temperature": 0.2,
                 "top_p": 0.95,
-                "max_tokens": 4096,
+                "max_tokens": None,
+                "reasoning_budget": -1,
+                "reasoning_effort": "default",
                 "workload_kind": "coding_agent",
             },
         }
@@ -2406,6 +2633,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             if state.manager.state != "ready" or not state.manager.handles:
                 raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
             handles = dict(state.manager.handles)
+            if target_hint and target_hint not in handles:
+                raise AppError(f"GPU lane '{target_hint}' is not loaded.", HTTPStatus.CONFLICT)
             target = target_hint if target_hint in handles else None
             if target is None:
                 model_hint = requested_model.removeprefix("dgpu:")
@@ -2446,7 +2675,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         request_payload = dict(payload)
         request_payload["model"] = handle.model.name
+        request_payload, reasoning_settings = state.chat._coding_request(handle, request_payload)
         stream = bool(request_payload.get("stream"))
+        if stream:
+            # Request final token counts unless the caller explicitly opts out.
+            stream_options = dict(request_payload.get("stream_options") or {})
+            stream_options.setdefault("include_usage", True)
+            request_payload["stream_options"] = stream_options
         capture_content = self.headers.get("X-DGPU-Capture-Content", "").lower() in {"1", "true", "yes"}
         stored_request = dict(request_payload)
         if not capture_content and isinstance(stored_request.get("messages"), list):
@@ -2460,7 +2695,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if isinstance(message, dict)
             ]
         run_id = str(uuid.uuid4())
-        model_path = resolve_model_path(state.config, handle.model)
+        # Reuse the path resolved at deploy time; re-globbing the models dir on
+        # every agent tool turn only adds latency for a value that cannot change.
+        model_path = getattr(handle.process, "model_path", None) or resolve_model_path(state.config, handle.model)
         state.store.begin_run(
             {
                 "id": run_id,
@@ -2482,6 +2719,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "endpoint": handle.process.base_url,
                     "device": handle.process.device,
                     "lanes": [asdict(lane) for lane in handle.lanes],
+                    "reasoning": reasoning_settings,
                 },
                 "client_id": client["id"] if client else None,
                 "task_label": task_label,
@@ -2492,12 +2730,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "workload_kind": "coding_agent",
             }
         )
-        baseline = state.manager.sampler.capture()
+        # GPU sampling launches PowerShell/Get-Counter on Windows. The background
+        # sampler already owns that work; never put it on every agent tool turn.
+        baseline = state.manager.sampler.latest()
         started = time.monotonic()
         backend_payload: dict[str, Any] = {}
         output_parts: list[str] = []
         reasoning_parts: list[str] = []
         first_token_at: float | None = None
+        reasoning_started_at: float | None = None
+        reasoning_last_at: float | None = None
+        first_visible_at: float | None = None
+        reasoning_characters = 0
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
         response_started = False
         try:
             request = urlrequest.Request(
@@ -2516,7 +2761,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_header("Connection", "close")
                     self.send_header("X-DGPU-Run-ID", run_id)
                     self.end_headers()
+                    self.close_connection = True
                     response_started = True
+                    stream_complete = False
                     while True:
                         line = response.readline()
                         if not line:
@@ -2524,24 +2771,53 @@ class RequestHandler(BaseHTTPRequestHandler):
                         self.wfile.write(line)
                         self.wfile.flush()
                         decoded = line.decode("utf-8", errors="replace").strip()
-                        if not decoded.startswith("data:") or decoded == "data: [DONE]":
+                        if stream_complete and not decoded:
+                            break  # [DONE] ends SSE; do not wait for backend TCP EOF.
+                        if decoded.startswith("data:") and decoded[5:].strip() == "[DONE]":
+                            stream_complete = True
+                            continue
+                        if not decoded.startswith("data:"):
                             continue
                         try:
                             chunk = json.loads(decoded[5:].strip())
                         except json.JSONDecodeError:
                             continue
-                        backend_payload.update({key: value for key, value in chunk.items() if key != "choices"})
+                        if chunk.get("error"):
+                            raise RuntimeError(f"Model stream error: {chunk['error']}")
+                        backend_payload.update({key: value for key, value in chunk.items()
+                                                if key != "choices" and value is not None})
                         choices = chunk.get("choices") or []
                         if choices:
                             delta = choices[0].get("delta") or {}
                             content = delta.get("content") or ""
                             reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                            if (content or reasoning) and first_token_at is None:
+                            now = time.monotonic()
+                            if reasoning:
+                                if reasoning_started_at is None:
+                                    reasoning_started_at = now
+                                reasoning_last_at = now
+                                reasoning_characters += len(reasoning)
+                                backend_payload["reasoning_observed"] = True
+                            if (content or delta.get("tool_calls")) and first_visible_at is None:
+                                first_visible_at = now
+                            if (content or reasoning or delta.get("tool_calls")) and first_token_at is None:
                                 first_token_at = time.monotonic()
-                            output_parts.append(content)
-                            reasoning_parts.append(reasoning)
+                            for call in (delta.get("tool_calls") or []):
+                                # Deltas stream a tool call's arguments in fragments keyed by
+                                # index; collect fragments now (O(1) append), join once at end.
+                                slot = tool_calls_acc.setdefault(call.get("index", 0), {"name": "", "arguments": []})
+                                function = call.get("function") or {}
+                                if function.get("name"):
+                                    slot["name"] = function["name"]
+                                if function.get("arguments"):
+                                    slot["arguments"].append(function["arguments"])
+                            if capture_content:
+                                output_parts.append(content)
+                                reasoning_parts.append(reasoning)
                             if choices[0].get("finish_reason") is not None:
                                 backend_payload["finish_reason"] = choices[0]["finish_reason"]
+                    if not stream_complete:
+                        raise RuntimeError("Model stream ended before [DONE]; completion may be truncated.")
 
             elapsed = time.monotonic() - started
             if not stream:
@@ -2550,11 +2826,31 @@ class RequestHandler(BaseHTTPRequestHandler):
                 output_parts = [message.get("content") or choice.get("text") or ""]
                 reasoning_parts = [message.get("reasoning_content") or message.get("reasoning") or ""]
                 backend_payload["finish_reason"] = choice.get("finish_reason")
+            if stream:
+                # Streamed reasoning deltas are not retained on backend_payload, so
+                # hand the observed character count to usage normalization. It yields
+                # the exact backend reasoning-token count when present, else a labeled
+                # estimate from these characters.
+                backend_payload["reasoning_characters"] = reasoning_characters
             usage = ChatService._normalize_usage(backend_payload)
+            tool_calls = (
+                [{"function": {"name": slot["name"], "arguments": "".join(slot["arguments"])}}
+                 for slot in tool_calls_acc.values()]
+                if stream
+                else ((backend_payload.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
+            )
+            usage.update(ChatService._tool_call_stats(tool_calls))
             timing = ChatService._normalize_timing(backend_payload, usage, elapsed)
             if first_token_at is not None:
                 timing["time_to_first_token_ms"] = round((first_token_at - started) * 1000, 2)
-            state.manager.sampler.capture()
+            timing["reasoning_duration_ms"] = (
+                round((reasoning_last_at - reasoning_started_at) * 1000, 2)
+                if reasoning_started_at is not None and reasoning_last_at is not None else None
+            )
+            timing["reasoning_duration_source"] = "observed_stream_span" if reasoning_started_at is not None else None
+            timing["time_to_first_visible_token_ms"] = (
+                round((first_visible_at - started) * 1000, 2) if first_visible_at is not None else None
+            )
             samples = state.chat._sample_window(started, baseline)
             resources = ChatService._resource_summary(samples, target)
             stored_backend = backend_payload if capture_content else {
@@ -2571,6 +2867,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "timing": timing,
                 "resources": resources,
                 "backend_response": stored_backend,
+                "reasoning": reasoning_settings,
             }
             state.store.finish_run(run_id, final)
             state.store.save_samples(run_id, samples, started)
@@ -2603,7 +2900,6 @@ class RequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         state = self.server.app_state
         try:
-            state.manager.sampler.capture()
             samples = state.chat._sample_window(started, baseline)
             final = {
                 "status": status,

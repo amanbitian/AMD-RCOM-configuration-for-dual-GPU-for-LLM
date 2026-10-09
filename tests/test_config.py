@@ -51,6 +51,45 @@ def test_loads_with_every_optional_field_omitted(tmp_path: Path):
     assert config.policy.settle_seconds_after_restart == 2.0
     assert len(config.lanes) == 2
     assert config.models[0].name == "test-model"
+    # Speculative-decoding defaults: disabled, with backend-default knobs.
+    assert config.models[0].draft_model == ""
+    assert config.models[0].draft_max == 0
+    assert config.models[0].draft_gpu_layers is None
+
+
+def test_speculative_decoding_fields_parse(tmp_path: Path):
+    config_path = tmp_path / "draft.toml"
+    config_path.write_text(
+        """
+[[lanes]]
+key = "a"
+display = "A"
+vram_gb = 32
+port = 19001
+
+[[lanes]]
+key = "b"
+display = "B"
+vram_gb = 16
+port = 19002
+
+[[models]]
+name = "test-model"
+path = "test.gguf"
+draft_model = "draft.gguf"
+draft_max = 8
+draft_min = 2
+draft_p_min = 0.9
+draft_gpu_layers = 48
+""",
+        encoding="utf-8",
+    )
+    model = load_config(config_path).models[0]
+    assert model.draft_model.endswith("draft.gguf")
+    assert model.draft_max == 8
+    assert model.draft_min == 2
+    assert model.draft_p_min == 0.9
+    assert model.draft_gpu_layers == 48
 
 
 def test_wrong_lane_count_rejected(tmp_path: Path):

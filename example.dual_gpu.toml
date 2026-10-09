@@ -56,6 +56,14 @@ parallel = 1
 name = "Qwen3-32B-GGUF"
 path = "lmstudio-community/Qwen3-32B-GGUF/Qwen3-32B-Q4_K_M.gguf"
 size_gb = 19.76
+# Optional speculative decoding: a small same-family draft model raises tokens/sec
+# with identical output (the target verifies every drafted token). The draft shares
+# this model's GPU lane, so its size counts against the lane's VRAM budget. See the
+# "Speculative decoding" section in CODING_AGENTS.md.
+# draft_model = "lmstudio-community/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf"
+# draft_max = 16        # max tokens drafted per step (backend default if omitted)
+# draft_p_min = 0.0     # min draft-token probability to keep speculating
+# draft_gpu_layers = 999  # draft layers on GPU (defaults to policy.gpu_layers)
 
 [[models]]
 name = "gpt-oss-120b-GGUF"

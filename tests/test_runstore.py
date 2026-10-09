@@ -150,6 +150,41 @@ def test_dashboard_uses_complete_history_beyond_recent_cap(tmp_path: Path):
     assert dashboard["summary"]["total_tokens"] == 505 * 150
 
 
+def test_dashboard_reads_metrics_without_loading_content_or_taking_writer_lock(tmp_path):
+    store = app.RunStore(tmp_path / "runs.db")
+    make_run(store, "a", "qwen", "code", 25, 1000, workload_kind="coding_agent")
+    with store.connect() as connection:
+        connection.execute("UPDATE runs SET request_json=?, configuration_json=? WHERE id='a'", (
+            '{"messages":[{"content":"large private prompt"}]}',
+            '{"reasoning":{"effective_effort":"low","budget_policy":"model_controlled"}}',
+        ))
+    class NoWriterLock:
+        def __enter__(self):
+            raise AssertionError("Dashboard reader blocked inference writer")
+        def __exit__(self, *args):
+            pass
+    original = store.lock
+    store.lock = NoWriterLock()
+    rows = store._dashboard_runs()
+    store.lock = original
+    assert rows[0]["request"] is None
+    assert rows[0]["configuration"]["reasoning"]["effective_effort"] == "low"
+    assert store.get("a")["request"]["messages"][0]["content"] == "large private prompt"
+
+
+def test_decode_aggregate_excludes_runs_with_missing_decode_time(tmp_path):
+    store = app.RunStore(tmp_path / "runs.db")
+    for run_id in ("timed", "untimed"):
+        make_run(store, run_id, "qwen", "code", 25, 1000, workload_kind="coding_agent")
+    store.finish_run("timed", {"status": "completed", "usage": {"output_tokens": 50, "thinking_tokens": 30},
+                               "timing": {"decode_duration_ms": 2000}})
+    dashboard = store.dashboard()
+    assert dashboard["summary"]["aggregate_tokens_per_second"] == 25
+    level = dashboard["reasoning_levels"][0]
+    assert level["thinking_tokens_reported_runs"] == 1
+    assert level["avg_thinking_tokens"] == 30
+
+
 def test_project_filtered_dashboard_and_gpu_breakdown(tmp_path: Path):
     store = app.RunStore(tmp_path / "t.sqlite3")
     project_a = store.upsert_project("Project A", "F:/Projects/A")

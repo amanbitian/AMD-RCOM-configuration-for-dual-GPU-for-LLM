@@ -6,7 +6,7 @@ import threading
 import pytest
 
 import app
-from dual_gpu_setup.config import LaneConfig
+from dual_gpu_setup.config import LaneConfig, ModelConfig
 
 
 def _manager(fit_by_model_and_lane):
@@ -95,12 +95,12 @@ def test_lane_replace_preserves_other_gpu(tmp_path):
     old_large_process = FakeProcess()
     preserved_process = FakeProcess()
     old_large = app.ServerHandle(
-        "r9700", SimpleNamespace(name="old-large", reasoning_budget=None), [lanes[0]], old_large_process
+        "r9700", ModelConfig(name="old-large", path="unused.gguf"), [lanes[0]], old_large_process
     )
     preserved = app.ServerHandle(
-        "9070xt", SimpleNamespace(name="still-running", reasoning_budget=None), [lanes[1]], preserved_process
+        "9070xt", ModelConfig(name="still-running", path="unused.gguf"), [lanes[1]], preserved_process
     )
-    new_model = SimpleNamespace(name="new-large", reasoning_budget=None)
+    new_model = ModelConfig(name="new-large", path="unused.gguf")
     manager = object.__new__(app.DeploymentManager)
     manager.config = SimpleNamespace(lanes=lanes)
     manager.data_dir = tmp_path
@@ -172,13 +172,13 @@ def _lane_replace_manager(tmp_path, active_profile, handles_spec, new_model_name
     lane_by_key = {lane.key: lane for lane in lanes}
     manager.handles = {
         key: app.ServerHandle(
-            key, SimpleNamespace(name=resolved, reasoning_budget=None), [lane_by_key[key]], FakeProcess()
+            key, ModelConfig(name=resolved, path="unused.gguf"), [lane_by_key[key]], FakeProcess()
         )
         for key, resolved in handles_spec.items()
     }
     spec = {
         "target": "r9700",
-        "model": SimpleNamespace(name=new_model_name, reasoning_budget=None),
+        "model": ModelConfig(name=new_model_name, path="unused.gguf"),
         "lanes": [lanes[0]],
         "context": 51200,
         "multi": False,

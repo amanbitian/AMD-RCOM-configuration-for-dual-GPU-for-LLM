@@ -72,6 +72,17 @@ class ModelConfig:
     parallel: int = 0
     reasoning_mode: str = ""
     reasoning_budget: int | None = None
+    reasoning_effort: str = "default"
+    # Speculative decoding (lossless): a small draft model proposes tokens that the
+    # target model verifies, raising tokens/sec without changing the output. draft_model
+    # is a path/glob resolved like `path`; empty disables it. The remaining knobs map to
+    # llama-server --draft-max/--draft-min/--draft-p-min/--gpu-layers-draft (0/None = let
+    # the backend default decide). See CODING_AGENTS.md.
+    draft_model: str = ""
+    draft_max: int = 0
+    draft_min: int = 0
+    draft_p_min: float = 0.0
+    draft_gpu_layers: int | None = None
     cache_reuse: int | None = None
     flash_attn: str = ""
     gpu_layers: int | None = None
@@ -196,8 +207,16 @@ def load_config(path: str | Path) -> AppConfig:
             ctx_size=int(item.get("ctx_size", 0)),
             parallel=int(item.get("parallel", 0)),
             reasoning_mode=str(item.get("reasoning_mode", "")),
+            reasoning_effort=str(item.get("reasoning_effort", "default")),
             reasoning_budget=(
                 int(item["reasoning_budget"]) if "reasoning_budget" in item and item["reasoning_budget"] is not None else None
+            ),
+            draft_model=_expand(str(item.get("draft_model", ""))),
+            draft_max=int(item.get("draft_max", 0)),
+            draft_min=int(item.get("draft_min", 0)),
+            draft_p_min=float(item.get("draft_p_min", 0.0)),
+            draft_gpu_layers=(
+                int(item["draft_gpu_layers"]) if "draft_gpu_layers" in item and item["draft_gpu_layers"] is not None else None
             ),
             cache_reuse=int(item["cache_reuse"]) if "cache_reuse" in item and item["cache_reuse"] is not None else None,
             flash_attn=str(item.get("flash_attn", "")),
