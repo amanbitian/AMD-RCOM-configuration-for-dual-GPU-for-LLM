@@ -249,6 +249,44 @@ def test_speculative_acceptance_rate_from_backend_timings():
     assert plain["draft_acceptance_rate"] is None
 
 
+def test_gateway_archives_full_conversation_while_metrics_db_stays_redacted(gateway, monkeypatch, tmp_path):
+    handler, store, _ = gateway
+    history = app.ChatHistoryStore(tmp_path / "hist.sqlite3", enabled=True)
+    handler.server.app_state.chat.history = history
+    wire = (b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+            b'data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}],'
+            b'"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\ndata: [DONE]\n\n')
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(wire)))
+    handler._proxy_openai_chat("/v1/r9700/developer/chat/completions",
+                               {"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    history.flush()
+
+    turns = history.query(include_content=True)
+    assert len(turns) == 1
+    assert turns[0]["messages"] == [{"role": "user", "content": "hi"}]  # full input archived
+    assert turns[0]["output_text"] == "hello"  # reassembled from stream, even without capture header
+    assert turns[0]["input_tokens"] == 5 and turns[0]["output_tokens"] == 2
+
+    run = store.get(store.recent(1)[0]["id"])  # metrics DB stays redacted
+    assert run["output_text"] is None
+    assert run["request"]["messages"][0]["content_redacted"] is True
+    history.close()
+
+
+def test_gateway_no_history_header_skips_archive(gateway, monkeypatch, tmp_path):
+    handler, store, _ = gateway
+    history = app.ChatHistoryStore(tmp_path / "hist.sqlite3", enabled=True)
+    handler.server.app_state.chat.history = history
+    handler.headers = {"X-DGPU-No-History": "true"}
+    monkeypatch.setattr(app.urlrequest, "urlopen",
+                        Mock(return_value=io.BytesIO(b"data: [DONE]\n\n")))
+    handler._proxy_openai_chat("/v1/r9700/developer/chat/completions",
+                               {"stream": True, "messages": [{"role": "user", "content": "secret"}]})
+    history.flush()
+    assert history.query() == []  # per-request opt-out honored
+    history.close()
+
+
 def test_fully_cached_prompt_and_zero_completion_are_not_missing():
     payload = {"usage": {"prompt_tokens": 100, "completion_tokens": 0},
                "timings": {"prompt_n": 0, "cache_n": 100, "prompt_ms": 0, "predicted_n": 0}}

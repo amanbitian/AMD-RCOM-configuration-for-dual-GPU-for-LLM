@@ -213,6 +213,39 @@ The run detail shows the validity percentage, and the *Coding reasoning performa
 Compare validity with and without a grammar/schema constraint to confirm it is lifting quality;
 a rate below ~100% on a tool-heavy workload is the signal to constrain output.
 
+## Conversation archive (full history, separate store)
+
+Two databases, by design:
+
+- **Metrics DB** (`chatbot.sqlite3`) — always on. Token counts, timing, resources, and
+  configuration for every run. Prompts and responses are **redacted** here unless a caller
+  sends `X-DGPU-Capture-Content: true`. This keeps it small and the dashboard fast.
+- **Conversation archive** (`chat_history.sqlite3`, opt-in) — the full history of every app
+  that uses this repo: complete input messages, tool schemas, output text, reasoning, tool
+  calls, plus the same token counts, in their own file.
+
+Enable it in the TOML:
+
+```toml
+[project]
+store_chat_history = true
+# chat_history_path = "G:/llm-archive/chat_history.sqlite3"  # optional; default is next to the metrics DB
+```
+
+**It never slows inference.** Writes go through an in-memory queue to a background worker that
+batches the commits; the request path only does an O(1) enqueue, and JSON serialization plus
+the DB write happen off-thread. If the queue ever fills, records are dropped rather than
+applying backpressure to a model request. A per-request `X-DGPU-No-History: true` header (or
+`"store_history": false` in an `/api/chat` body) skips archiving a sensitive turn.
+
+**Read it back** with `GET /api/chat-history` — query params `project_id`, `start_date` /
+`end_date` (YYYY-MM-DD, inclusive), `limit`, `offset`, and `content=1` to include the full
+message/response bodies (omitted by default so listings stay light). Token columns
+(`input_tokens`, `output_tokens`, `thinking_tokens`, `total_tokens`, …) are stored as real
+columns, so future aggregation and export don't need to parse JSON. Because it's a plain
+SQLite file in its own location, it can be copied, backed up, or queried by other tools
+independently of the live server.
+
 | Native stage | Thinking allowance | Monitored per run |
 | --- | --- | --- |
 | Model default | Model controlled; no fixed cap | Resolved default when declared by the template |

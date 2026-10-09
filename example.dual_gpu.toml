@@ -5,6 +5,13 @@ log_dir = "./runs"
 host = "127.0.0.1"
 cleanup_ports_on_start = true
 start_timeout_seconds = 900
+# Full-conversation archive (opt-in). When true, every request through /api/chat and the
+# OpenAI gateway is logged -- full prompts, responses, reasoning, tool calls, and token
+# counts -- to a SEPARATE SQLite file, written off the request path. The metrics database
+# stays lean and redacted. Read it back via GET /api/chat-history. Default path is
+# chat_history.sqlite3 next to the metrics DB; override with chat_history_path.
+# store_chat_history = true
+# chat_history_path = "G:/llm-archive/chat_history.sqlite3"
 
 [discovery]
 lmstudio_home = "C:/Users/user/.lmstudio"

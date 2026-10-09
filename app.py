@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import queue
 import signal
 import socket
 import sqlite3
@@ -827,8 +828,15 @@ class RunStore:
         with self.lock, self.connect() as connection:
             return int(connection.execute(f"SELECT COUNT(*) FROM runs{where}", params).fetchone()[0])
 
+    @staticmethod
+    def _day_after(date_str: str) -> str:
+        # Exclusive upper bound so an inclusive end date covers its whole day. Parsing
+        # also validates the YYYY-MM-DD format (ValueError on anything else).
+        return (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
     def _dashboard_runs(
-        self, project_id: str | None = None, workload_kind: str | None = None
+        self, project_id: str | None = None, workload_kind: str | None = None,
+        start_date: str | None = None, end_date: str | None = None,
     ) -> list[dict[str, Any]]:
         conditions: list[str] = []
         params: list[Any] = []
@@ -838,6 +846,14 @@ class RunStore:
         if workload_kind:
             conditions.append("workload_kind = ?")
             params.append(workload_kind)
+        # created_at is ISO text, so lexicographic bounds match chronological ones and use
+        # the created_at index. start is inclusive; end covers its whole day.
+        if start_date:
+            conditions.append("created_at >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("created_at < ?")
+            params.append(self._day_after(end_date))
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         # WAL readers need not hold the writer lock. Do not copy/parse large prompt,
         # completion, or backend-response bodies for performance aggregates.
@@ -872,11 +888,13 @@ class RunStore:
         return item
 
     def dashboard(
-        self, project_id: str | None = None, workload_kind: str | None = None
+        self, project_id: str | None = None, workload_kind: str | None = None,
+        start_date: str | None = None, end_date: str | None = None,
     ) -> dict[str, Any]:
-        # Dashboard aggregates intentionally use the complete matching history. The prior
-        # implementation called recent(1000), which was silently capped to 500 records.
-        runs = self._dashboard_runs(project_id, workload_kind)
+        # Dashboard aggregates intentionally use the complete matching history (optionally
+        # narrowed to a date range). The prior implementation called recent(1000), which
+        # was silently capped to 500 records.
+        runs = self._dashboard_runs(project_id, workload_kind, start_date, end_date)
 
         def nums(path: tuple[str, str], selected: list[dict[str, Any]] = runs) -> list[float]:
             parent, child = path
@@ -1002,6 +1020,12 @@ class RunStore:
         if project_id:
             tool_conditions.append("project_id = ?")
             tool_params.append(project_id)
+        if start_date:
+            tool_conditions.append("occurred_at >= ?")
+            tool_params.append(start_date)
+        if end_date:
+            tool_conditions.append("occurred_at < ?")
+            tool_params.append(self._day_after(end_date))
         tool_where = f" WHERE {' AND '.join(tool_conditions)}" if tool_conditions else ""
         with self.lock, self.connect() as connection:
             tool_row = connection.execute(
@@ -1028,8 +1052,11 @@ class RunStore:
             bucket["runs"] += 1
             if isinstance(run.get("usage"), dict):
                 bucket["tokens"] += int(run["usage"].get("total_tokens") or 0)
+        # Default view keeps the last 14 days tidy; an explicit date range shows every day in it.
+        daily_list = list(daily.values()) if (start_date or end_date) else list(daily.values())[-14:]
         return {
             "generated_at": utc_now(),
+            "filters": {"start_date": start_date, "end_date": end_date},
             "summary": {
                 "total_runs": len(runs),
                 "completed_runs": len(completed),
@@ -1074,7 +1101,7 @@ class RunStore:
             "tool_summary": tool_summary,
             "categories": categories,
             "category_models": category_models,
-            "daily": list(daily.values())[-14:],
+            "daily": daily_list,
             "recent_runs": runs[:20],
         }
 
@@ -1098,6 +1125,189 @@ class RunStore:
             except json.JSONDecodeError:
                 item[output_key] = None
         return item
+
+
+class ChatHistoryStore:
+    """Append-only full-conversation archive in its OWN SQLite file.
+
+    Design goals: (1) never slow the inference hot path, (2) keep the metrics RunStore lean.
+    So content (full prompts, responses, reasoning, tool calls) plus token counts are written
+    here, not into the metrics DB, and the write happens on a background worker: callers only
+    pay an O(1) queue put, and JSON serialization + the DB commit (batched) happen off-thread.
+    When disabled, no file, thread, or queue work exists -- `enqueue` is a no-op.
+    """
+
+    _SENTINEL = object()
+    _COLUMNS = (
+        "id", "created_at", "project_id", "client_id", "agent_role", "agent_session_id",
+        "coding_task_id", "model_name", "target", "workload_kind",
+        "input_tokens", "cached_input_tokens", "output_tokens", "thinking_tokens", "total_tokens",
+        "tokens_per_second", "latency_ms", "finish_reason",
+        "messages_json", "tools_json", "output_text", "reasoning_text", "tool_calls_json",
+    )
+
+    def __init__(self, path: Path, enabled: bool = False):
+        self.path = path
+        self.enabled = enabled
+        self._queue: queue.Queue = queue.Queue(maxsize=20000)
+        self._worker: threading.Thread | None = None
+        if not enabled:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+        self._worker = threading.Thread(target=self._run, name="chat-history", daemon=True)
+        self._worker.start()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    def _initialize(self) -> None:
+        with self.connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chat_turns (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    project_id TEXT,
+                    client_id TEXT,
+                    agent_role TEXT,
+                    agent_session_id TEXT,
+                    coding_task_id TEXT,
+                    model_name TEXT,
+                    target TEXT,
+                    workload_kind TEXT,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    thinking_tokens INTEGER,
+                    total_tokens INTEGER,
+                    tokens_per_second REAL,
+                    latency_ms REAL,
+                    finish_reason TEXT,
+                    messages_json TEXT,
+                    tools_json TEXT,
+                    output_text TEXT,
+                    reasoning_text TEXT,
+                    tool_calls_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_created_at ON chat_turns(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_project ON chat_turns(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_model ON chat_turns(model_name, created_at DESC);
+                """
+            )
+
+    def enqueue(self, record: dict[str, Any]) -> None:
+        # Hot path: a single non-blocking put. History must never block or fail a request,
+        # so a full queue drops the record rather than applying backpressure to inference.
+        if not self.enabled:
+            return
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            pass
+
+    @staticmethod
+    def _row(record: dict[str, Any]) -> tuple[Any, ...]:
+        usage = record.get("usage") or {}
+        timing = record.get("timing") or {}
+
+        def dump(value: Any) -> str | None:
+            return json.dumps(value, ensure_ascii=False) if value is not None else None
+
+        return (
+            record.get("id"), record.get("created_at"), record.get("project_id"),
+            record.get("client_id"), record.get("agent_role"), record.get("agent_session_id"),
+            record.get("coding_task_id"), record.get("model_name"), record.get("target"),
+            record.get("workload_kind"),
+            usage.get("input_tokens"), usage.get("cached_input_tokens"), usage.get("output_tokens"),
+            usage.get("thinking_tokens"), usage.get("total_tokens"),
+            timing.get("tokens_per_second"), timing.get("end_to_end_duration_ms"),
+            record.get("finish_reason"),
+            dump(record.get("messages")), dump(record.get("tools")),
+            record.get("output_text"), record.get("reasoning_text"), dump(record.get("tool_calls")),
+        )
+
+    def _flush(self, batch: list[dict[str, Any]]) -> None:
+        placeholders = ", ".join(["?"] * len(self._COLUMNS))
+        statement = f"INSERT OR REPLACE INTO chat_turns ({', '.join(self._COLUMNS)}) VALUES ({placeholders})"
+        try:
+            with self.connect() as connection:
+                connection.executemany(statement, [self._row(item) for item in batch])
+        except sqlite3.Error:
+            pass  # best-effort archive; never crash the server over a logging failure
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                self._queue.task_done()
+                return
+            batch = [item]
+            while len(batch) < 200:  # batch whatever else is waiting into one commit
+                try:
+                    nxt = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is self._SENTINEL:
+                    self._flush(batch)
+                    for _ in batch:
+                        self._queue.task_done()
+                    self._queue.task_done()
+                    return
+                batch.append(nxt)
+            self._flush(batch)
+            for _ in batch:
+                self._queue.task_done()
+
+    def flush(self) -> None:
+        """Block until every queued record has been written (used by tests/shutdown)."""
+        if self.enabled:
+            self._queue.join()
+
+    def close(self) -> None:
+        if self._worker is None:
+            return
+        self._queue.put(self._SENTINEL)
+        self._worker.join(timeout=10)
+
+    def query(self, project_id: str | None = None, start_date: str | None = None,
+              end_date: str | None = None, limit: int = 100, offset: int = 0,
+              include_content: bool = False) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        columns = [col for col in self._COLUMNS
+                   if include_content or not col.endswith(("_json", "_text"))]
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if start_date:
+            conditions.append("created_at >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("created_at < ?")
+            params.append(RunStore._day_after(end_date))
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(columns)} FROM chat_turns{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                [*params, int(limit), int(offset)],
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if include_content:
+                for key in ("messages_json", "tools_json", "tool_calls_json"):
+                    if item.get(key) is not None:
+                        item[key[:-5]] = json.loads(item.pop(key))
+                    else:
+                        item.pop(key, None)
+            result.append(item)
+        return result
 
 
 class AppError(RuntimeError):
@@ -1839,9 +2049,11 @@ class DeploymentManager:
 
 
 class ChatService:
-    def __init__(self, manager: DeploymentManager, store: RunStore):
+    def __init__(self, manager: DeploymentManager, store: RunStore,
+                 history: "ChatHistoryStore | None" = None):
         self.manager = manager
         self.store = store
+        self.history = history or ChatHistoryStore(Path(), enabled=False)
         self._client_output_lock = threading.Lock()
 
     def _coding_request(self, handle: ServerHandle, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2118,6 +2330,17 @@ class ChatService:
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
+            if self.history.enabled and payload.get("store_history") is not False:
+                self.history.enqueue({
+                    "id": run_id, "created_at": utc_now(),
+                    "project_id": project_id, "client_id": client["id"] if client else None,
+                    "agent_role": agent_role, "agent_session_id": agent_session_id,
+                    "coding_task_id": coding_task_id, "model_name": handle.model.name,
+                    "target": target, "workload_kind": workload_kind, "usage": usage,
+                    "timing": timing, "finish_reason": choice.get("finish_reason"),
+                    "messages": messages, "tools": payload.get("tools"), "output_text": output,
+                    "reasoning_text": reasoning, "tool_calls": message.get("tool_calls"),
+                })
             delivery = self._deliver_to_client(client, run_id, target, handle, final)
             result = {"run_id": run_id, "model": handle.model.name, **final, "backend_response": None}
             if delivery is not None:
@@ -2377,8 +2600,14 @@ class ApplicationState:
         self.config = load_config(config_path)
         self.data_dir = data_dir
         self.store = RunStore(data_dir / "chatbot.sqlite3")
+        history_path = (
+            Path(self.config.project.chat_history_path)
+            if self.config.project.chat_history_path
+            else data_dir / "chat_history.sqlite3"
+        )
+        self.history = ChatHistoryStore(history_path, enabled=self.config.project.store_chat_history)
         self.manager = DeploymentManager(self.config, data_dir, self.store)
-        self.chat = ChatService(self.manager, self.store)
+        self.chat = ChatService(self.manager, self.store, self.history)
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -2473,9 +2702,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/dashboard":
             project_id = (query.get("project_id") or [None])[0]
             workload_kind = (query.get("workload_kind") or [None])[0]
+            start_date = (query.get("start_date") or [None])[0]
+            end_date = (query.get("end_date") or [None])[0]
+            try:
+                for value in (start_date, end_date):
+                    if value:
+                        datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST,
+                                {"error": "start_date and end_date must be YYYY-MM-DD."})
+                return
             self._send_json(
                 HTTPStatus.OK,
-                self.server.app_state.store.dashboard(project_id, workload_kind),
+                self.server.app_state.store.dashboard(project_id, workload_kind, start_date, end_date),
             )
             return
         if path == "/api/runs":
@@ -2497,6 +2736,35 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "offset": max(0, offset),
                 },
             )
+            return
+        if path == "/api/chat-history":
+            history = self.server.app_state.chat.history
+            if not history.enabled:
+                self._send_json(HTTPStatus.OK, {"enabled": False, "turns": [],
+                                                "note": "Set project.store_chat_history = true to archive conversations."})
+                return
+            try:
+                limit = int((query.get("limit") or [100])[0])
+                offset = int((query.get("offset") or [0])[0])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "limit and offset must be integers"})
+                return
+            start_date = (query.get("start_date") or [None])[0]
+            end_date = (query.get("end_date") or [None])[0]
+            try:
+                for value in (start_date, end_date):
+                    if value:
+                        datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "start_date and end_date must be YYYY-MM-DD."})
+                return
+            include_content = (query.get("content") or ["0"])[0].lower() in {"1", "true", "yes"}
+            self._send_json(HTTPStatus.OK, {
+                "enabled": True,
+                "turns": history.query((query.get("project_id") or [None])[0], start_date, end_date,
+                                       min(max(1, limit), 500), max(0, offset), include_content),
+                "limit": min(max(1, limit), 500), "offset": max(0, offset),
+            })
             return
         if path == "/api/projects":
             self._send_json(HTTPStatus.OK, {"projects": self.server.app_state.store.projects()})
@@ -2683,6 +2951,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             stream_options.setdefault("include_usage", True)
             request_payload["stream_options"] = stream_options
         capture_content = self.headers.get("X-DGPU-Capture-Content", "").lower() in {"1", "true", "yes"}
+        # Full-conversation archive: on unless disabled in config or opted out per request. It
+        # needs the streamed content, so accumulate output/reasoning when either it or the
+        # metrics-DB content capture is active (kept out of the metrics DB regardless).
+        history_on = state.chat.history.enabled and self.headers.get("X-DGPU-No-History", "").lower() not in {"1", "true", "yes"}
+        keep_content = capture_content or history_on
         stored_request = dict(request_payload)
         if not capture_content and isinstance(stored_request.get("messages"), list):
             stored_request["messages"] = [
@@ -2811,7 +3084,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                                     slot["name"] = function["name"]
                                 if function.get("arguments"):
                                     slot["arguments"].append(function["arguments"])
-                            if capture_content:
+                            if keep_content:
                                 output_parts.append(content)
                                 reasoning_parts.append(reasoning)
                             if choices[0].get("finish_reason") is not None:
@@ -2871,6 +3144,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             }
             state.store.finish_run(run_id, final)
             state.store.save_samples(run_id, samples, started)
+            if history_on:
+                # Full content lives only here, in the separate archive -- never in the
+                # metrics DB, whose stored_request/backend_response stay redacted.
+                state.chat.history.enqueue({
+                    "id": run_id, "created_at": utc_now(),
+                    "project_id": project_id, "client_id": client["id"] if client else None,
+                    "agent_role": agent_role, "agent_session_id": session_id,
+                    "coding_task_id": coding_task_id, "model_name": handle.model.name,
+                    "target": target, "workload_kind": "coding_agent", "usage": usage,
+                    "timing": timing, "finish_reason": backend_payload.get("finish_reason"),
+                    "messages": payload.get("messages"), "tools": payload.get("tools"),
+                    "output_text": "".join(output_parts) or None,
+                    "reasoning_text": "".join(reasoning_parts) or None, "tool_calls": tool_calls,
+                })
             state.chat._deliver_to_client(client, run_id, target, handle, final)
             if not stream:
                 backend_payload["dgpu_run_id"] = run_id
@@ -3088,6 +3375,7 @@ def main() -> int:
     if args.check:
         print(json.dumps({"status": "ok", "config": str(config_path), "data_dir": str(data_dir)}, indent=2))
         state.manager.shutdown()
+        state.history.close()
         return 0
 
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -3128,6 +3416,7 @@ def main() -> int:
         server.serve_forever(poll_interval=0.5)
     finally:
         state.manager.shutdown()
+        state.history.close()  # flush any queued conversation records
         server.server_close()
     return 0
 

@@ -207,3 +207,78 @@ def test_tool_events_are_aggregated_per_project(tmp_path: Path):
 
     tools = store.dashboard(project_id=project["id"])["tool_summary"]
     assert tools == {"events": 2, "failed": 1, "success_rate": 50.0}
+
+
+def _run_on_day(store, run_id, day):
+    store.begin_run({
+        "id": run_id, "comparison_id": None, "deployment_id": None,
+        "created_at": f"{day}T12:00:00+00:00", "mode": "single_gpu", "target": "primary",
+        "model_name": "m", "model_path": "x.gguf", "lane_keys": ["primary"], "device": "rocm:0",
+        "context_window": 8192, "reasoning_budget": 0, "request": {}, "configuration": {},
+        "client_id": None, "task_label": None, "project_id": None, "workload_kind": "evaluation",
+        "agent_role": None,
+    })
+    store.finish_run(run_id, {"status": "completed", "usage": {"total_tokens": 100},
+                              "timing": {}, "resources": {}})
+
+
+def test_dashboard_date_range_filters_runs_and_daily(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    for run_id, day in [("r1", "2026-10-01"), ("r2", "2026-10-05"), ("r3", "2026-10-09")]:
+        _run_on_day(store, run_id, day)
+
+    scoped = store.dashboard(start_date="2026-10-05", end_date="2026-10-09")  # inclusive both ends
+    assert scoped["summary"]["total_runs"] == 2
+    assert {bucket["date"] for bucket in scoped["daily"]} == {"2026-10-05", "2026-10-09"}
+    assert scoped["filters"] == {"start_date": "2026-10-05", "end_date": "2026-10-09"}
+    # End date includes its whole day; start/end may be given alone; no filter sees everything.
+    assert store.dashboard(end_date="2026-10-01")["summary"]["total_runs"] == 1
+    assert store.dashboard(start_date="2026-10-05")["summary"]["total_runs"] == 2
+    assert store.dashboard()["summary"]["total_runs"] == 3
+
+
+def test_day_after_bound_and_validation():
+    assert app.RunStore._day_after("2026-10-09") == "2026-10-10"
+    assert app.RunStore._day_after("2026-12-31") == "2027-01-01"
+    with pytest.raises(ValueError):
+        app.RunStore._day_after("09-10-2026")
+
+
+def test_chat_history_disabled_is_a_noop_with_no_file(tmp_path: Path):
+    history = app.ChatHistoryStore(tmp_path / "hist.sqlite3", enabled=False)
+    history.enqueue({"id": "x", "created_at": "2026-10-09T00:00:00+00:00"})
+    history.flush()
+    assert history.query() == []
+    assert not (tmp_path / "hist.sqlite3").exists()  # disabled -> nothing created
+    history.close()
+
+
+def test_chat_history_archives_content_and_scalar_tokens(tmp_path: Path):
+    history = app.ChatHistoryStore(tmp_path / "hist.sqlite3", enabled=True)
+    history.enqueue({
+        "id": "r1", "created_at": "2026-10-09T10:00:00+00:00", "project_id": "p1",
+        "model_name": "m", "target": "r9700", "workload_kind": "coding_agent",
+        "usage": {"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20,
+                  "thinking_tokens": 5, "total_tokens": 120},
+        "timing": {"tokens_per_second": 25.0, "end_to_end_duration_ms": 900.0},
+        "finish_reason": "stop", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function"}], "output_text": "hello", "reasoning_text": "think",
+        "tool_calls": [{"function": {"name": "read", "arguments": "{}"}}],
+    })
+    history.flush()
+
+    light = history.query()
+    assert len(light) == 1
+    assert light[0]["input_tokens"] == 100 and light[0]["output_tokens"] == 20
+    assert light[0]["total_tokens"] == 120 and light[0]["latency_ms"] == 900.0
+    assert "messages_json" not in light[0] and "output_text" not in light[0]  # light view = metadata only
+
+    full = history.query(include_content=True)[0]
+    assert full["messages"] == [{"role": "user", "content": "hi"}]
+    assert full["output_text"] == "hello" and full["reasoning_text"] == "think"
+    assert full["tool_calls"][0]["function"]["name"] == "read"
+
+    assert history.query(project_id="p1") and history.query(project_id="nope") == []
+    assert history.query(start_date="2026-10-09", end_date="2026-10-09")  # end date inclusive
+    assert history.query(end_date="2026-10-08") == []
+    history.close()

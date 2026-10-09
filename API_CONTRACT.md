@@ -122,7 +122,11 @@ and `time_to_first_visible_token_ms`. Actual reasoning-token counts are only rep
 when supplied by the backend; chunk counts are not token counts.
 
 Aggregated analytics across the complete stored history. Optional query parameters:
-`project_id=<uuid>` and `workload_kind=evaluation|coding_agent`.
+`project_id=<uuid>`, `workload_kind=evaluation|coding_agent`, and a date range
+`start_date=YYYY-MM-DD` / `end_date=YYYY-MM-DD` (both inclusive; either may be given alone;
+a malformed date returns 400). When a date range is set, every summary, per-model, per-level,
+per-project, tool-event, and `daily` aggregate is restricted to it, and `daily` returns every
+day in range rather than the default last 14. The applied range echoes back as `filters`.
 
 **Shares:**
 ```jsonc
@@ -225,6 +229,39 @@ Aggregated analytics across the complete stored history. Optional query paramete
 ]
 ```
 `404 {"error": "Run not found"}` if `run_id` doesn't exist.
+
+---
+
+## GET `/api/chat-history`
+
+The full-conversation archive (a separate SQLite file, opt-in via `project.store_chat_history`).
+Disabled by default; when off, returns `{"enabled": false, "turns": []}`.
+
+**Query params:** `project_id`, `start_date`/`end_date` (YYYY-MM-DD, inclusive; 400 on bad
+format), `limit` (default 100, capped 500), `offset`, and `content=1|true|yes` to include full
+bodies (omitted by default).
+
+**Shares:**
+```jsonc
+{
+  "enabled": true,
+  "turns": [
+    {
+      "id": "run-uuid", "created_at": "ISO-8601", "project_id": "…", "client_id": "…",
+      "agent_role": "…", "model_name": "…", "target": "r9700", "workload_kind": "coding_agent",
+      "input_tokens": "int|null", "cached_input_tokens": "int|null", "output_tokens": "int|null",
+      "thinking_tokens": "int|null", "total_tokens": "int|null",
+      "tokens_per_second": "float|null", "latency_ms": "float|null", "finish_reason": "…",
+      // only when content=1:
+      "messages": [ /* full input messages */ ], "tools": [ /* tool schemas */ ],
+      "output_text": "…", "reasoning_text": "…|null", "tool_calls": [ /* parsed */ ]
+    }
+  ],
+  "limit": 100, "offset": 0
+}
+```
+Content is archived regardless of `X-DGPU-Capture-Content` (which only governs the metrics DB).
+Per-request opt-out: `X-DGPU-No-History: true`, or `"store_history": false` in an `/api/chat` body.
 
 ---
 
