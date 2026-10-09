@@ -102,7 +102,7 @@ def test_lane_replace_preserves_other_gpu(tmp_path):
     )
     new_model = ModelConfig(name="new-large", path="unused.gguf")
     manager = object.__new__(app.DeploymentManager)
-    manager.config = SimpleNamespace(lanes=lanes)
+    manager.config = SimpleNamespace(lanes=lanes, policy=SimpleNamespace(drain_timeout_seconds=0.0))
     manager.data_dir = tmp_path
     manager.store = FakeStore()
     manager.sampler = SimpleNamespace(latest=lambda: {})
@@ -158,7 +158,7 @@ def _lane_replace_manager(tmp_path, active_profile, handles_spec, new_model_name
         LaneConfig("9070xt", "9070 XT", "9070 XT", 16, 8082),
     ]
     manager = object.__new__(app.DeploymentManager)
-    manager.config = SimpleNamespace(lanes=lanes)
+    manager.config = SimpleNamespace(lanes=lanes, policy=SimpleNamespace(drain_timeout_seconds=0.0))
     manager.data_dir = tmp_path
     manager.store = FakeStore()
     manager.sampler = SimpleNamespace(latest=lambda: {})

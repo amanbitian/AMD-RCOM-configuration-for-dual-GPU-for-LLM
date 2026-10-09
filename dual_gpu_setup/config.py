@@ -55,6 +55,9 @@ class PolicyConfig:
     kill_busy_ports: bool = True
     health_poll_seconds: float = 1.0
     settle_seconds_after_restart: float = 2.0
+    # How long to let a lane's in-flight requests finish before stopping its server during a
+    # deployment change, so a hot-swap does not kill another client's request mid-generation.
+    drain_timeout_seconds: float = 30.0
 
 
 @dataclass(slots=True)
@@ -191,6 +194,9 @@ def load_config(path: str | Path) -> AppConfig:
         health_poll_seconds=float(policy_raw.get("health_poll_seconds", policy_defaults.health_poll_seconds)),
         settle_seconds_after_restart=float(
             policy_raw.get("settle_seconds_after_restart", policy_defaults.settle_seconds_after_restart)
+        ),
+        drain_timeout_seconds=float(
+            policy_raw.get("drain_timeout_seconds", policy_defaults.drain_timeout_seconds)
         ),
     )
 
