@@ -19,6 +19,12 @@ class ProjectConfig:
     log_dir: str = "./runs"
     cleanup_ports_on_start: bool = True
     start_timeout_seconds: int = 900
+    # Full-conversation archive (opt-in: it retains complete prompts and responses). When on,
+    # every request through /api/chat and the OpenAI gateway is logged -- content plus token
+    # counts -- to a SEPARATE SQLite file, written off the request path. Empty path = default
+    # next to the metrics DB. See CODING_AGENTS.md "Conversation archive".
+    store_chat_history: bool = False
+    chat_history_path: str = ""
 
 
 @dataclass(slots=True)
@@ -162,6 +168,8 @@ def load_config(path: str | Path) -> AppConfig:
         log_dir=str(project_raw.get("log_dir", project_defaults.log_dir)),
         cleanup_ports_on_start=bool(project_raw.get("cleanup_ports_on_start", project_defaults.cleanup_ports_on_start)),
         start_timeout_seconds=int(project_raw.get("start_timeout_seconds", project_defaults.start_timeout_seconds)),
+        store_chat_history=bool(project_raw.get("store_chat_history", project_defaults.store_chat_history)),
+        chat_history_path=_expand(str(project_raw.get("chat_history_path", ""))),
     )
     policy = PolicyConfig(
         vram_safety_fraction=float(policy_raw.get("vram_safety_fraction", policy_defaults.vram_safety_fraction)),
