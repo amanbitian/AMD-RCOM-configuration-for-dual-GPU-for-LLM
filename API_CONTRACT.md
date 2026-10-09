@@ -103,6 +103,24 @@ Current deployment state and the latest resource sample. No input.
 
 ## GET `/api/dashboard`
 
+Coding runs also expose `reasoning_levels`, grouped by model and effective native effort.
+Each group reports run count, `thinking_tokens_reported_runs`, `avg_thinking_tokens`,
+`thinking_tokens_estimated_runs`, `avg_thinking_tokens_estimated`, `avg_thinking_characters`,
+`avg_reasoning_duration_ms`, decode throughput, latency, `avg_draft_acceptance_rate` (speculative
+decoding), and tool-call validity (`tool_calls_total`, `tool_calls_malformed`,
+`avg_tool_call_valid_rate`). Exact backend counts and the
+character-based estimate are aggregated separately; missing thinking counts are excluded from
+both averages, never treated as zero. `recent_runs` here contains lightweight metric summaries; use
+`GET /api/runs/<id>` for full prompts, outputs, and configuration. Aggregation includes the
+complete matching history while excluding large content bodies from its database read.
+
+Coding run `configuration.reasoning` records `effort`, `effective_effort`,
+`budget_policy: "model_controlled"`, `budget_tokens: null`, `server_budget_tokens: -1`,
+and any explicit `output_limit_tokens`. Streamed coding timing additionally includes
+`reasoning_duration_ms` (observed first-to-last reasoning chunk span), its source,
+and `time_to_first_visible_token_ms`. Actual reasoning-token counts are only reported
+when supplied by the backend; chunk counts are not token counts.
+
 Aggregated analytics across the complete stored history. Optional query parameters:
 `project_id=<uuid>` and `workload_kind=evaluation|coding_agent`.
 
@@ -236,7 +254,12 @@ loaded first**: there is one active deployment at a time.
   exceeds `policy.ctx_max`, the deploy is rejected with `400` instead of silently loading a server
   that will fail requests mid-run with `exceed_context_size_error`.
 - `reasoning_budget`: **optional**; defaults to the model's configured value or the policy
-  default. Must be `>= 0`.
+  default. Must be `-1` (unlimited) or `>= 0` for evaluation deployments.
+- `workload_kind: "coding_agent"`: optional on the deployment or individual model entries.
+  Uses `reasoning_mode: "auto"` and `reasoning_budget: -1`, ignoring legacy numeric presets.
+  `reasoning_effort` selects a native level or `default`; available choices and the declared
+  default are exposed in each catalog model's `coding_reasoning` object. Native efforts
+  are not mapped to fixed token budgets.
 - Server-side, for every mode including `single_large_model`: model file size vs. the safe
   VRAM budget of the lane(s) it's headed for, any `pin_lane` constraint, and — when the
   model's GGUF metadata is one the server can confidently read (see caveat below) — an
@@ -322,6 +345,9 @@ Run a prompt against the currently loaded deployment.
       "usage": {
         "input_tokens": "int | null", "cached_input_tokens": "int | null", "uncached_input_tokens": "int | null",
         "prefill_tokens": "int | null", "thinking_tokens": "int | null",
+        "thinking_tokens_estimated": "int | null", "thinking_characters": "int | null",
+        "thinking_tokens_source": "backend | estimated_from_characters | unavailable",
+        "tool_calls_total": "int", "tool_calls_malformed": "int", "tool_call_valid_rate": "float | null",
         "visible_output_tokens": "int | null", "output_tokens": "int | null", "total_tokens": "int | null"
       },
       "timing": {

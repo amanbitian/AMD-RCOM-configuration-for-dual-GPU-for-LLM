@@ -5,14 +5,14 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
-from dual_gpu_setup.lmstudio import backend_env, resolve_device, runtime_dir, server_binary
+from dual_gpu_setup.lmstudio import backend_env, resolve_device, resolve_model_path, runtime_dir, server_binary
 
 # Every helper process spawned in this module (netstat/tasklist/taskkill/powershell for
 # metrics, the llama-server process itself) is launched without an inherited console --
@@ -305,8 +305,30 @@ class LlamaServerProcess:
             args.extend(["--ubatch-size", str(self.model.ubatch_size)])
         if self.model.threads:
             args.extend(["--threads", str(self.model.threads), "--threads-batch", str(self.model.threads)])
+        args.extend(self._draft_args(policy))
         args.extend(self.lane_extra_args or [])
         args.extend(self.model.extra_args)
+        return args
+
+    def _draft_args(self, policy: "PolicyConfig") -> list[str]:
+        # Speculative decoding: run a small draft model on the same lane(s) as the
+        # target. It is lossless -- the target verifies every proposed token -- so it
+        # only changes throughput. Omitted knobs fall back to llama-server defaults.
+        if not self.model.draft_model:
+            return []
+        draft_path = resolve_model_path(self.config, replace(self.model, path=self.model.draft_model))
+        draft_layers = self.model.draft_gpu_layers if self.model.draft_gpu_layers is not None else policy.gpu_layers
+        args = [
+            "--model-draft", str(draft_path),
+            "--gpu-layers-draft", str(draft_layers),
+            "--device-draft", self.device,
+        ]
+        if self.model.draft_max:
+            args.extend(["--draft-max", str(self.model.draft_max)])
+        if self.model.draft_min:
+            args.extend(["--draft-min", str(self.model.draft_min)])
+        if self.model.draft_p_min > 0:
+            args.extend(["--draft-p-min", str(self.model.draft_p_min)])
         return args
 
     def start(self) -> None:
