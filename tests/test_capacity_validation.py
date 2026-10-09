@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app  # noqa: E402
@@ -146,6 +148,26 @@ def test_single_large_model_mode_is_now_validated(tmp_path: Path, gguf_writer):
 
         # A small context on the same combined budget must pass.
         manager._validate_profile("single_large_model", {"model": {"model": "test-model", "context_window": 4096}})
+    finally:
+        manager.shutdown()
+
+
+def test_capacity_check_counts_draft_model_weights(tmp_path: Path, gguf_writer, monkeypatch):
+    """Speculative decoding loads a draft model on the same lane; the fit check must count it,
+    or a deploy that OOMs would be approved (the auto-sizer already reserves it)."""
+    target = gguf_writer("dense.gguf", _DENSE_ARCH)
+    draft = gguf_writer("draft.gguf", _DENSE_ARCH)
+    config_path = _write_config(tmp_path, target, model_size_gb=0.0, lane_vram_gb=25.0)  # capacity 22.5 GB
+    manager = make_manager(config_path, tmp_path)
+    # Target 20 GB fits alone (< 22.5); +4 GB draft -> 24 GB weights, which must be rejected.
+    monkeypatch.setattr(app, "model_size_gb", lambda _c, m: 4.0 if "draft" in str(m.path) else 20.0)
+    model = app.ModelConfig("test-model", str(target), ctx_size=4096, draft_model=str(draft))
+    try:
+        with pytest.raises(app.AppError, match="draft"):
+            manager._validate_capacity(model, [manager.config.lanes[0]])
+        # Without the draft, the same 20 GB target passes.
+        manager._validate_capacity(app.ModelConfig("test-model", str(target), ctx_size=4096),
+                                   [manager.config.lanes[0]])
     finally:
         manager.shutdown()
 

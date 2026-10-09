@@ -432,6 +432,18 @@ contain `dgpu_run_id`. The optional `X-DGPU-Project`, `X-DGPU-Agent-Role`, `X-DG
 `X-DGPU-Task`, and `X-DGPU-Task-Label` headers add attribution. Coding prompt and completion content
 is redacted from storage unless `X-DGPU-Capture-Content: true` is supplied.
 
+### Inline autocomplete (FIM) endpoints
+
+`POST /v1/completions` and `POST /v1/infill` (and their `/v1/<lane>/<role>/...` variants) proxy
+the raw fill-in-middle endpoints of the selected lane's llama-server, for IDE inline
+autocomplete (Continue, Tabby, Twinny, llama.vscode, …). Lane selection is identical to chat
+(path, `X-DGPU-Target`, or `model`). These are a **thin passthrough**: because autocomplete
+fires on nearly every typing pause, they do **no** run recording, GPU sampling, or history
+logging — so autocomplete adds no inference overhead and never bloats the metrics DB. They are
+still drain-safe (counted in-flight during a deployment change). Point a small, fast FIM coder
+model (e.g. Qwen2.5-Coder-1.5B/7B) at the smaller lane for autocomplete and the agent model at
+the larger lane.
+
 ## Project and agent telemetry endpoints
 
 - `GET /api/projects` lists registered projects with run/token totals.

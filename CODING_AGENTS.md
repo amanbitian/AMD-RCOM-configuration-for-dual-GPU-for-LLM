@@ -258,6 +258,40 @@ than being estimated from streamed chunks. The observed thinking span measures t
 the first and last reasoning chunks; it is not native GPU decode time and excludes the
 wait before the first chunk. Counts are not inferred by extra tokenizer requests.
 
+## Inline autocomplete + agent (Continue)
+
+The gateway serves both an agent surface (`/v1/.../chat/completions`) and an inline-autocomplete
+surface (`/v1/.../completions` and `/v1/.../infill`, raw FIM). Autocomplete is a thin
+passthrough — no recording or sampling — so it never slows inference. The dual-GPU split maps
+cleanly onto the two needs: **agent/chat on the big lane, autocomplete on the small lane.**
+
+For autocomplete, load a small, fast **FIM coder** model (e.g. Qwen2.5-Coder-1.5B or 7B) on the
+smaller lane — a large reasoning model makes ghost-text unusable. Put a coder-instruct model on
+the big lane for the agent (instruct coders are faster and more reliable at tool calls than
+reasoning models).
+
+[Continue](https://continue.dev) ties both together — paste into `~/.continue/config.json`
+(replace lane keys/models with yours):
+
+```jsonc
+{
+  "models": [
+    { "title": "DualGPU Agent", "provider": "openai", "model": "dgpu-agent",
+      "apiBase": "http://127.0.0.1:8090/v1/r9700/developer", "apiKey": "local" }
+  ],
+  "tabAutocompleteModel": {
+    "title": "DualGPU Autocomplete", "provider": "openai", "model": "dgpu-autocomplete",
+    "apiBase": "http://127.0.0.1:8090/v1/9070xt/autocomplete", "apiKey": "local",
+    "useLegacyCompletionsEndpoint": true
+  }
+}
+```
+
+Continue posts chat to `.../developer/chat/completions` (agent, big lane) and autocomplete to
+`.../autocomplete/completions` (FIM, small lane). Aider is a strong terminal alternative for the
+agent half (`--openai-api-base http://127.0.0.1:8090/v1/<lane>/<role> --openai-api-key local`);
+it has no autocomplete, so pair it with Continue's autocomplete if you want both.
+
 The dashboard leaves **Max output** blank in coding mode. An explicit client output limit
 is still respected and recorded, and the context window remains finite. Thinking consumes
 part of the completion/context allowance. Compare task correctness and elapsed time as well

@@ -287,6 +287,93 @@ def test_gateway_no_history_header_skips_archive(gateway, monkeypatch, tmp_path)
     history.close()
 
 
+def test_handle_counts_inflight_requests_and_drain_times_out():
+    import time
+    handle = app.ServerHandle("r9700", ModelConfig("m", "x.gguf"), [], SimpleNamespace())
+    assert handle.inflight == 0
+    assert handle.drain(0.1) is True  # idle -> drains immediately
+    release = threading.Event()
+
+    def hold():
+        with handle.serving():
+            release.wait(2)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    time.sleep(0.05)
+    assert handle.inflight == 1
+    assert handle.drain(0.1) is False  # still busy past the timeout -> caller stops anyway
+    release.set()
+    worker.join()
+    assert handle.inflight == 0
+    assert handle.drain(0.1) is True
+
+
+def test_deployment_change_drains_a_busy_lane_before_stopping_it():
+    import time
+    config = load_config(Path(__file__).resolve().parents[1] / "example.dual_gpu.toml")
+    manager = object.__new__(app.DeploymentManager)
+    manager.config = config
+    order: list[str] = []
+    process = SimpleNamespace(stop=lambda: order.append("stopped"))
+    handle = app.ServerHandle("r9700", ModelConfig("m", "x.gguf"), [], process)
+    release = threading.Event()
+
+    def hold():
+        with handle.serving():
+            order.append("serving")
+            release.wait(2)
+        order.append("done")
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    time.sleep(0.05)
+    stopper = threading.Thread(target=lambda: manager._stop_handle(handle))
+    stopper.start()
+    time.sleep(0.1)
+    assert "stopped" not in order  # the in-flight request is draining, server not yet killed
+    release.set()
+    worker.join()
+    stopper.join()
+    assert order.index("done") < order.index("stopped")  # request finished before the stop
+
+
+def test_completions_proxy_forwards_to_lane_without_recording_a_run(gateway, monkeypatch):
+    handler, store, sampler = gateway
+    body = json.dumps({"choices": [{"text": "print(1)"}]}).encode()
+    backend = Mock(return_value=io.BytesIO(body))
+    monkeypatch.setattr(app.urlrequest, "urlopen", backend)
+    handler._proxy_openai_completions("/v1/r9700/autocomplete/completions",
+                                      {"prompt": "def f():", "max_tokens": 8})
+    sent = backend.call_args.args[0]
+    assert sent.full_url == "http://backend/v1/completions"  # raw FIM endpoint, not chat
+    assert json.loads(sent.data)["prompt"] == "def f():"
+    assert handler.wfile.getvalue() == body
+    # Autocomplete must stay cheap: no run row, no GPU sampling, no history overhead.
+    assert store.count_runs() == 0
+    sampler.capture.assert_not_called()
+
+
+def test_infill_proxy_hits_infill_endpoint(gateway, monkeypatch):
+    handler, store, _ = gateway
+    backend = Mock(return_value=io.BytesIO(b'{"content":"x"}'))
+    monkeypatch.setattr(app.urlrequest, "urlopen", backend)
+    handler._proxy_openai_completions("/v1/r9700/autocomplete/infill",
+                                      {"input_prefix": "a", "input_suffix": "b"}, infill=True)
+    assert backend.call_args.args[0].full_url == "http://backend/infill"
+    assert store.count_runs() == 0
+
+
+def test_completions_stream_passthrough_emits_full_done_event(gateway, monkeypatch):
+    handler, store, _ = gateway
+    wire = b'data: {"choices":[{"text":"x"}]}\n\ndata: [DONE]\n\n'
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(wire)))
+    handler._proxy_openai_completions("/v1/r9700/autocomplete/completions",
+                                      {"prompt": "a", "stream": True})
+    assert handler.wfile.getvalue() == wire  # full stream incl. [DONE]'s terminating blank line
+    assert store.count_runs() == 0
+
+
 def test_fully_cached_prompt_and_zero_completion_are_not_missing():
     payload = {"usage": {"prompt_tokens": 100, "completion_tokens": 0},
                "timings": {"prompt_n": 0, "cache_n": 100, "prompt_ms": 0, "predicted_n": 0}}

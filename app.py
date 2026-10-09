@@ -15,6 +15,7 @@ import time
 import uuid
 import webbrowser
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -1323,6 +1324,33 @@ class ServerHandle:
         self.lanes = lanes
         self.process = process
         self._reasoning_capabilities: dict[str, Any] | None = None
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+
+    @contextmanager
+    def serving(self):
+        """Count an in-flight request so a deployment change can drain before stopping this
+        server, instead of killing another client's request mid-generation."""
+        with self._inflight_lock:
+            self._inflight += 1
+        try:
+            yield
+        finally:
+            with self._inflight_lock:
+                self._inflight = max(0, self._inflight - 1)
+
+    @property
+    def inflight(self) -> int:
+        with self._inflight_lock:
+            return self._inflight
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for in-flight requests to finish. Returns True if the
+        server went idle, False if it timed out (the caller stops it anyway to avoid hanging)."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.inflight > 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.inflight == 0
 
     def reasoning_capabilities(self, config: AppConfig) -> dict[str, Any]:
         # The model file is fixed for the life of a deployment, so read its native
@@ -1648,6 +1676,14 @@ class DeploymentManager:
         self.sampler.stop()
         self._stop_all()
 
+    def _stop_handle(self, handle: ServerHandle) -> None:
+        # Let in-flight requests finish (bounded) before killing the server, so a deployment
+        # change never drops another client's request mid-generation.
+        if not handle.drain(self.config.policy.drain_timeout_seconds):
+            print(f"[{handle.target}] {handle.inflight} request(s) still in flight after "
+                  f"{self.config.policy.drain_timeout_seconds:.0f}s drain; stopping anyway.")
+        handle.process.stop()
+
     def _stop_all(self) -> None:
         with self.lock:
             handles = list(self.handles.values())
@@ -1655,7 +1691,7 @@ class DeploymentManager:
             deployment_id = self.deployment_id
         for handle in handles:
             try:
-                handle.process.stop()
+                self._stop_handle(handle)
             except Exception:  # noqa: BLE001
                 pass
         if deployment_id and handles:
@@ -1728,7 +1764,9 @@ class DeploymentManager:
     def _draft_footprint_gb(self, model: ModelConfig) -> float:
         if not model.draft_model:
             return 0.0
-        return model_size_gb(self.config, replace(model, path=model.draft_model))
+        # size_gb=0 forces an actual file measurement of the DRAFT; without it model_size_gb
+        # would return the target model's configured size_gb (replace keeps that field).
+        return model_size_gb(self.config, replace(model, path=model.draft_model, size_gb=0.0))
 
     def _requested_model_names_by_lane(self) -> dict[str, str]:
         """Map lane key -> the exact model string the caller last asked for on that lane.
@@ -1799,26 +1837,39 @@ class DeploymentManager:
         max_output_tokens or requested explicitly, and was never run at all for
         single_large_model deploys before this."""
         size = model_size_gb(self.config, model)
+        # A draft model (speculative decoding) is loaded on the same lane(s), so its weights
+        # and KV cache share this budget. Omitting them here -- while _configured_model already
+        # reserves the draft for auto-sizing -- would approve a deploy that then OOMs.
+        draft_gb = self._draft_footprint_gb(model)
         if len(lanes) == 1 and model.pin_lane and model.pin_lane != lanes[0].key:
             raise AppError(f"{model.name} is pinned to lane {model.pin_lane}, not {lanes[0].key}.")
         capacity = sum(lane_capacity_gb(self.config, lane) for lane in lanes)
         lane_label = "+".join(lane.key for lane in lanes)
-        if size > capacity:
+        draft_note = f" + {draft_gb:.2f} GB draft model" if draft_gb else ""
+        weights = size + draft_gb
+        if weights > capacity:
             raise AppError(
-                f"{model.name} is {size:.2f} GB but {lane_label} has a safe model-file budget of "
-                f"{capacity:.2f} GB. Choose another GPU/model or multi-GPU mode."
+                f"{model.name} ({size:.2f} GB{draft_note}) needs {weights:.2f} GB but {lane_label} "
+                f"has a safe model-file budget of {capacity:.2f} GB. Choose another GPU/model or multi-GPU mode."
             )
         path = resolve_model_path(self.config, model)
         kv_gb, _note = estimate_kv_cache_gb(path, model.ctx_size)
         if kv_gb is None:
             return
-        total = size + kv_gb
+        draft_kv_gb = 0.0
+        if model.draft_model:
+            draft_path = resolve_model_path(self.config, replace(model, path=model.draft_model))
+            draft_kv_est, _ = estimate_kv_cache_gb(draft_path, model.ctx_size)
+            draft_kv_gb = draft_kv_est or 0.0
+        total = weights + kv_gb + draft_kv_gb
         if total > capacity:
+            kv_note = f" + ~{kv_gb:.2f} GB KV cache at {model.ctx_size} context tokens"
+            if draft_gb or draft_kv_gb:
+                kv_note += f" + {draft_gb:.2f} GB draft + ~{draft_kv_gb:.2f} GB draft KV"
             raise AppError(
-                f"{model.name} needs an estimated {total:.2f} GB ({size:.2f} GB model file + "
-                f"~{kv_gb:.2f} GB KV cache at {model.ctx_size} context tokens) but {lane_label} "
-                f"has a safe budget of {capacity:.2f} GB. Lower the context window, choose another "
-                "GPU, or use multi-GPU mode."
+                f"{model.name} needs an estimated {total:.2f} GB ({size:.2f} GB model file{kv_note}) "
+                f"but {lane_label} has a safe budget of {capacity:.2f} GB. Lower the context window, "
+                "choose another GPU, or use multi-GPU mode."
             )
 
     def _auto_lane_for_model(
@@ -1994,7 +2045,7 @@ class DeploymentManager:
                     self.state = "switching"
                 self.error = None
             if old_handle is not None:
-                old_handle.process.stop()
+                self._stop_handle(old_handle)
 
             run_dir = self.data_dir / "deployments" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -2300,11 +2351,12 @@ class ChatService:
         baseline = self.manager.sampler.latest() if workload_kind == "coding_agent" else self.manager.sampler.capture()
         started = time.monotonic()
         try:
-            backend = self._post_json(
-                f"{handle.process.base_url}/v1/chat/completions",
-                request_payload,
-                timeout=float(payload.get("timeout_seconds", 900)),
-            )
+            with handle.serving():  # drained before a deployment change stops this server
+                backend = self._post_json(
+                    f"{handle.process.base_url}/v1/chat/completions",
+                    request_payload,
+                    timeout=float(payload.get("timeout_seconds", 900)),
+                )
             elapsed = time.monotonic() - started
             choice = (backend.get("choices") or [{}])[0]
             message = choice.get("message") or {}
@@ -2808,6 +2860,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             ):
                 self._proxy_openai_chat(path, payload)
                 return
+            if path.endswith("/infill") and (path == "/infill" or path.startswith("/v1/")):
+                self._proxy_openai_completions(path, payload, infill=True)
+                return
+            if path.endswith("/completions") and path.startswith("/v1/"):
+                # chat/completions handled above; this is the raw FIM completions endpoint
+                self._proxy_openai_completions(path, payload)
+                return
             if path == "/api/deploy":
                 result = self.server.app_state.manager.deploy(payload)
             elif path == "/api/models/refresh":
@@ -2881,22 +2940,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
-    def _proxy_openai_chat(self, path: str, payload: dict[str, Any]) -> None:
-        """Stream an OpenAI-compatible coding-agent request through an active GPU lane.
-
-        Supported base URLs are /v1 (model selects a lane), /v1/<lane>, and
-        /v1/<lane>/<role>. A registered client_id used as the Bearer key supplies project
-        attribution, which works with clients such as Cline that expose an API-key field but
-        do not expose arbitrary HTTP headers.
-        """
+    def _resolve_lane_handle(self, path: str, payload: dict[str, Any]) -> tuple[str, "ServerHandle"]:
+        """Pick the active lane for an OpenAI-compatible request. Base URLs: /v1 (model selects
+        a lane), /v1/<lane>, /v1/<lane>/<role>. Shared by the chat and completions proxies so
+        lane routing is identical for agent and autocomplete traffic."""
         state = self.server.app_state
         path_parts = [part for part in path.split("/") if part]
         path_target = path_parts[1] if len(path_parts) >= 4 else None
-        path_role = path_parts[2] if len(path_parts) >= 5 else None
-        header_target = self.headers.get("X-DGPU-Target")
+        target_hint = self.headers.get("X-DGPU-Target") or path_target
         requested_model = str(payload.get("model") or "")
-        target_hint = header_target or path_target
-
         with state.manager.lock:
             if state.manager.state != "ready" or not state.manager.handles:
                 raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
@@ -2915,10 +2967,72 @@ class RequestHandler(BaseHTTPRequestHandler):
             if target is None and len(handles) == 1:
                 target = next(iter(handles))
             if target is None:
-                raise AppError(
-                    "Select a GPU lane with model='dgpu:<lane>' or a /v1/<lane> base URL."
-                )
-            handle = handles[target]
+                raise AppError("Select a GPU lane with model='dgpu:<lane>' or a /v1/<lane> base URL.")
+            return target, handles[target]
+
+    def _proxy_openai_completions(self, path: str, payload: dict[str, Any], infill: bool = False) -> None:
+        """Thin passthrough for inline autocomplete (FIM `/v1/completions` and `/infill`).
+
+        Deliberately minimal: autocomplete fires on nearly every typing pause, so this does
+        NO per-request run recording, GPU sampling, or history logging -- that overhead and
+        DB growth would hurt, which is exactly what we must avoid. It still routes through a
+        loaded lane (so autocomplete uses the dual-GPU setup from this codebase) and counts
+        the request in-flight so a deployment change drains it instead of killing it.
+        """
+        _target, handle = self._resolve_lane_handle(path, payload)
+        suffix = "/infill" if infill else "/v1/completions"
+        request_payload = dict(payload)
+        request_payload["model"] = handle.model.name
+        stream = bool(request_payload.get("stream"))
+        request = urlrequest.Request(
+            f"{handle.process.base_url}{suffix}",
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
+            method="POST",
+        )
+        try:
+            with handle.serving(), urlrequest.urlopen(request, timeout=120) as response:
+                if stream:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    done = False
+                    while True:
+                        line = response.readline()
+                        if not line:
+                            break
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                        if done and not line.strip():
+                            break  # emit [DONE]'s terminating blank line, then stop
+                        if line.strip() == b"data: [DONE]":
+                            done = True
+                else:
+                    body = response.read()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+        except urlerror.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
+
+    def _proxy_openai_chat(self, path: str, payload: dict[str, Any]) -> None:
+        """Stream an OpenAI-compatible coding-agent request through an active GPU lane.
+
+        Supported base URLs are /v1 (model selects a lane), /v1/<lane>, and
+        /v1/<lane>/<role>. A registered client_id used as the Bearer key supplies project
+        attribution, which works with clients such as Cline that expose an API-key field but
+        do not expose arbitrary HTTP headers.
+        """
+        state = self.server.app_state
+        path_parts = [part for part in path.split("/") if part]
+        path_role = path_parts[2] if len(path_parts) >= 5 else None
+        target, handle = self._resolve_lane_handle(path, payload)
 
         authorization = self.headers.get("Authorization", "")
         token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
@@ -3024,7 +3138,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
                 method="POST",
             )
-            with urlrequest.urlopen(request, timeout=900) as response:
+            # serving() marks the lane busy so a deployment change drains before stopping it.
+            with handle.serving(), urlrequest.urlopen(request, timeout=900) as response:
                 if not stream:
                     backend_payload = json.loads(response.read().decode("utf-8", errors="replace"))
                 else:
