@@ -4,9 +4,14 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
+
+# See server.py's own _NO_WINDOW for why: app.py runs detached (no console), so an
+# unflagged subprocess.run on Windows pops a new console window per call.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 BACKEND_SPECS = {
     "rocm": {"dir_re": r"llama\.cpp-win-x86_64-amd-rocm-", "vendor_hint": "rocm", "prefix": "ROCm"},
@@ -95,6 +100,7 @@ def list_devices(config: AppConfig, backend: str) -> list[tuple[str, str]]:
         timeout=120,
         env=backend_env(config, backend),
         cwd=str(runtime_dir(config, backend)),
+        creationflags=_NO_WINDOW,
     )
     prefix = BACKEND_SPECS[backend]["prefix"]
     found: list[tuple[str, str]] = []

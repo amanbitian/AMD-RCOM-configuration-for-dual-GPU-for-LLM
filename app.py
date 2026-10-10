@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import queue
 import signal
 import socket
 import sqlite3
@@ -14,24 +15,81 @@ import time
 import uuid
 import webbrowser
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig, load_config
 from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
-from dual_gpu_setup.orchestrator import ctx_for, lane_capacity_gb
-from dual_gpu_setup.server import LlamaServerProcess, gpu_process_metrics
+from dual_gpu_setup.orchestrator import ctx_for, estimate_kv_cache_gb, lane_capacity_gb, resolve_context_window
+from dual_gpu_setup.server import LlamaServerProcess, gpu_process_metrics_batch
+from dual_gpu_setup.reasoning import coding_request, model_reasoning
 
 
 APP_VERSION = "0.1.0"
 DEFAULT_REASONING_PRESETS = {"off": 0, "low": 1024, "medium": 4096, "high": 8192}
+
+# Documents exactly the fields ChatService already computes (see _normalize_usage,
+# _normalize_timing, _resource_summary) and hands to clients unchanged via /api/chat's
+# response and the client_id delivery file. Served at GET /api/clients/schema.
+CLIENT_METRICS_SCHEMA = {
+    "usage": {
+        "input_tokens": "Prompt tokens sent to the model.",
+        "cached_input_tokens": "Prompt tokens served from KV cache reuse, if reported by the backend.",
+        "uncached_input_tokens": "input_tokens minus cached_input_tokens.",
+        "prefill_tokens": "Tokens processed during the prefill/prompt phase.",
+        "thinking_tokens": "Exact reasoning/thinking tokens as reported by the backend; null when it reports none.",
+        "thinking_tokens_estimated": "Fallback ~4-chars/token estimate of thinking tokens, set only when the backend omits an exact count but reasoning text was observed; null otherwise.",
+        "thinking_characters": "Observed reasoning-text characters (streamed deltas or a non-streamed message's reasoning); the basis for thinking_tokens_estimated.",
+        "thinking_tokens_source": "backend (exact count), estimated_from_characters (fallback estimate), or unavailable (no reasoning observed).",
+        "visible_output_tokens": "output_tokens minus thinking_tokens.",
+        "tool_calls_total": "Number of tool calls the model emitted in this response.",
+        "tool_calls_malformed": "Tool calls with no function name or unparseable JSON arguments; grammar/schema constraints reduce this.",
+        "tool_call_valid_rate": "(tool_calls_total - tool_calls_malformed) / tool_calls_total; null when the response made no tool calls.",
+        "output_tokens": "Total completion tokens generated.",
+        "total_tokens": "input_tokens + output_tokens as reported by the backend.",
+    },
+    "timing": {
+        "time_to_first_token_ms": "Latency before the first output token.",
+        "prefill_duration_ms": "Wall time spent on the prefill/prompt phase.",
+        "decode_duration_ms": "Wall time spent generating output tokens.",
+        "end_to_end_duration_ms": "Total wall time for the request.",
+        "prefill_tokens_per_second": "Prefill rate: prompt tokens / prefill duration.",
+        "tokens_per_second": "Decode rate: output tokens / decode duration.",
+        "end_to_end_tokens_per_second": "Output tokens / full request duration, including prefill; not decode speed.",
+        "backend_prompt_tokens": "Prompt token count as reported natively by llama-server.",
+        "backend_output_tokens": "Output token count as reported natively by llama-server.",
+        "draft_tokens": "Tokens proposed by the speculative draft model; null when speculative decoding is off or unreported.",
+        "draft_accepted_tokens": "Draft tokens the target model accepted; null when speculative decoding is off or unreported.",
+        "draft_acceptance_rate": "draft_accepted_tokens / draft_tokens; higher means the draft is a better match and the speedup is larger. Null when unavailable.",
+        "native_timing": "Raw timings object returned by the backend, unmodified.",
+        "reasoning_duration_ms": "Observed time from first to last reasoning chunk in a streamed coding response; not native decode time.",
+        "reasoning_duration_source": "observed_stream_span when reasoning chunks were observed, otherwise null.",
+        "time_to_first_visible_token_ms": "Elapsed time until the first answer or tool-call chunk, excluding reasoning-only chunks.",
+    },
+    "resources": {
+        "avg_process_cpu_pct": "Average CPU percent of the model process during the run.",
+        "peak_process_cpu_pct": "Peak CPU percent of the model process during the run.",
+        "avg_gpu_utilization_pct": "Average GPU utilization percent during the run.",
+        "peak_gpu_utilization_pct": "Peak GPU utilization percent during the run.",
+        "peak_process_rss_bytes": "Peak resident memory (working set) of the model process.",
+        "peak_process_private_bytes": "Peak committed/private memory (pagefile usage) of the model process.",
+        "process_page_fault_delta": "Page faults incurred by the model process during this run's window.",
+        "peak_dedicated_vram_bytes": "Peak dedicated VRAM used by the model process.",
+        "peak_shared_gpu_memory_bytes": "Peak shared/system GPU memory used (VRAM-spill indicator).",
+        "spill_suspected": "True if shared GPU memory usage suggests VRAM spill.",
+        "avg_system_cpu_pct": "Average whole-system CPU percent during the run.",
+        "peak_system_ram_used_bytes": "Peak whole-system RAM used during the run.",
+        "peak_system_pagefile_used_bytes": "Peak whole-system commit charge (pagefile usage) during the run.",
+    },
+}
 
 
 def utc_now() -> str:
@@ -156,14 +214,17 @@ class ResourceSampler:
         now = time.monotonic()
         with self.manager.lock:
             handles = list(self.manager.handles.items())
+        live = [(target, handle) for target, handle in handles if handle.process.proc is not None]
+        # One PowerShell call for every active server's PID instead of one per server: the
+        # process spawn + Get-Counter cost is what makes this loop expensive, not the counter
+        # lookup itself, so batching is the win regardless of how many servers are active.
+        gpu_by_pid = gpu_process_metrics_batch([handle.process.pid for _, handle in live])
         servers = []
-        for target, handle in handles:
+        for target, handle in live:
             process = handle.process
-            if process.proc is None:
-                continue
             pid = process.pid
             process_metrics = self._process_metrics(pid, now)
-            gpu = gpu_process_metrics(pid)
+            gpu = gpu_by_pid.get(pid)
             servers.append(
                 {
                     "target": target,
@@ -174,6 +235,9 @@ class ResourceSampler:
                     "cpu_pct": process_metrics.get("cpu_pct"),
                     "rss_bytes": process_metrics.get("rss_bytes"),
                     "private_bytes": process_metrics.get("private_bytes"),
+                    "peak_rss_bytes": process_metrics.get("peak_rss_bytes"),
+                    "peak_private_bytes": process_metrics.get("peak_private_bytes"),
+                    "page_fault_count": process_metrics.get("page_fault_count"),
                     "gpu_utilization_pct": gpu.get("utilization_pct") if gpu else None,
                     "dedicated_vram_bytes": int(gpu["dedicated_gb"] * 1024**3) if gpu else None,
                     "shared_gpu_memory_bytes": int(gpu["shared_gb"] * 1024**3) if gpu else None,
@@ -221,6 +285,9 @@ class ResourceSampler:
                 "cpu_pct": round(cpu_pct, 2) if cpu_pct is not None else None,
                 "rss_bytes": int(counters.working_set_size) if memory_ok else None,
                 "private_bytes": int(counters.pagefile_usage) if memory_ok else None,
+                "peak_rss_bytes": int(counters.peak_working_set_size) if memory_ok else None,
+                "peak_private_bytes": int(counters.peak_pagefile_usage) if memory_ok else None,
+                "page_fault_count": int(counters.page_fault_count) if memory_ok else None,
             }
         finally:
             kernel32.CloseHandle(handle)
@@ -249,6 +316,7 @@ class ResourceSampler:
             "ram_used_bytes": int(memory.total_physical - memory.available_physical) if memory_ok else None,
             "ram_used_pct": float(memory.memory_load) if memory_ok else None,
             "pagefile_used_bytes": int(memory.total_page_file - memory.available_page_file) if memory_ok else None,
+            "pagefile_total_bytes": int(memory.total_page_file) if memory_ok else None,
         }
 
 
@@ -316,9 +384,66 @@ class RunStore:
                     sample_json TEXT NOT NULL,
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS clients (
+                    id TEXT PRIMARY KEY,
+                    project_name TEXT NOT NULL,
+                    github_repo TEXT,
+                    output_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT,
+                    project_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    repo_path TEXT,
+                    git_remote TEXT,
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    agent_role TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    FOREIGN KEY (project_id) REFERENCES projects(id)
+                );
+                CREATE TABLE IF NOT EXISTS coding_tasks (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    branch TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY (project_id) REFERENCES projects(id)
+                );
+                CREATE TABLE IF NOT EXISTS tool_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL,
+                    session_id TEXT,
+                    task_id TEXT,
+                    run_id TEXT,
+                    occurred_at TEXT NOT NULL,
+                    tool_type TEXT NOT NULL,
+                    duration_ms REAL,
+                    exit_code INTEGER,
+                    status TEXT NOT NULL,
+                    detail_json TEXT,
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (session_id) REFERENCES agent_sessions(id),
+                    FOREIGN KEY (task_id) REFERENCES coding_tasks(id),
+                    FOREIGN KEY (run_id) REFERENCES runs(id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_comparison_id ON runs(comparison_id);
                 CREATE INDEX IF NOT EXISTS idx_metric_samples_run_id ON metric_samples(run_id, id);
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON agent_sessions(project_id, started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON coding_tasks(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_tool_events_project_id ON tool_events(project_id, occurred_at DESC);
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
@@ -330,11 +455,26 @@ class RunStore:
                 "reasoning_budget": "INTEGER",
                 "configuration_json": "TEXT",
                 "finish_reason": "TEXT",
+                "client_id": "TEXT",
+                "task_label": "TEXT",
+                "project_id": "TEXT",
+                "agent_session_id": "TEXT",
+                "coding_task_id": "TEXT",
+                "agent_role": "TEXT",
+                "workload_kind": "TEXT NOT NULL DEFAULT 'evaluation'",
             }
             for name, data_type in migrations.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {data_type}")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_deployment_id ON runs(deployment_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_client_id ON runs(client_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_label ON runs(task_label)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs(project_id, created_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(agent_session_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_coding_task_id ON runs(coding_task_id)")
+            client_columns = {row[1] for row in connection.execute("PRAGMA table_info(clients)")}
+            if "project_id" not in client_columns:
+                connection.execute("ALTER TABLE clients ADD COLUMN project_id TEXT")
 
     def begin_deployment(self, deployment_id: str, mode: str, profile: dict[str, Any]) -> None:
         with self.lock, self.connect() as connection:
@@ -382,8 +522,9 @@ class RunStore:
                 INSERT INTO runs (
                     id, comparison_id, deployment_id, created_at, status, mode, target,
                     model_name, model_path, lane_keys_json, device_json, context_window,
-                    reasoning_budget, request_json, configuration_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reasoning_budget, request_json, configuration_json, client_id, task_label,
+                    project_id, agent_session_id, coding_task_id, agent_role, workload_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -401,6 +542,13 @@ class RunStore:
                     record.get("reasoning_budget"),
                     json.dumps(record["request"], ensure_ascii=False),
                     json.dumps(record.get("configuration"), ensure_ascii=False),
+                    record.get("client_id"),
+                    record.get("task_label"),
+                    record.get("project_id"),
+                    record.get("agent_session_id"),
+                    record.get("coding_task_id"),
+                    record.get("agent_role"),
+                    record.get("workload_kind", "evaluation"),
                 ),
             )
 
@@ -452,12 +600,272 @@ class RunStore:
                 rows,
             )
 
-    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+    def upsert_project(
+        self,
+        name: str,
+        repo_path: str | None = None,
+        git_remote: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("Project name is required.")
+        with self.lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE name = ? COLLATE NOCASE", (normalized,)
+            ).fetchone()
+            if row is None:
+                project_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO projects (id, name, repo_path, git_remote, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (project_id, normalized, repo_path, git_remote, utc_now()),
+                )
+            else:
+                project_id = row["id"]
+                connection.execute(
+                    """
+                    UPDATE projects SET repo_path = COALESCE(?, repo_path),
+                        git_remote = COALESCE(?, git_remote)
+                    WHERE id = ?
+                    """,
+                    (repo_path, git_remote, project_id),
+                )
+            result = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(result)
+
+    def projects(self) -> list[dict[str, Any]]:
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.*,
+                    COUNT(r.id) AS run_count,
+                    COALESCE(SUM(CAST(json_extract(r.usage_json, '$.total_tokens') AS INTEGER)), 0) AS total_tokens,
+                    MAX(r.created_at) AS last_run_at
+                FROM projects p
+                LEFT JOIN runs r ON r.project_id = p.id
+                WHERE p.archived_at IS NULL
+                GROUP BY p.id
+                ORDER BY COALESCE(MAX(r.created_at), p.created_at) DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_project(self, project_id_or_name: str) -> dict[str, Any] | None:
+        with self.lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE id = ? OR name = ? COLLATE NOCASE",
+                (project_id_or_name, project_id_or_name),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_agent_session(self, project_id: str, agent_role: str, runtime: str) -> dict[str, Any]:
+        session = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "agent_role": agent_role.strip() or "developer",
+            "runtime": runtime.strip() or "unknown",
+            "started_at": utc_now(),
+            "status": "active",
+        }
+        with self.lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_sessions (id, project_id, agent_role, runtime, started_at, status)
+                VALUES (:id, :project_id, :agent_role, :runtime, :started_at, :status)
+                """,
+                session,
+            )
+        return session
+
+    def create_coding_task(
+        self, project_id: str, title: str, branch: str | None = None
+    ) -> dict[str, Any]:
+        task = {
+            "id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "title": title.strip(),
+            "status": "active",
+            "branch": branch,
+            "created_at": utc_now(),
+        }
+        if not task["title"]:
+            raise ValueError("Task title is required.")
+        with self.lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO coding_tasks (id, project_id, title, status, branch, created_at)
+                VALUES (:id, :project_id, :title, :status, :branch, :created_at)
+                """,
+                task,
+            )
+        return task
+
+    def record_tool_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        record = {
+            "project_id": event["project_id"],
+            "session_id": event.get("session_id"),
+            "task_id": event.get("task_id"),
+            "run_id": event.get("run_id"),
+            "occurred_at": event.get("occurred_at") or utc_now(),
+            "tool_type": str(event.get("tool_type") or "unknown"),
+            "duration_ms": event.get("duration_ms"),
+            "exit_code": event.get("exit_code"),
+            "status": str(event.get("status") or "completed"),
+            "detail_json": json.dumps(event.get("detail"), ensure_ascii=False),
+        }
+        with self.lock, self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO tool_events (
+                    project_id, session_id, task_id, run_id, occurred_at, tool_type,
+                    duration_ms, exit_code, status, detail_json
+                ) VALUES (
+                    :project_id, :session_id, :task_id, :run_id, :occurred_at, :tool_type,
+                    :duration_ms, :exit_code, :status, :detail_json
+                )
+                """,
+                record,
+            )
+            record["id"] = cursor.lastrowid
+        record["detail"] = json.loads(record.pop("detail_json"))
+        return record
+
+    def register_client(self, project_name: str, github_repo: str | None, output_path: str) -> dict[str, Any]:
+        project = self.upsert_project(project_name, git_remote=github_repo)
+        client_id = str(uuid.uuid4())
+        created_at = utc_now()
+        with self.lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO clients (
+                    id, project_name, github_repo, output_path, created_at, last_seen_at, project_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (client_id, project_name, github_repo, output_path, created_at, created_at, project["id"]),
+            )
+        return {
+            "client_id": client_id,
+            "project_id": project["id"],
+            "project_name": project_name,
+            "github_repo": github_repo,
+            "output_path": output_path,
+            "created_at": created_at,
+        }
+
+    def get_client(self, client_id: str) -> dict[str, Any] | None:
+        with self.lock, self.connect() as connection:
+            row = connection.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+        return dict(row) if row else None
+
+    def touch_client(self, client_id: str) -> None:
+        with self.lock, self.connect() as connection:
+            connection.execute("UPDATE clients SET last_seen_at = ? WHERE id = ?", (utc_now(), client_id))
+
+    def link_client_project(self, client_id: str, project_id: str) -> None:
+        with self.lock, self.connect() as connection:
+            connection.execute("UPDATE clients SET project_id = ? WHERE id = ?", (project_id, client_id))
+
+    def runs_for_client(self, client_id: str, limit: int = 100) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
         with self.lock, self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM runs WHERE client_id = ? ORDER BY created_at DESC LIMIT ?",
+                (client_id, limit),
             ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def prune_older_than(self, days: int) -> dict[str, Any]:
+        """Delete runs (and their metric_samples, via ON DELETE CASCADE) and deployments
+        older than `days`. Opt-in only -- nothing calls this unless the operator passes
+        --prune-older-than-days, so the default stays "keep everything forever". There is
+        no automatic retention policy otherwise: this database grows without bound."""
+        if days <= 0:
+            raise ValueError("days must be positive.")
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="milliseconds")
+        with self.lock, self.connect() as connection:
+            deleted_runs = connection.execute("DELETE FROM runs WHERE created_at < ?", (cutoff,)).rowcount
+            deleted_deployments = connection.execute(
+                "DELETE FROM deployments WHERE created_at < ?", (cutoff,)
+            ).rowcount
+        return {"cutoff": cutoff, "deleted_runs": deleted_runs, "deleted_deployments": deleted_deployments}
+
+    def recent(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        project_id: str | None = None,
+        workload_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if workload_kind:
+            conditions.append("workload_kind = ?")
+            params.append(workload_kind)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM runs{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def count_runs(self, project_id: str | None = None, workload_kind: str | None = None) -> int:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if workload_kind:
+            conditions.append("workload_kind = ?")
+            params.append(workload_kind)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.lock, self.connect() as connection:
+            return int(connection.execute(f"SELECT COUNT(*) FROM runs{where}", params).fetchone()[0])
+
+    @staticmethod
+    def _day_after(date_str: str) -> str:
+        # Exclusive upper bound so an inclusive end date covers its whole day. Parsing
+        # also validates the YYYY-MM-DD format (ValueError on anything else).
+        return (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def _dashboard_runs(
+        self, project_id: str | None = None, workload_kind: str | None = None,
+        start_date: str | None = None, end_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if workload_kind:
+            conditions.append("workload_kind = ?")
+            params.append(workload_kind)
+        # created_at is ISO text, so lexicographic bounds match chronological ones and use
+        # the created_at index. start is inclusive; end covers its whole day.
+        if start_date:
+            conditions.append("created_at >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("created_at < ?")
+            params.append(self._day_after(end_date))
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        # WAL readers need not hold the writer lock. Do not copy/parse large prompt,
+        # completion, or backend-response bodies for performance aggregates.
+        with self.connect() as connection:
+            rows = connection.execute(f"""
+                SELECT id, created_at, status, mode, target, model_name, lane_keys_json,
+                    context_window, reasoning_budget, project_id, agent_role, task_label,
+                    workload_kind, usage_json, timing_json, resources_json,
+                    json_object('reasoning', json_extract(configuration_json, '$.reasoning')) AS configuration_json
+                FROM runs{where} ORDER BY created_at DESC
+            """, params).fetchall()
         return [self._decode(row) for row in rows]
 
     def get(self, run_id: str) -> dict[str, Any] | None:
@@ -480,8 +888,14 @@ class RunStore:
         ]
         return item
 
-    def dashboard(self) -> dict[str, Any]:
-        runs = self.recent(1000)
+    def dashboard(
+        self, project_id: str | None = None, workload_kind: str | None = None,
+        start_date: str | None = None, end_date: str | None = None,
+    ) -> dict[str, Any]:
+        # Dashboard aggregates intentionally use the complete matching history (optionally
+        # narrowed to a date range). The prior implementation called recent(1000), which
+        # was silently capped to 500 records.
+        runs = self._dashboard_runs(project_id, workload_kind, start_date, end_date)
 
         def nums(path: tuple[str, str], selected: list[dict[str, Any]] = runs) -> list[float]:
             parent, child = path
@@ -506,29 +920,132 @@ class RunStore:
             return round(values[index], 2)
 
         completed = [run for run in runs if run.get("status") == "completed"]
+
+        def summarize(group: list[dict[str, Any]]) -> dict[str, Any]:
+            group_completed = [run for run in group if run.get("status") == "completed"]
+            timed = [run for run in group_completed if (run.get("timing") or {}).get("decode_duration_ms", 0)
+                     and (run.get("usage") or {}).get("output_tokens") is not None]
+            output_tokens = total(("usage", "output_tokens"), timed)
+            decode_ms = sum(nums(("timing", "decode_duration_ms"), timed))
+            return {
+                "runs": len(group),
+                "success_rate": round(len(group_completed) / len(group) * 100, 1) if group else None,
+                "input_tokens": total(("usage", "input_tokens"), group),
+                "output_tokens": total(("usage", "output_tokens"), group),
+                "thinking_tokens": total(("usage", "thinking_tokens"), group),
+                "thinking_tokens_reported_runs": len(nums(("usage", "thinking_tokens"), group_completed)),
+                "avg_thinking_tokens": average(("usage", "thinking_tokens"), group_completed),
+                "thinking_tokens_estimated_runs": len(nums(("usage", "thinking_tokens_estimated"), group_completed)),
+                "avg_thinking_tokens_estimated": average(("usage", "thinking_tokens_estimated"), group_completed),
+                "avg_thinking_characters": average(("usage", "thinking_characters"), group_completed),
+                "avg_reasoning_duration_ms": average(("timing", "reasoning_duration_ms"), group_completed),
+                "avg_tokens_per_second": average(("timing", "tokens_per_second"), group_completed),
+                "avg_draft_acceptance_rate": average(("timing", "draft_acceptance_rate"), group_completed),
+                "tool_calls_total": total(("usage", "tool_calls_total"), group_completed),
+                "tool_calls_malformed": total(("usage", "tool_calls_malformed"), group_completed),
+                "avg_tool_call_valid_rate": average(("usage", "tool_call_valid_rate"), group_completed),
+                "aggregate_tokens_per_second": (
+                    round(output_tokens / (decode_ms / 1000), 2) if decode_ms > 0 else None
+                ),
+                "avg_prefill_tokens_per_second": average(
+                    ("timing", "prefill_tokens_per_second"), group_completed
+                ),
+                "avg_latency_ms": average(("timing", "end_to_end_duration_ms"), group_completed),
+                "avg_gpu_utilization_pct": average(
+                    ("resources", "avg_gpu_utilization_pct"), group_completed
+                ),
+                "peak_vram_bytes": max(nums(("resources", "peak_dedicated_vram_bytes"), group) or [0]),
+            }
+
         models: list[dict[str, Any]] = []
         for model_name in sorted({run["model_name"] for run in runs}):
             group = [run for run in runs if run["model_name"] == model_name]
-            group_completed = [run for run in group if run.get("status") == "completed"]
-            models.append(
+            models.append({"model": model_name, **summarize(group)})
+
+        # task_label is optional, freeform metadata a caller passes to /api/chat (see
+        # CLIENT_API.md) to tag what kind of work a call was -- e.g. "relevance",
+        # "resume_extraction", "fraud_d2_fusion". Runs that never set it are left out of
+        # these two breakdowns (they still count in `models` and the overall `summary`).
+        labeled_runs = [run for run in runs if run.get("task_label")]
+        categories: list[dict[str, Any]] = []
+        for label in sorted({run["task_label"] for run in labeled_runs}):
+            group = [run for run in labeled_runs if run["task_label"] == label]
+            categories.append({"category": label, **summarize(group)})
+
+        category_models: list[dict[str, Any]] = []
+        pairs = sorted({(run["task_label"], run["model_name"]) for run in labeled_runs})
+        for label, model_name in pairs:
+            group = [
+                run for run in labeled_runs
+                if run["task_label"] == label and run["model_name"] == model_name
+            ]
+            category_models.append({"category": label, "model": model_name, **summarize(group)})
+
+        gpu_lanes: list[dict[str, Any]] = []
+        for lane in sorted({lane for run in runs for lane in (run.get("lane_keys") or [])}):
+            group = [run for run in runs if lane in (run.get("lane_keys") or [])]
+            gpu_lanes.append({"gpu": lane, **summarize(group)})
+
+        project_rows: list[dict[str, Any]] = []
+        known_projects = {project["id"]: project for project in self.projects()}
+        project_keys_set: set[str | None] = set(known_projects) if not project_id else {project_id}
+        project_keys_set.update(run.get("project_id") for run in runs)
+        project_keys = sorted(project_keys_set, key=lambda value: str(value or ""))
+        for key in project_keys:
+            group = [run for run in runs if run.get("project_id") == key]
+            project = known_projects.get(key or "", {})
+            project_rows.append(
                 {
-                    "model": model_name,
-                    "runs": len(group),
-                    "success_rate": round(len(group_completed) / len(group) * 100, 1),
-                    "input_tokens": total(("usage", "input_tokens"), group),
-                    "output_tokens": total(("usage", "output_tokens"), group),
-                    "thinking_tokens": total(("usage", "thinking_tokens"), group),
-                    "avg_tokens_per_second": average(("timing", "tokens_per_second"), group_completed),
-                    "avg_prefill_tokens_per_second": average(
-                        ("timing", "prefill_tokens_per_second"), group_completed
-                    ),
-                    "avg_latency_ms": average(("timing", "end_to_end_duration_ms"), group_completed),
-                    "avg_gpu_utilization_pct": average(
-                        ("resources", "avg_gpu_utilization_pct"), group_completed
-                    ),
-                    "peak_vram_bytes": max(nums(("resources", "peak_dedicated_vram_bytes"), group) or [0]),
+                    "project_id": key,
+                    "project": project.get("name") or "Unassigned / Legacy",
+                    **summarize(group),
                 }
             )
+
+        agent_rows: list[dict[str, Any]] = []
+        for role in sorted({run.get("agent_role") for run in runs if run.get("agent_role")}):
+            group = [run for run in runs if run.get("agent_role") == role]
+            agent_rows.append({"agent_role": role, **summarize(group)})
+
+        tool_summary = {"events": 0, "failed": 0, "success_rate": None}
+        reasoning_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for run in runs:
+            reasoning = (run.get("configuration") or {}).get("reasoning") or {}
+            if run.get("workload_kind") == "coding_agent":
+                level = reasoning.get("effective_effort") or reasoning.get("effort") or "unknown"
+                reasoning_groups.setdefault((run["model_name"], level), []).append(run)
+        reasoning_levels = [{"model": model, "effort": effort, **summarize(group)}
+                            for (model, effort), group in sorted(reasoning_groups.items())]
+        tool_conditions: list[str] = []
+        tool_params: list[Any] = []
+        if project_id:
+            tool_conditions.append("project_id = ?")
+            tool_params.append(project_id)
+        if start_date:
+            tool_conditions.append("occurred_at >= ?")
+            tool_params.append(start_date)
+        if end_date:
+            tool_conditions.append("occurred_at < ?")
+            tool_params.append(self._day_after(end_date))
+        tool_where = f" WHERE {' AND '.join(tool_conditions)}" if tool_conditions else ""
+        with self.lock, self.connect() as connection:
+            tool_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS events,
+                    SUM(CASE WHEN status IN ('failed', 'error', 'timeout') OR COALESCE(exit_code, 0) != 0 THEN 1 ELSE 0 END) AS failed
+                FROM tool_events{tool_where}
+                """,
+                tool_params,
+            ).fetchone()
+        if tool_row:
+            event_count = int(tool_row["events"] or 0)
+            failed_count = int(tool_row["failed"] or 0)
+            tool_summary = {
+                "events": event_count,
+                "failed": failed_count,
+                "success_rate": round((event_count - failed_count) / event_count * 100, 1) if event_count else None,
+            }
+
         daily: dict[str, dict[str, Any]] = {}
         for run in reversed(runs):
             day = str(run.get("created_at", ""))[:10]
@@ -536,8 +1053,11 @@ class RunStore:
             bucket["runs"] += 1
             if isinstance(run.get("usage"), dict):
                 bucket["tokens"] += int(run["usage"].get("total_tokens") or 0)
+        # Default view keeps the last 14 days tidy; an explicit date range shows every day in it.
+        daily_list = list(daily.values()) if (start_date or end_date) else list(daily.values())[-14:]
         return {
             "generated_at": utc_now(),
+            "filters": {"start_date": start_date, "end_date": end_date},
             "summary": {
                 "total_runs": len(runs),
                 "completed_runs": len(completed),
@@ -550,6 +1070,7 @@ class RunStore:
                 "visible_output_tokens": total(("usage", "visible_output_tokens")),
                 "total_tokens": total(("usage", "total_tokens")),
                 "avg_tokens_per_second": average(("timing", "tokens_per_second"), completed),
+                "aggregate_tokens_per_second": summarize(runs)["aggregate_tokens_per_second"],
                 "avg_prefill_tokens_per_second": average(
                     ("timing", "prefill_tokens_per_second"), completed
                 ),
@@ -574,7 +1095,14 @@ class RunStore:
                 ),
             },
             "models": models,
-            "daily": list(daily.values())[-14:],
+            "gpus": gpu_lanes,
+            "projects": project_rows,
+            "agents": agent_rows,
+            "reasoning_levels": reasoning_levels,
+            "tool_summary": tool_summary,
+            "categories": categories,
+            "category_models": category_models,
+            "daily": daily_list,
             "recent_runs": runs[:20],
         }
 
@@ -600,6 +1128,189 @@ class RunStore:
         return item
 
 
+class ChatHistoryStore:
+    """Append-only full-conversation archive in its OWN SQLite file.
+
+    Design goals: (1) never slow the inference hot path, (2) keep the metrics RunStore lean.
+    So content (full prompts, responses, reasoning, tool calls) plus token counts are written
+    here, not into the metrics DB, and the write happens on a background worker: callers only
+    pay an O(1) queue put, and JSON serialization + the DB commit (batched) happen off-thread.
+    When disabled, no file, thread, or queue work exists -- `enqueue` is a no-op.
+    """
+
+    _SENTINEL = object()
+    _COLUMNS = (
+        "id", "created_at", "project_id", "client_id", "agent_role", "agent_session_id",
+        "coding_task_id", "model_name", "target", "workload_kind",
+        "input_tokens", "cached_input_tokens", "output_tokens", "thinking_tokens", "total_tokens",
+        "tokens_per_second", "latency_ms", "finish_reason",
+        "messages_json", "tools_json", "output_text", "reasoning_text", "tool_calls_json",
+    )
+
+    def __init__(self, path: Path, enabled: bool = False):
+        self.path = path
+        self.enabled = enabled
+        self._queue: queue.Queue = queue.Queue(maxsize=20000)
+        self._worker: threading.Thread | None = None
+        if not enabled:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+        self._worker = threading.Thread(target=self._run, name="chat-history", daemon=True)
+        self._worker.start()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    def _initialize(self) -> None:
+        with self.connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chat_turns (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    project_id TEXT,
+                    client_id TEXT,
+                    agent_role TEXT,
+                    agent_session_id TEXT,
+                    coding_task_id TEXT,
+                    model_name TEXT,
+                    target TEXT,
+                    workload_kind TEXT,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    thinking_tokens INTEGER,
+                    total_tokens INTEGER,
+                    tokens_per_second REAL,
+                    latency_ms REAL,
+                    finish_reason TEXT,
+                    messages_json TEXT,
+                    tools_json TEXT,
+                    output_text TEXT,
+                    reasoning_text TEXT,
+                    tool_calls_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_created_at ON chat_turns(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_project ON chat_turns(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_model ON chat_turns(model_name, created_at DESC);
+                """
+            )
+
+    def enqueue(self, record: dict[str, Any]) -> None:
+        # Hot path: a single non-blocking put. History must never block or fail a request,
+        # so a full queue drops the record rather than applying backpressure to inference.
+        if not self.enabled:
+            return
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            pass
+
+    @staticmethod
+    def _row(record: dict[str, Any]) -> tuple[Any, ...]:
+        usage = record.get("usage") or {}
+        timing = record.get("timing") or {}
+
+        def dump(value: Any) -> str | None:
+            return json.dumps(value, ensure_ascii=False) if value is not None else None
+
+        return (
+            record.get("id"), record.get("created_at"), record.get("project_id"),
+            record.get("client_id"), record.get("agent_role"), record.get("agent_session_id"),
+            record.get("coding_task_id"), record.get("model_name"), record.get("target"),
+            record.get("workload_kind"),
+            usage.get("input_tokens"), usage.get("cached_input_tokens"), usage.get("output_tokens"),
+            usage.get("thinking_tokens"), usage.get("total_tokens"),
+            timing.get("tokens_per_second"), timing.get("end_to_end_duration_ms"),
+            record.get("finish_reason"),
+            dump(record.get("messages")), dump(record.get("tools")),
+            record.get("output_text"), record.get("reasoning_text"), dump(record.get("tool_calls")),
+        )
+
+    def _flush(self, batch: list[dict[str, Any]]) -> None:
+        placeholders = ", ".join(["?"] * len(self._COLUMNS))
+        statement = f"INSERT OR REPLACE INTO chat_turns ({', '.join(self._COLUMNS)}) VALUES ({placeholders})"
+        try:
+            with self.connect() as connection:
+                connection.executemany(statement, [self._row(item) for item in batch])
+        except sqlite3.Error:
+            pass  # best-effort archive; never crash the server over a logging failure
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                self._queue.task_done()
+                return
+            batch = [item]
+            while len(batch) < 200:  # batch whatever else is waiting into one commit
+                try:
+                    nxt = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is self._SENTINEL:
+                    self._flush(batch)
+                    for _ in batch:
+                        self._queue.task_done()
+                    self._queue.task_done()
+                    return
+                batch.append(nxt)
+            self._flush(batch)
+            for _ in batch:
+                self._queue.task_done()
+
+    def flush(self) -> None:
+        """Block until every queued record has been written (used by tests/shutdown)."""
+        if self.enabled:
+            self._queue.join()
+
+    def close(self) -> None:
+        if self._worker is None:
+            return
+        self._queue.put(self._SENTINEL)
+        self._worker.join(timeout=10)
+
+    def query(self, project_id: str | None = None, start_date: str | None = None,
+              end_date: str | None = None, limit: int = 100, offset: int = 0,
+              include_content: bool = False) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        columns = [col for col in self._COLUMNS
+                   if include_content or not col.endswith(("_json", "_text"))]
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if start_date:
+            conditions.append("created_at >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("created_at < ?")
+            params.append(RunStore._day_after(end_date))
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(columns)} FROM chat_turns{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                [*params, int(limit), int(offset)],
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if include_content:
+                for key in ("messages_json", "tools_json", "tool_calls_json"):
+                    if item.get(key) is not None:
+                        item[key[:-5]] = json.loads(item.pop(key))
+                    else:
+                        item.pop(key, None)
+            result.append(item)
+        return result
+
+
 class AppError(RuntimeError):
     def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST):
         super().__init__(message)
@@ -612,6 +1323,44 @@ class ServerHandle:
         self.model = model
         self.lanes = lanes
         self.process = process
+        self._reasoning_capabilities: dict[str, Any] | None = None
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+
+    @contextmanager
+    def serving(self):
+        """Count an in-flight request so a deployment change can drain before stopping this
+        server, instead of killing another client's request mid-generation."""
+        with self._inflight_lock:
+            self._inflight += 1
+        try:
+            yield
+        finally:
+            with self._inflight_lock:
+                self._inflight = max(0, self._inflight - 1)
+
+    @property
+    def inflight(self) -> int:
+        with self._inflight_lock:
+            return self._inflight
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for in-flight requests to finish. Returns True if the
+        server went idle, False if it timed out (the caller stops it anyway to avoid hanging)."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.inflight > 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.inflight == 0
+
+    def reasoning_capabilities(self, config: AppConfig) -> dict[str, Any]:
+        # The model file is fixed for the life of a deployment, so read its native
+        # effort levels once per handle. Reloading the model makes a fresh handle.
+        # Re-resolving/stat-ing the GGUF on every agent tool turn is pure latency.
+        if self._reasoning_capabilities is None:
+            resolved = getattr(self.process, "model_path", None)
+            path = Path(resolved) if resolved is not None else resolve_model_path(config, self.model)
+            self._reasoning_capabilities = model_reasoning(path)
+        return self._reasoning_capabilities
 
     def public(self) -> dict[str, Any]:
         return {
@@ -624,6 +1373,9 @@ class ServerHandle:
             "alive": bool(self.process.proc and self.process.proc.poll() is None),
             "context_window": self.process.ctx_size,
             "reasoning_budget": self.model.reasoning_budget,
+            "reasoning_mode": self.model.reasoning_mode,
+            "reasoning_effort": self.model.reasoning_effort,
+            "draft_model": self.model.draft_model or None,
         }
 
 
@@ -793,6 +1545,7 @@ class DeploymentManager:
                 if model.reasoning_budget is not None
                 else self.config.policy.reasoning_budget
             ),
+            "coding_reasoning": model_reasoning(path),
             "tensor_split": model.tensor_split or None,
         }
 
@@ -923,6 +1676,14 @@ class DeploymentManager:
         self.sampler.stop()
         self._stop_all()
 
+    def _stop_handle(self, handle: ServerHandle) -> None:
+        # Let in-flight requests finish (bounded) before killing the server, so a deployment
+        # change never drops another client's request mid-generation.
+        if not handle.drain(self.config.policy.drain_timeout_seconds):
+            print(f"[{handle.target}] {handle.inflight} request(s) still in flight after "
+                  f"{self.config.policy.drain_timeout_seconds:.0f}s drain; stopping anyway.")
+        handle.process.stop()
+
     def _stop_all(self) -> None:
         with self.lock:
             handles = list(self.handles.values())
@@ -930,7 +1691,7 @@ class DeploymentManager:
             deployment_id = self.deployment_id
         for handle in handles:
             try:
-                handle.process.stop()
+                self._stop_handle(handle)
             except Exception:  # noqa: BLE001
                 pass
         if deployment_id and handles:
@@ -953,33 +1714,104 @@ class DeploymentManager:
 
     def _configured_model(self, raw: dict[str, Any], lane_vram_gb: float) -> tuple[ModelConfig, int]:
         source = self._model(str(raw.get("model", "")))
-        context = int(raw.get("context_window") or source.ctx_size or ctx_for(self.config, model_size_gb(self.config, source), lane_vram_gb))
+        # A draft model shares the lane's VRAM, so include it in the footprint the
+        # auto-sizer leaves headroom against (explicit context_window still wins).
+        footprint_gb = model_size_gb(self.config, source) + self._draft_footprint_gb(source)
+        context = int(raw.get("context_window") or source.ctx_size or ctx_for(self.config, footprint_gb, lane_vram_gb))
         if context < 256:
             raise AppError("Context window must be at least 256 tokens.")
+        input_tokens = raw.get("input_tokens")
+        max_output_tokens = raw.get("max_output_tokens")
+        if input_tokens is not None or max_output_tokens is not None:
+            if input_tokens is None or max_output_tokens is None:
+                raise AppError("input_tokens and max_output_tokens must be provided together.")
+            try:
+                context = resolve_context_window(self.config, context, int(input_tokens), int(max_output_tokens))
+            except ValueError as exc:
+                raise AppError(str(exc)) from exc
         budget = int(raw.get("reasoning_budget", source.reasoning_budget if source.reasoning_budget is not None else self.config.policy.reasoning_budget))
-        if budget < 0:
-            raise AppError("Reasoning budget cannot be negative.")
+        if budget < -1:
+            raise AppError("Reasoning budget must be -1 (unlimited) or non-negative.")
+        # The UI exposes a budget selector: choosing a positive budget must also
+        # enable thinking, even when the base TOML policy defaults to off.
+        reasoning_mode = raw.get("reasoning_mode")
+        if reasoning_mode is None:
+            reasoning_mode = (
+                ("auto" if budget == -1 else "on" if budget > 0 else "off")
+                if "reasoning_budget" in raw
+                else source.reasoning_mode or self.config.policy.reasoning_mode
+            )
+        if reasoning_mode not in {"on", "off", "auto"}:
+            raise AppError("reasoning_mode must be on, off, or auto.")
+        effort = str(raw.get("reasoning_effort", source.reasoning_effort))
+        if raw.get("workload_kind") == "coding_agent":
+            budget, reasoning_mode = -1, "auto"
+            capabilities = model_reasoning(resolve_model_path(self.config, source))
+            if effort not in capabilities["efforts"]:
+                raise AppError(f"Unsupported reasoning effort '{effort}'. Available: {', '.join(capabilities['efforts'])}.")
         tensor_split = str(raw.get("tensor_split") or source.tensor_split)
-        model = replace(source, ctx_size=context, reasoning_budget=budget, tensor_split=tensor_split)
+        model = replace(source, ctx_size=context, reasoning_budget=budget,
+                        reasoning_mode=reasoning_mode, reasoning_effort=effort, tensor_split=tensor_split)
         path = resolve_model_path(self.config, model)
         if not path.exists():
             raise AppError(f"Model file does not exist: {path}")
+        if model.draft_model:
+            draft_path = resolve_model_path(self.config, replace(model, path=model.draft_model))
+            if not draft_path.exists():
+                raise AppError(f"Draft model file does not exist: {draft_path}")
         return model, context
 
+    def _draft_footprint_gb(self, model: ModelConfig) -> float:
+        if not model.draft_model:
+            return 0.0
+        # size_gb=0 forces an actual file measurement of the DRAFT; without it model_size_gb
+        # would return the target model's configured size_gb (replace keeps that field).
+        return model_size_gb(self.config, replace(model, path=model.draft_model, size_gb=0.0))
+
+    def _requested_model_names_by_lane(self) -> dict[str, str]:
+        """Map lane key -> the exact model string the caller last asked for on that lane.
+
+        `profile.models[]` is the documented join key a client uses to match its own
+        requested model strings back to resolved lanes, so a lane replacement must not
+        downgrade the lanes it preserves to `ModelConfig.name` (the resolved short display
+        name, which never equals a catalog id a caller requests with). active_profile holds
+        the caller's own raw profile as deploy() stored it -- either a single `model` dict
+        (single_gpu / single_large_model) or a `models` list (parallel_models).
+        """
+        profile = self.active_profile or {}
+        entries = list(profile.get("models") or [])
+        single = profile.get("model")
+        if single is not None:
+            entries.append(single)
+        requested: dict[str, str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            lane_key = entry.get("lane")
+            name = entry.get("model")
+            if lane_key and name:
+                requested[str(lane_key)] = str(name)
+        return requested
+
     def _validate_profile(self, mode: str, profile: dict[str, Any]) -> list[dict[str, Any]]:
+        if profile.get("workload_kind") == "coding_agent":
+            profile = {**profile,
+                       "model": {**(profile.get("model") or {}), "workload_kind": "coding_agent"},
+                       "models": [{**raw, "workload_kind": "coding_agent"} for raw in profile.get("models", [])]}
         if mode == "single_large_model":
             raw = profile.get("model") or {}
             model, context = self._configured_model(raw, sum(lane.vram_gb for lane in self.config.lanes))
             backends = {lane.backend for lane in self.config.lanes}
             if len(backends) != 1:
                 raise AppError("Both lanes must use the same backend for multi-GPU mode.")
+            self._validate_capacity(model, list(self.config.lanes))
             return [{"target": "primary", "model": model, "lanes": list(self.config.lanes), "context": context, "multi": True}]
 
         if mode == "single_gpu":
             raw = profile.get("model") or {}
             lane = self._lane(str(raw.get("lane", "")))
             model, context = self._configured_model(raw, lane.vram_gb)
-            self._validate_single_fit(model, lane)
+            self._validate_capacity(model, [lane])
             return [{"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False}]
 
         raw_models = profile.get("models") or []
@@ -993,19 +1825,267 @@ class DeploymentManager:
                 raise AppError("Parallel mode must use two different lanes.")
             seen_lanes.add(lane.key)
             model, context = self._configured_model(raw, lane.vram_gb)
-            self._validate_single_fit(model, lane)
+            self._validate_capacity(model, [lane])
             specs.append({"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False})
         return specs
 
-    def _validate_single_fit(self, model: ModelConfig, lane: LaneConfig) -> None:
+    def _validate_capacity(self, model: ModelConfig, lanes: list[LaneConfig]) -> None:
+        """Check the model actually fits the lane(s) it's headed for: file size always,
+        plus a best-effort KV-cache estimate for the requested context when the model's
+        GGUF metadata is one we're confident reading (see estimate_kv_cache_gb) -- this is
+        the check that was missing for context sizes bumped up by input_tokens/
+        max_output_tokens or requested explicitly, and was never run at all for
+        single_large_model deploys before this."""
         size = model_size_gb(self.config, model)
-        if model.pin_lane and model.pin_lane != lane.key:
-            raise AppError(f"{model.name} is pinned to lane {model.pin_lane}, not {lane.key}.")
-        if size > lane_capacity_gb(self.config, lane):
+        # A draft model (speculative decoding) is loaded on the same lane(s), so its weights
+        # and KV cache share this budget. Omitting them here -- while _configured_model already
+        # reserves the draft for auto-sizing -- would approve a deploy that then OOMs.
+        draft_gb = self._draft_footprint_gb(model)
+        if len(lanes) == 1 and model.pin_lane and model.pin_lane != lanes[0].key:
+            raise AppError(f"{model.name} is pinned to lane {model.pin_lane}, not {lanes[0].key}.")
+        capacity = sum(lane_capacity_gb(self.config, lane) for lane in lanes)
+        lane_label = "+".join(lane.key for lane in lanes)
+        draft_note = f" + {draft_gb:.2f} GB draft model" if draft_gb else ""
+        weights = size + draft_gb
+        if weights > capacity:
             raise AppError(
-                f"{model.name} is {size:.2f} GB but {lane.key} has a safe model-file budget of "
-                f"{lane_capacity_gb(self.config, lane):.2f} GB. Choose another GPU/model or multi-GPU mode."
+                f"{model.name} ({size:.2f} GB{draft_note}) needs {weights:.2f} GB but {lane_label} "
+                f"has a safe model-file budget of {capacity:.2f} GB. Choose another GPU/model or multi-GPU mode."
             )
+        path = resolve_model_path(self.config, model)
+        kv_gb, _note = estimate_kv_cache_gb(path, model.ctx_size)
+        if kv_gb is None:
+            return
+        draft_kv_gb = 0.0
+        if model.draft_model:
+            draft_path = resolve_model_path(self.config, replace(model, path=model.draft_model))
+            draft_kv_est, _ = estimate_kv_cache_gb(draft_path, model.ctx_size)
+            draft_kv_gb = draft_kv_est or 0.0
+        total = weights + kv_gb + draft_kv_gb
+        if total > capacity:
+            kv_note = f" + ~{kv_gb:.2f} GB KV cache at {model.ctx_size} context tokens"
+            if draft_gb or draft_kv_gb:
+                kv_note += f" + {draft_gb:.2f} GB draft + ~{draft_kv_gb:.2f} GB draft KV"
+            raise AppError(
+                f"{model.name} needs an estimated {total:.2f} GB ({size:.2f} GB model file{kv_note}) "
+                f"but {lane_label} has a safe budget of {capacity:.2f} GB. Lower the context window, "
+                "choose another GPU, or use multi-GPU mode."
+            )
+
+    def _auto_lane_for_model(
+        self,
+        model_name: str,
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> LaneConfig:
+        """Pick the smallest lane that passes the complete fit check.
+
+        This intentionally uses ``check_fit`` rather than model file size alone: at a 51k
+        context, KV cache can make a model that appears to fit the 9070 require the 9700.
+        """
+        candidates = sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        for lane in candidates:
+            verdict = self.check_fit(
+                model_name, lane.key, context_window, input_tokens, max_output_tokens
+            )
+            if verdict["fits"]:
+                return lane
+        # Let deploy() produce the authoritative error against the largest lane when
+        # nothing fits, instead of returning the smaller lane and hiding that it was tried.
+        return candidates[-1]
+
+    def deploy_parallel_for_client(
+        self,
+        model_names: list[str],
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Deploy one model per lane without promoting small models to the large lane.
+
+        Each model is tested against the smallest lane at the requested context. A model that
+        fits there belongs there; only a model that does not fit there may use the larger lane.
+        Consequently, two small models (or two large-only models) are not a valid parallel pair
+        and must be run sequentially on their common lane.
+        """
+        if len(model_names) != len(self.config.lanes):
+            raise AppError(
+                f"deploy_parallel needs exactly {len(self.config.lanes)} model(s) "
+                f"(one per lane), got {len(model_names)}."
+            )
+        small_lane, large_lane = sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        assignments: list[tuple[str, LaneConfig]] = []
+        for name in model_names:
+            small_fit = self.check_fit(
+                name, small_lane.key, context_window, input_tokens, max_output_tokens
+            )
+            if small_fit["fits"]:
+                assignments.append((name, small_lane))
+                continue
+            large_fit = self.check_fit(
+                name, large_lane.key, context_window, input_tokens, max_output_tokens
+            )
+            if not large_fit["fits"]:
+                raise AppError(
+                    f"{name} fits neither {small_lane.key} nor {large_lane.key} at the requested "
+                    f"context: {large_fit['reason'] or small_fit['reason']}"
+                )
+            assignments.append((name, large_lane))
+
+        assigned_keys = [lane.key for _, lane in assignments]
+        if len(set(assigned_keys)) != len(assignments):
+            raise AppError(
+                "Parallel placement would promote a model to a larger GPU merely to fill both "
+                f"lanes ({assigned_keys}). Run these models sequentially on their assigned lane."
+            )
+
+        raw_models = []
+        for name, lane in assignments:
+            raw: dict[str, Any] = {"model": name, "lane": lane.key}
+            if context_window is not None:
+                raw["context_window"] = context_window
+            if input_tokens is not None:
+                raw["input_tokens"] = input_tokens
+            if max_output_tokens is not None:
+                raw["max_output_tokens"] = max_output_tokens
+            raw_models.append(raw)
+        return self.deploy({"mode": "parallel_models", "models": raw_models})
+
+    def check_fit(
+        self,
+        model_name: str,
+        lane_key: str,
+        context_window: int | None = None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only feasibility check: "would this model fit this lane at this context window,"
+        without loading anything. Runs the exact same resolution/validation deploy() would
+        (_configured_model + _validate_capacity) so the answer is authoritative, not a client-side
+        guess -- but never calls deploy() itself. For a client planning a schedule ahead of time
+        (e.g. partitioning a model list by which lane each one fits) instead of discovering fit by
+        trial deploy, which would actually load the model just to find out."""
+        try:
+            lane = self._lane(lane_key)
+            raw: dict[str, Any] = {"model": model_name}
+            if context_window is not None:
+                raw["context_window"] = context_window
+            if input_tokens is not None:
+                raw["input_tokens"] = input_tokens
+            if max_output_tokens is not None:
+                raw["max_output_tokens"] = max_output_tokens
+            model, resolved_context = self._configured_model(raw, lane.vram_gb)
+            self._validate_capacity(model, [lane])
+            return {"fits": True, "reason": None, "resolved_context_window": resolved_context}
+        except AppError as exc:
+            return {"fits": False, "reason": str(exc), "resolved_context_window": None}
+
+    def deploy_for_client(
+        self,
+        model_name: str,
+        gpu: str | None,
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Client-facing deploy: resolves a lane automatically when gpu is omitted, then delegates
+        to deploy() so the feasibility verdict (fit/pin/context checks) is identical to the UI's.
+        When the client reports its real input/output token budget, the allocated context window
+        is sized to fit it (see resolve_context_window) instead of trusting a guessed default."""
+        lane = self._lane(gpu) if gpu else self._auto_lane_for_model(
+            model_name, context_window, input_tokens, max_output_tokens
+        )
+        raw: dict[str, Any] = {"model": model_name, "lane": lane.key}
+        if context_window is not None:
+            raw["context_window"] = context_window
+        if input_tokens is not None:
+            raw["input_tokens"] = input_tokens
+        if max_output_tokens is not None:
+            raw["max_output_tokens"] = max_output_tokens
+        return self.deploy({"mode": "single_gpu", "model": raw})
+
+    def deploy_lane_for_client(
+        self,
+        model_name: str,
+        lane_key: str,
+        context_window: int | None,
+        input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace one GPU lane without stopping models on the other lanes.
+
+        The caller must only replace a lane after its own outstanding chat call has
+        completed. Deployment changes are serialized, but chat traffic on preserved
+        lanes continues while this lane stops and loads its next model.
+        """
+        lane = self._lane(lane_key)
+        raw: dict[str, Any] = {"model": model_name, "lane": lane.key}
+        if context_window is not None:
+            raw["context_window"] = context_window
+        if input_tokens is not None:
+            raw["input_tokens"] = input_tokens
+        if max_output_tokens is not None:
+            raw["max_output_tokens"] = max_output_tokens
+        profile = {"mode": "single_gpu", "model": raw}
+        spec = self._validate_profile("single_gpu", profile)[0]
+
+        # Blocking is intentional: two lane workers can finish together, and the
+        # second should wait for the first model load instead of failing with 409.
+        self.transition_lock.acquire()
+        with self.lock:
+            requested_by_lane = self._requested_model_names_by_lane()
+        requested_by_lane[lane.key] = model_name
+        deployment_id = str(uuid.uuid4())
+        self.store.begin_deployment(deployment_id, "lane_replace", profile)
+        try:
+            with self.lock:
+                old_handle = self.handles.pop(lane.key, None)
+                if not self.handles:
+                    self.state = "switching"
+                self.error = None
+            if old_handle is not None:
+                self._stop_handle(old_handle)
+
+            run_dir = self.data_dir / "deployments" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                process = self._make_process(spec, run_dir)
+                process.start()
+                handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process)
+            except BaseException as exc:
+                message = f"{lane.key}: {exc}"
+                with self.lock:
+                    self.state = "ready" if self.handles else "error"
+                    self.mode = "parallel_models" if len(self.handles) > 1 else (
+                        "single_gpu" if self.handles else "idle"
+                    )
+                    self.error = message
+                self.store.update_deployment(deployment_id, "failed", error=message)
+                raise AppError(message, HTTPStatus.INTERNAL_SERVER_ERROR) from exc
+
+            with self.lock:
+                self.handles[lane.key] = handle
+                self.deployment_id = deployment_id
+                self.state = "ready"
+                self.mode = "parallel_models" if len(self.handles) > 1 else "single_gpu"
+                self.active_profile = {
+                    "mode": self.mode,
+                    "models": [
+                        {
+                            "model": requested_by_lane.get(target, active.model.name),
+                            "lane": target,
+                            "context_window": active.process.ctx_size,
+                        }
+                        for target, active in self.handles.items()
+                    ],
+                }
+                self.error = None
+                servers = [active.public() for active in self.handles.values()]
+            self.store.update_deployment(deployment_id, "ready", servers=servers)
+            return self.status()
+        finally:
+            self.transition_lock.release()
 
     def _make_process(self, spec: dict[str, Any], run_dir: Path) -> LlamaServerProcess:
         model = spec["model"]
@@ -1020,11 +2100,106 @@ class DeploymentManager:
 
 
 class ChatService:
-    def __init__(self, manager: DeploymentManager, store: RunStore):
+    def __init__(self, manager: DeploymentManager, store: RunStore,
+                 history: "ChatHistoryStore | None" = None):
         self.manager = manager
         self.store = store
+        self.history = history or ChatHistoryStore(Path(), enabled=False)
+        self._client_output_lock = threading.Lock()
+
+    def _coding_request(self, handle: ServerHandle, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        policy = self.manager.config.policy
+        try:
+            self._validate_structured_output(payload)
+            return coding_request(
+                payload, capabilities=handle.reasoning_capabilities(self.manager.config),
+                default_effort=handle.model.reasoning_effort,
+                server_budget=handle.model.reasoning_budget if handle.model.reasoning_budget is not None else policy.reasoning_budget,
+                server_mode=handle.model.reasoning_mode or policy.reasoning_mode,
+            )
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+
+    @staticmethod
+    def _validate_structured_output(payload: dict[str, Any]) -> None:
+        """Fail fast on malformed structured-output constraints so a coding harness gets a
+        clear error instead of a cryptic backend failure. These fields pass through to
+        llama-server untouched: `grammar` (GBNF), `json_schema`, and `response_format`.
+        Grammar/schema-constrained decoding is the most reliable way to stop a local model
+        emitting malformed tool-call JSON, which is the dominant tool-use failure mode."""
+        grammar = payload.get("grammar")
+        if grammar is not None and (not isinstance(grammar, str) or not grammar.strip()):
+            raise ValueError("`grammar` must be a non-empty GBNF string.")
+        json_schema = payload.get("json_schema")
+        if json_schema is not None and not isinstance(json_schema, dict):
+            raise ValueError("`json_schema` must be an object.")
+        response_format = payload.get("response_format")
+        if response_format is not None:
+            if not isinstance(response_format, dict):
+                raise ValueError("`response_format` must be an object.")
+            kind = response_format.get("type")
+            if kind not in {"text", "json_object", "json_schema"}:
+                raise ValueError("`response_format.type` must be text, json_object, or json_schema.")
+            if kind == "json_schema" and not isinstance(response_format.get("json_schema"), dict):
+                raise ValueError("`response_format` of type json_schema requires a `json_schema` object.")
+        if grammar is not None and response_format is not None:
+            raise ValueError("Set `grammar` or `response_format`, not both.")
+
+    @staticmethod
+    def _tool_call_stats(tool_calls: list[dict[str, Any]] | None) -> dict[str, Any]:
+        """Validity of the model's emitted tool calls. Malformed = a call with no function
+        name, or whose JSON `arguments` string does not parse. Empty arguments are valid (a
+        no-argument call). This is exactly what grammar/schema constraints are meant to fix,
+        so the valid rate is the signal for whether constraining output is helping."""
+        total = 0
+        malformed = 0
+        for call in tool_calls or []:
+            function = (call or {}).get("function") or {}
+            name = function.get("name")
+            arguments = function.get("arguments")
+            total += 1
+            if not name:
+                malformed += 1
+                continue
+            if isinstance(arguments, str) and arguments.strip():
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError:
+                    malformed += 1
+        if total == 0:
+            return {"tool_calls_total": 0, "tool_calls_malformed": 0, "tool_call_valid_rate": None}
+        return {"tool_calls_total": total, "tool_calls_malformed": malformed,
+                "tool_call_valid_rate": round((total - malformed) / total, 3)}
 
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client: dict[str, Any] | None = None
+        client_id = payload.get("client_id")
+        if client_id:
+            client = self.store.get_client(str(client_id))
+            if client is None:
+                raise AppError(f"Unknown client_id: {client_id}", HTTPStatus.NOT_FOUND)
+            self.store.touch_client(client["id"])
+        project_id = str(payload.get("project_id") or "").strip() or None
+        if client:
+            project_id = client.get("project_id") or project_id
+            if not project_id:
+                project = self.store.upsert_project(
+                    client["project_name"], git_remote=client.get("github_repo")
+                )
+                project_id = project["id"]
+                self.store.link_client_project(client["id"], project_id)
+        if project_id and self.store.get_project(project_id) is None:
+            raise AppError(f"Unknown project_id: {project_id}", HTTPStatus.NOT_FOUND)
+        workload_kind = str(payload.get("workload_kind") or "evaluation").strip().lower()
+        if workload_kind not in {"evaluation", "coding_agent"}:
+            raise AppError("workload_kind must be 'evaluation' or 'coding_agent'.")
+        agent_role = str(payload.get("agent_role") or "").strip().lower() or None
+        agent_session_id = str(payload.get("agent_session_id") or "").strip() or None
+        coding_task_id = str(payload.get("coding_task_id") or "").strip() or None
+        task_label = payload.get("task_label")
+        # Normalized (lowercase + stripped) so "Resume_Extraction" and "resume_extraction"
+        # land in the same dashboard category instead of silently fragmenting into two.
+        task_label = str(task_label).strip().lower() or None if task_label else None
         with self.manager.lock:
             if self.manager.state != "ready" or not self.manager.handles:
                 raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
@@ -1049,11 +2224,29 @@ class ChatService:
                 raise AppError("A prompt or messages array is required.")
             messages = [{"role": "user", "content": prompt}]
         comparison_id = str(uuid.uuid4()) if len(handles) > 1 else None
+        if workload_kind == "coding_agent":
+            # Validate before starting workers, so invalid settings return a proper
+            # HTTP error instead of an uncaught thread exception and empty results.
+            for handle in handles.values():
+                self._coding_request(handle, payload)
         results: dict[str, Any] = {}
         threads = []
 
         def run(target: str, handle: ServerHandle) -> None:
-            results[target] = self._run_one(target, handle, messages, payload, comparison_id)
+            results[target] = self._run_one(
+                target,
+                handle,
+                messages,
+                payload,
+                comparison_id,
+                client,
+                task_label,
+                project_id,
+                agent_session_id,
+                coding_task_id,
+                agent_role,
+                workload_kind,
+            )
 
         for target, handle in handles.items():
             thread = threading.Thread(target=run, args=(target, handle), daemon=True)
@@ -1070,6 +2263,13 @@ class ChatService:
         messages: list[dict[str, Any]],
         payload: dict[str, Any],
         comparison_id: str | None,
+        client: dict[str, Any] | None = None,
+        task_label: str | None = None,
+        project_id: str | None = None,
+        agent_session_id: str | None = None,
+        coding_task_id: str | None = None,
+        agent_role: str | None = None,
+        workload_kind: str = "evaluation",
     ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         request_payload: dict[str, Any] = {
@@ -1078,11 +2278,20 @@ class ChatService:
             "stream": False,
             "temperature": float(payload.get("temperature", 0.7)),
             "top_p": float(payload.get("top_p", 0.95)),
-            "max_tokens": int(payload.get("max_tokens", 1024)),
         }
+        if payload.get("max_tokens") is not None:
+            request_payload["max_tokens"] = int(payload["max_tokens"])
+        elif workload_kind != "coding_agent":
+            request_payload["max_tokens"] = 1024
+        reasoning_settings = None
+        if workload_kind == "coding_agent":
+            for key in ("reasoning_effort", "chat_template_kwargs", "max_completion_tokens"):
+                if key in payload:
+                    request_payload[key] = payload[key]
+            request_payload, reasoning_settings = self._coding_request(handle, request_payload)
         if payload.get("seed") is not None:
             request_payload["seed"] = int(payload["seed"])
-        model_path = resolve_model_path(self.manager.config, handle.model)
+        model_path = getattr(handle.process, "model_path", None) or resolve_model_path(self.manager.config, handle.model)
         configuration = {
             "app_version": APP_VERSION,
             "deployment_id": self.manager.deployment_id,
@@ -1112,6 +2321,7 @@ class ChatService:
             ),
             "lanes": [asdict(lane) for lane in handle.lanes],
             "server_command": handle.process.build_command(),
+            "reasoning": reasoning_settings,
         }
         self.store.begin_run(
             {
@@ -1129,24 +2339,34 @@ class ChatService:
                 "reasoning_budget": handle.model.reasoning_budget,
                 "request": request_payload,
                 "configuration": configuration,
+                "client_id": client["id"] if client else None,
+                "task_label": task_label,
+                "project_id": project_id,
+                "agent_session_id": agent_session_id,
+                "coding_task_id": coding_task_id,
+                "agent_role": agent_role,
+                "workload_kind": workload_kind,
             }
         )
-        baseline = self.manager.sampler.capture()
+        baseline = self.manager.sampler.latest() if workload_kind == "coding_agent" else self.manager.sampler.capture()
         started = time.monotonic()
         try:
-            backend = self._post_json(
-                f"{handle.process.base_url}/v1/chat/completions",
-                request_payload,
-                timeout=float(payload.get("timeout_seconds", 900)),
-            )
+            with handle.serving():  # drained before a deployment change stops this server
+                backend = self._post_json(
+                    f"{handle.process.base_url}/v1/chat/completions",
+                    request_payload,
+                    timeout=float(payload.get("timeout_seconds", 900)),
+                )
             elapsed = time.monotonic() - started
             choice = (backend.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             output = message.get("content") or choice.get("text") or ""
             reasoning = message.get("reasoning_content") or message.get("reasoning")
             usage = self._normalize_usage(backend)
+            usage.update(self._tool_call_stats(message.get("tool_calls")))
             timing = self._normalize_timing(backend, usage, elapsed)
-            self.manager.sampler.capture()
+            if workload_kind != "coding_agent":
+                self.manager.sampler.capture()
             samples = self._sample_window(started, baseline)
             resources = self._resource_summary(samples, target)
             final = {
@@ -1158,13 +2378,30 @@ class ChatService:
                 "timing": timing,
                 "resources": resources,
                 "backend_response": backend,
+                "reasoning": reasoning_settings,
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
-            return {"run_id": run_id, "model": handle.model.name, **final, "backend_response": None}
+            if self.history.enabled and payload.get("store_history") is not False:
+                self.history.enqueue({
+                    "id": run_id, "created_at": utc_now(),
+                    "project_id": project_id, "client_id": client["id"] if client else None,
+                    "agent_role": agent_role, "agent_session_id": agent_session_id,
+                    "coding_task_id": coding_task_id, "model_name": handle.model.name,
+                    "target": target, "workload_kind": workload_kind, "usage": usage,
+                    "timing": timing, "finish_reason": choice.get("finish_reason"),
+                    "messages": messages, "tools": payload.get("tools"), "output_text": output,
+                    "reasoning_text": reasoning, "tool_calls": message.get("tool_calls"),
+                })
+            delivery = self._deliver_to_client(client, run_id, target, handle, final)
+            result = {"run_id": run_id, "model": handle.model.name, **final, "backend_response": None}
+            if delivery is not None:
+                result["client_delivery"] = delivery
+            return result
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - started
-            self.manager.sampler.capture()
+            if workload_kind != "coding_agent":
+                self.manager.sampler.capture()
             samples = self._sample_window(started, baseline)
             resources = self._resource_summary(samples, target)
             final = {
@@ -1179,7 +2416,50 @@ class ChatService:
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
-            return {"run_id": run_id, "model": handle.model.name, **final}
+            delivery = self._deliver_to_client(client, run_id, target, handle, final)
+            result = {"run_id": run_id, "model": handle.model.name, **final}
+            if delivery is not None:
+                result["client_delivery"] = delivery
+            return result
+
+    def _deliver_to_client(
+        self,
+        client: dict[str, Any] | None,
+        run_id: str,
+        target: str,
+        handle: ServerHandle,
+        final: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Append this run's metrics as a JSON line to the client's own output_path, so a
+        consuming codebase gets its own durable copy of the performance data alongside the
+        response. Never fails the chat call itself if the client's path can't be written."""
+        if client is None:
+            return None
+        record = {
+            "run_id": run_id,
+            "client_id": client["id"],
+            "project_name": client["project_name"],
+            "github_repo": client.get("github_repo"),
+            "recorded_at": utc_now(),
+            "target": target,
+            "model": handle.model.name,
+            "device": handle.process.device,
+            "context_window": handle.process.ctx_size,
+            "status": final.get("status"),
+            "usage": final.get("usage"),
+            "timing": final.get("timing"),
+            "resources": final.get("resources"),
+            "reasoning": final.get("reasoning"),
+            "error_text": final.get("error_text"),
+        }
+        output_path = Path(client["output_path"]).expanduser()
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._client_output_lock, output_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            return {"written": False, "path": str(output_path), "error": str(exc)}
+        return {"written": True, "path": str(output_path)}
 
     def _sample_window(self, started: float, baseline: dict[str, Any] | None) -> list[dict[str, Any]]:
         samples = self.manager.sampler.since(started)
@@ -1208,15 +2488,41 @@ class ChatService:
     @staticmethod
     def _normalize_usage(payload: dict[str, Any]) -> dict[str, Any]:
         usage = payload.get("usage") or {}
+        timings = payload.get("timings") or payload.get("timing") or {}
         details = usage.get("completion_tokens_details") or {}
+        def first(*values: Any) -> Any:
+            return next((value for value in values if value is not None), None)
+
+        prefill_tokens = first(timings.get("prompt_n"), timings.get("prompt_tokens"))
         input_tokens = usage.get("prompt_tokens")
-        output_tokens = usage.get("completion_tokens")
+        if input_tokens is None and prefill_tokens is not None:
+            input_tokens = prefill_tokens + (timings.get("cache_n") or 0)
+        output_tokens = first(usage.get("completion_tokens"), timings.get("predicted_n"), timings.get("generated_tokens"))
         thinking_tokens = details.get("reasoning_tokens")
         prompt_details = usage.get("prompt_tokens_details") or {}
-        cached_tokens = prompt_details.get("cached_tokens")
-        timings = payload.get("timings") or payload.get("timing") or {}
-        prefill_tokens = timings.get("prompt_n") or timings.get("prompt_tokens") or input_tokens
+        cached_tokens = first(prompt_details.get("cached_tokens"), timings.get("cache_n"))
+        if prefill_tokens is None and input_tokens is not None and cached_tokens is not None:
+            prefill_tokens = max(0, input_tokens - cached_tokens)
+        # Reasoning characters: supplied by the streaming gateway (deltas are not kept
+        # on the payload), else summed from a non-streamed message's reasoning text.
+        reasoning_characters = payload.get("reasoning_characters")
+        if reasoning_characters is None:
+            reasoning_characters = sum(
+                len((choice.get("message") or {}).get("reasoning_content") or
+                    (choice.get("message") or {}).get("reasoning") or "")
+                for choice in payload.get("choices", [])
+            )
         visible_tokens = output_tokens
+        reasoning_observed = bool(payload.get("reasoning_observed") or reasoning_characters)
+        # Native effort levels carry no fixed budget, so track what each run actually
+        # spends on thinking. Prefer the backend's exact reasoning-token count; when it
+        # is omitted, fall back to a labeled ~4-chars/token estimate (never mixed into
+        # the exact-count aggregates, never passed off as a backend figure).
+        thinking_tokens_estimated = None
+        if thinking_tokens is None and reasoning_characters > 0:
+            thinking_tokens_estimated = max(1, round(reasoning_characters / 4))
+        if thinking_tokens is None and reasoning_observed:
+            visible_tokens = None
         if output_tokens is not None and thinking_tokens is not None:
             visible_tokens = max(0, output_tokens - thinking_tokens)
         return {
@@ -1229,20 +2535,43 @@ class ChatService:
             ),
             "prefill_tokens": prefill_tokens,
             "thinking_tokens": thinking_tokens,
+            "thinking_tokens_estimated": thinking_tokens_estimated,
+            "thinking_characters": reasoning_characters or None,
+            "thinking_tokens_source": (
+                "backend" if thinking_tokens is not None
+                else "estimated_from_characters" if thinking_tokens_estimated is not None
+                else "unavailable"
+            ),
             "visible_output_tokens": visible_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": usage.get("total_tokens"),
+            "total_tokens": first(usage.get("total_tokens"), (
+                input_tokens + output_tokens
+                if input_tokens is not None and output_tokens is not None
+                else None
+            )),
         }
 
     @staticmethod
     def _normalize_timing(payload: dict[str, Any], usage: dict[str, Any], elapsed: float) -> dict[str, Any]:
         timings = payload.get("timings") or payload.get("timing") or {}
-        prompt_ms = timings.get("prompt_ms") or timings.get("prompt_eval_time_ms")
-        predicted_ms = timings.get("predicted_ms") or timings.get("generation_time_ms")
-        prefill_rate = timings.get("prompt_per_second") or timings.get("prompt_tokens_per_second")
-        token_rate = timings.get("predicted_per_second") or timings.get("tokens_per_second")
-        if token_rate is None and usage.get("output_tokens") and elapsed > 0:
-            token_rate = usage["output_tokens"] / elapsed
+        def first(*values: Any) -> Any:
+            return next((value for value in values if value is not None), None)
+
+        prompt_ms = first(timings.get("prompt_ms"), timings.get("prompt_eval_time_ms"))
+        predicted_ms = first(timings.get("predicted_ms"), timings.get("generation_time_ms"))
+        prefill_rate = first(timings.get("prompt_per_second"), timings.get("prompt_tokens_per_second"))
+        token_rate = first(timings.get("predicted_per_second"), timings.get("tokens_per_second"))
+        if token_rate is None and predicted_ms is not None and predicted_ms > 0 and usage.get("output_tokens") is not None:
+            token_rate = usage["output_tokens"] / (predicted_ms / 1000)
+        end_to_end_rate = usage["output_tokens"] / elapsed if usage.get("output_tokens") is not None and elapsed > 0 else None
+        # Speculative decoding stats (present only when a draft model is loaded). Key
+        # names vary across llama.cpp builds, so probe timings and the top-level payload.
+        draft_tokens = first(timings.get("draft_n"), timings.get("n_draft"), timings.get("draft_tokens"),
+                             payload.get("draft_n"))
+        draft_accepted = first(timings.get("draft_n_accepted"), timings.get("n_draft_accepted"),
+                               timings.get("draft_accepted"), payload.get("draft_n_accepted"))
+        acceptance = (round(draft_accepted / draft_tokens, 3)
+                      if draft_tokens and draft_accepted is not None and draft_tokens > 0 else None)
         return {
             "time_to_first_token_ms": timings.get("time_to_first_token_ms"),
             "prefill_duration_ms": prompt_ms,
@@ -1250,8 +2579,12 @@ class ChatService:
             "end_to_end_duration_ms": round(elapsed * 1000, 2),
             "prefill_tokens_per_second": round(float(prefill_rate), 3) if prefill_rate is not None else None,
             "tokens_per_second": round(float(token_rate), 3) if token_rate is not None else None,
-            "backend_prompt_tokens": timings.get("prompt_n") or timings.get("prompt_tokens"),
-            "backend_output_tokens": timings.get("predicted_n") or timings.get("generated_tokens"),
+            "end_to_end_tokens_per_second": round(end_to_end_rate, 3) if end_to_end_rate is not None else None,
+            "backend_prompt_tokens": first(timings.get("prompt_n"), timings.get("prompt_tokens")),
+            "backend_output_tokens": first(timings.get("predicted_n"), timings.get("generated_tokens")),
+            "draft_tokens": draft_tokens,
+            "draft_accepted_tokens": draft_accepted,
+            "draft_acceptance_rate": acceptance,
             "native_timing": timings,
         }
 
@@ -1274,10 +2607,13 @@ class ChatService:
         cpu = values(process_rows, "cpu_pct")
         gpu_utilization = values(process_rows, "gpu_utilization_pct")
         rss = values(process_rows, "rss_bytes")
+        private = values(process_rows, "private_bytes")
         dedicated = values(process_rows, "dedicated_vram_bytes")
         shared = values(process_rows, "shared_gpu_memory_bytes")
+        page_faults = values(process_rows, "page_fault_count")
         system_cpu = values(system_rows, "cpu_pct")
         ram = values(system_rows, "ram_used_bytes")
+        pagefile = values(system_rows, "pagefile_used_bytes")
         spill = bool(shared and dedicated and max(shared) > 1024**3 and max(shared) > max(dedicated) * 0.15)
         return {
             "sample_count": len(process_rows),
@@ -1286,11 +2622,16 @@ class ChatService:
             "avg_gpu_utilization_pct": average(gpu_utilization),
             "peak_gpu_utilization_pct": max(gpu_utilization) if gpu_utilization else None,
             "peak_process_rss_bytes": int(max(rss)) if rss else None,
+            "peak_process_private_bytes": int(max(private)) if private else None,
+            # page_fault_count is a cumulative counter since process start; the delta across
+            # this run's window is what's actually informative (memory pressure during THIS run).
+            "process_page_fault_delta": int(page_faults[-1] - page_faults[0]) if len(page_faults) >= 2 else None,
             "peak_dedicated_vram_bytes": int(max(dedicated)) if dedicated else None,
             "peak_shared_gpu_memory_bytes": int(max(shared)) if shared else None,
             "spill_suspected": spill if shared and dedicated else None,
             "avg_system_cpu_pct": average(system_cpu),
             "peak_system_ram_used_bytes": int(max(ram)) if ram else None,
+            "peak_system_pagefile_used_bytes": int(max(pagefile)) if pagefile else None,
             "samples_started_at": samples[0].get("sampled_at") if samples else None,
             "samples_finished_at": samples[-1].get("sampled_at") if samples else None,
         }
@@ -1311,8 +2652,14 @@ class ApplicationState:
         self.config = load_config(config_path)
         self.data_dir = data_dir
         self.store = RunStore(data_dir / "chatbot.sqlite3")
+        history_path = (
+            Path(self.config.project.chat_history_path)
+            if self.config.project.chat_history_path
+            else data_dir / "chat_history.sqlite3"
+        )
+        self.history = ChatHistoryStore(history_path, enabled=self.config.project.store_chat_history)
         self.manager = DeploymentManager(self.config, data_dir, self.store)
-        self.chat = ChatService(self.manager, self.store)
+        self.chat = ChatService(self.manager, self.store, self.history)
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -1321,7 +2668,67 @@ class ApplicationState:
             "catalog": self.manager.catalog(),
             "status": self.manager.status(),
             "runs": self.store.recent(20),
+            "projects": self.store.projects(),
+            "coding_presets": {
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "max_tokens": None,
+                "reasoning_budget": -1,
+                "reasoning_effort": "default",
+                "workload_kind": "coding_agent",
+            },
         }
+
+    def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_name = str(payload.get("project_name") or "").strip()
+        if not project_name:
+            raise AppError("project_name is required.")
+        output_path = str(payload.get("output_path") or "").strip()
+        if not output_path:
+            raise AppError("output_path is required (where run metrics will be appended as JSON lines).")
+        github_repo = payload.get("github_repo")
+        github_repo = str(github_repo).strip() or None if github_repo else None
+        return self.store.register_client(project_name, github_repo, output_path)
+
+    def create_project(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self.store.upsert_project(
+                str(payload.get("name") or ""),
+                str(payload.get("repo_path") or "").strip() or None,
+                str(payload.get("git_remote") or "").strip() or None,
+            )
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+
+    def create_agent_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id or self.store.get_project(project_id) is None:
+            raise AppError("A valid project_id is required.")
+        return self.store.create_agent_session(
+            project_id,
+            str(payload.get("agent_role") or "developer"),
+            str(payload.get("runtime") or "unknown"),
+        )
+
+    def create_coding_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id or self.store.get_project(project_id) is None:
+            raise AppError("A valid project_id is required.")
+        try:
+            return self.store.create_coding_task(
+                project_id,
+                str(payload.get("title") or ""),
+                str(payload.get("branch") or "").strip() or None,
+            )
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+
+    def record_tool_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id or self.store.get_project(project_id) is None:
+            raise AppError("A valid project_id is required.")
+        payload = {**payload, "project_id": project_id}
+        return self.store.record_tool_event(payload)
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -1332,7 +2739,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {format % args}")
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if path == "/":
             self._send_bytes(HTTPStatus.OK, HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -1343,10 +2752,87 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, self.server.app_state.manager.status())
             return
         if path == "/api/dashboard":
-            self._send_json(HTTPStatus.OK, self.server.app_state.store.dashboard())
+            project_id = (query.get("project_id") or [None])[0]
+            workload_kind = (query.get("workload_kind") or [None])[0]
+            start_date = (query.get("start_date") or [None])[0]
+            end_date = (query.get("end_date") or [None])[0]
+            try:
+                for value in (start_date, end_date):
+                    if value:
+                        datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST,
+                                {"error": "start_date and end_date must be YYYY-MM-DD."})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                self.server.app_state.store.dashboard(project_id, workload_kind, start_date, end_date),
+            )
             return
         if path == "/api/runs":
-            self._send_json(HTTPStatus.OK, {"runs": self.server.app_state.store.recent(100)})
+            try:
+                limit = int((query.get("limit") or [100])[0])
+                offset = int((query.get("offset") or [0])[0])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "limit and offset must be integers"})
+                return
+            project_id = (query.get("project_id") or [None])[0]
+            workload_kind = (query.get("workload_kind") or [None])[0]
+            store = self.server.app_state.store
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "runs": store.recent(limit, offset, project_id, workload_kind),
+                    "total": store.count_runs(project_id, workload_kind),
+                    "limit": max(1, min(limit, 500)),
+                    "offset": max(0, offset),
+                },
+            )
+            return
+        if path == "/api/chat-history":
+            history = self.server.app_state.chat.history
+            if not history.enabled:
+                self._send_json(HTTPStatus.OK, {"enabled": False, "turns": [],
+                                                "note": "Set project.store_chat_history = true to archive conversations."})
+                return
+            try:
+                limit = int((query.get("limit") or [100])[0])
+                offset = int((query.get("offset") or [0])[0])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "limit and offset must be integers"})
+                return
+            start_date = (query.get("start_date") or [None])[0]
+            end_date = (query.get("end_date") or [None])[0]
+            try:
+                for value in (start_date, end_date):
+                    if value:
+                        datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "start_date and end_date must be YYYY-MM-DD."})
+                return
+            include_content = (query.get("content") or ["0"])[0].lower() in {"1", "true", "yes"}
+            self._send_json(HTTPStatus.OK, {
+                "enabled": True,
+                "turns": history.query((query.get("project_id") or [None])[0], start_date, end_date,
+                                       min(max(1, limit), 500), max(0, offset), include_content),
+                "limit": min(max(1, limit), 500), "offset": max(0, offset),
+            })
+            return
+        if path == "/api/projects":
+            self._send_json(HTTPStatus.OK, {"projects": self.server.app_state.store.projects()})
+            return
+        if path == "/v1/models" or (path.startswith("/v1/") and path.endswith("/models")):
+            servers = self.server.app_state.manager.status().get("servers", [])
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": server["target"], "object": "model", "owned_by": "dual-gpu-studio"}
+                        for server in servers
+                    ],
+                },
+            )
             return
         if path.startswith("/api/runs/"):
             run_id = path.rsplit("/", 1)[-1]
@@ -1356,12 +2842,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(HTTPStatus.OK, run)
             return
+        if path == "/api/clients/schema":
+            self._send_json(HTTPStatus.OK, CLIENT_METRICS_SCHEMA)
+            return
+        if path.startswith("/api/clients/") and path.endswith("/runs"):
+            client_id = path.split("/")[3]
+            self._send_json(HTTPStatus.OK, {"runs": self.server.app_state.store.runs_for_client(client_id)})
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
             payload = self._read_json()
+            if path == "/v1/chat/completions" or (
+                path.startswith("/v1/") and path.endswith("/chat/completions")
+            ):
+                self._proxy_openai_chat(path, payload)
+                return
+            if path.endswith("/infill") and (path == "/infill" or path.startswith("/v1/")):
+                self._proxy_openai_completions(path, payload, infill=True)
+                return
+            if path.endswith("/completions") and path.startswith("/v1/"):
+                # chat/completions handled above; this is the raw FIM completions endpoint
+                self._proxy_openai_completions(path, payload)
+                return
             if path == "/api/deploy":
                 result = self.server.app_state.manager.deploy(payload)
             elif path == "/api/models/refresh":
@@ -1371,6 +2876,59 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = self.server.app_state.manager.unload()
             elif path == "/api/chat":
                 result = self.server.app_state.chat.chat(payload)
+            elif path == "/api/clients/register":
+                result = self.server.app_state.register_client(payload)
+            elif path == "/api/projects":
+                result = self.server.app_state.create_project(payload)
+            elif path == "/api/agent-sessions":
+                result = self.server.app_state.create_agent_session(payload)
+            elif path == "/api/coding-tasks":
+                result = self.server.app_state.create_coding_task(payload)
+            elif path == "/api/tool-events":
+                result = self.server.app_state.record_tool_event(payload)
+            elif path == "/api/clients/deploy":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.deploy_for_client(
+                    str(payload.get("model", "")),
+                    str(payload["gpu"]) if payload.get("gpu") else None,
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+            elif path == "/api/clients/deploy_parallel":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.deploy_parallel_for_client(
+                    [str(name) for name in (payload.get("models") or [])],
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+            elif path == "/api/clients/deploy_lane":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.deploy_lane_for_client(
+                    str(payload.get("model", "")),
+                    str(payload.get("lane", "")),
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+            elif path == "/api/clients/check_fit":
+                context_window = payload.get("context_window")
+                input_tokens = payload.get("input_tokens")
+                max_output_tokens = payload.get("max_output_tokens")
+                result = self.server.app_state.manager.check_fit(
+                    str(payload.get("model", "")),
+                    str(payload.get("lane", "")),
+                    int(context_window) if context_window is not None else None,
+                    int(input_tokens) if input_tokens is not None else None,
+                    int(max_output_tokens) if max_output_tokens is not None else None,
+                )
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
@@ -1381,6 +2939,381 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
         except Exception as exc:  # noqa: BLE001
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+    def _resolve_lane_handle(self, path: str, payload: dict[str, Any]) -> tuple[str, "ServerHandle"]:
+        """Pick the active lane for an OpenAI-compatible request. Base URLs: /v1 (model selects
+        a lane), /v1/<lane>, /v1/<lane>/<role>. Shared by the chat and completions proxies so
+        lane routing is identical for agent and autocomplete traffic."""
+        state = self.server.app_state
+        path_parts = [part for part in path.split("/") if part]
+        path_target = path_parts[1] if len(path_parts) >= 4 else None
+        target_hint = self.headers.get("X-DGPU-Target") or path_target
+        requested_model = str(payload.get("model") or "")
+        with state.manager.lock:
+            if state.manager.state != "ready" or not state.manager.handles:
+                raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
+            handles = dict(state.manager.handles)
+            if target_hint and target_hint not in handles:
+                raise AppError(f"GPU lane '{target_hint}' is not loaded.", HTTPStatus.CONFLICT)
+            target = target_hint if target_hint in handles else None
+            if target is None:
+                model_hint = requested_model.removeprefix("dgpu:")
+                if model_hint in handles:
+                    target = model_hint
+                else:
+                    matches = [key for key, handle in handles.items() if handle.model.name == requested_model]
+                    if len(matches) == 1:
+                        target = matches[0]
+            if target is None and len(handles) == 1:
+                target = next(iter(handles))
+            if target is None:
+                raise AppError("Select a GPU lane with model='dgpu:<lane>' or a /v1/<lane> base URL.")
+            return target, handles[target]
+
+    def _proxy_openai_completions(self, path: str, payload: dict[str, Any], infill: bool = False) -> None:
+        """Thin passthrough for inline autocomplete (FIM `/v1/completions` and `/infill`).
+
+        Deliberately minimal: autocomplete fires on nearly every typing pause, so this does
+        NO per-request run recording, GPU sampling, or history logging -- that overhead and
+        DB growth would hurt, which is exactly what we must avoid. It still routes through a
+        loaded lane (so autocomplete uses the dual-GPU setup from this codebase) and counts
+        the request in-flight so a deployment change drains it instead of killing it.
+        """
+        _target, handle = self._resolve_lane_handle(path, payload)
+        suffix = "/infill" if infill else "/v1/completions"
+        request_payload = dict(payload)
+        request_payload["model"] = handle.model.name
+        stream = bool(request_payload.get("stream"))
+        request = urlrequest.Request(
+            f"{handle.process.base_url}{suffix}",
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
+            method="POST",
+        )
+        try:
+            with handle.serving(), urlrequest.urlopen(request, timeout=120) as response:
+                if stream:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    done = False
+                    while True:
+                        line = response.readline()
+                        if not line:
+                            break
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                        if done and not line.strip():
+                            break  # emit [DONE]'s terminating blank line, then stop
+                        if line.strip() == b"data: [DONE]":
+                            done = True
+                else:
+                    body = response.read()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+        except urlerror.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
+
+    def _proxy_openai_chat(self, path: str, payload: dict[str, Any]) -> None:
+        """Stream an OpenAI-compatible coding-agent request through an active GPU lane.
+
+        Supported base URLs are /v1 (model selects a lane), /v1/<lane>, and
+        /v1/<lane>/<role>. A registered client_id used as the Bearer key supplies project
+        attribution, which works with clients such as Cline that expose an API-key field but
+        do not expose arbitrary HTTP headers.
+        """
+        state = self.server.app_state
+        path_parts = [part for part in path.split("/") if part]
+        path_role = path_parts[2] if len(path_parts) >= 5 else None
+        target, handle = self._resolve_lane_handle(path, payload)
+
+        authorization = self.headers.get("Authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        client = state.store.get_client(token) if token and token != "local" else None
+        if token and token != "local" and client is None:
+            raise AppError("The API key is not a registered Dual GPU Studio client_id.", HTTPStatus.UNAUTHORIZED)
+        project_ref = self.headers.get("X-DGPU-Project")
+        project = state.store.get_project(project_ref) if project_ref else None
+        project_id = (client or {}).get("project_id") or (project or {}).get("id")
+        if client and not project_id:
+            project = state.store.upsert_project(client["project_name"], git_remote=client.get("github_repo"))
+            project_id = project["id"]
+            state.store.link_client_project(client["id"], project_id)
+        agent_role = (
+            self.headers.get("X-DGPU-Agent-Role")
+            or path_role
+            or ("cline" if "cline" in self.headers.get("User-Agent", "").lower() else "coding-agent")
+        ).strip().lower()
+        session_id = self.headers.get("X-DGPU-Session") or None
+        coding_task_id = self.headers.get("X-DGPU-Task") or None
+        task_label = self.headers.get("X-DGPU-Task-Label") or None
+
+        request_payload = dict(payload)
+        request_payload["model"] = handle.model.name
+        request_payload, reasoning_settings = state.chat._coding_request(handle, request_payload)
+        stream = bool(request_payload.get("stream"))
+        if stream:
+            # Request final token counts unless the caller explicitly opts out.
+            stream_options = dict(request_payload.get("stream_options") or {})
+            stream_options.setdefault("include_usage", True)
+            request_payload["stream_options"] = stream_options
+        capture_content = self.headers.get("X-DGPU-Capture-Content", "").lower() in {"1", "true", "yes"}
+        # Full-conversation archive: on unless disabled in config or opted out per request. It
+        # needs the streamed content, so accumulate output/reasoning when either it or the
+        # metrics-DB content capture is active (kept out of the metrics DB regardless).
+        history_on = state.chat.history.enabled and self.headers.get("X-DGPU-No-History", "").lower() not in {"1", "true", "yes"}
+        keep_content = capture_content or history_on
+        stored_request = dict(request_payload)
+        if not capture_content and isinstance(stored_request.get("messages"), list):
+            stored_request["messages"] = [
+                {
+                    "role": message.get("role"),
+                    "content_redacted": True,
+                    "content_characters": len(str(message.get("content") or "")),
+                }
+                for message in stored_request["messages"]
+                if isinstance(message, dict)
+            ]
+        run_id = str(uuid.uuid4())
+        # Reuse the path resolved at deploy time; re-globbing the models dir on
+        # every agent tool turn only adds latency for a value that cannot change.
+        model_path = getattr(handle.process, "model_path", None) or resolve_model_path(state.config, handle.model)
+        state.store.begin_run(
+            {
+                "id": run_id,
+                "comparison_id": None,
+                "deployment_id": state.manager.deployment_id,
+                "created_at": utc_now(),
+                "mode": state.manager.mode,
+                "target": target,
+                "model_name": handle.model.name,
+                "model_path": str(model_path),
+                "lane_keys": [lane.key for lane in handle.lanes],
+                "device": handle.process.device,
+                "context_window": handle.process.ctx_size,
+                "reasoning_budget": handle.model.reasoning_budget,
+                "request": stored_request,
+                "configuration": {
+                    "app_version": APP_VERSION,
+                    "gateway": "openai-compatible",
+                    "endpoint": handle.process.base_url,
+                    "device": handle.process.device,
+                    "lanes": [asdict(lane) for lane in handle.lanes],
+                    "reasoning": reasoning_settings,
+                },
+                "client_id": client["id"] if client else None,
+                "task_label": task_label,
+                "project_id": project_id,
+                "agent_session_id": session_id,
+                "coding_task_id": coding_task_id,
+                "agent_role": agent_role,
+                "workload_kind": "coding_agent",
+            }
+        )
+        # GPU sampling launches PowerShell/Get-Counter on Windows. The background
+        # sampler already owns that work; never put it on every agent tool turn.
+        baseline = state.manager.sampler.latest()
+        started = time.monotonic()
+        backend_payload: dict[str, Any] = {}
+        output_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        first_token_at: float | None = None
+        reasoning_started_at: float | None = None
+        reasoning_last_at: float | None = None
+        first_visible_at: float | None = None
+        reasoning_characters = 0
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
+        response_started = False
+        try:
+            request = urlrequest.Request(
+                f"{handle.process.base_url}/v1/chat/completions",
+                data=json.dumps(request_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
+                method="POST",
+            )
+            # serving() marks the lane busy so a deployment change drains before stopping it.
+            with handle.serving(), urlrequest.urlopen(request, timeout=900) as response:
+                if not stream:
+                    backend_payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                else:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.send_header("X-DGPU-Run-ID", run_id)
+                    self.end_headers()
+                    self.close_connection = True
+                    response_started = True
+                    stream_complete = False
+                    while True:
+                        line = response.readline()
+                        if not line:
+                            break
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                        decoded = line.decode("utf-8", errors="replace").strip()
+                        if stream_complete and not decoded:
+                            break  # [DONE] ends SSE; do not wait for backend TCP EOF.
+                        if decoded.startswith("data:") and decoded[5:].strip() == "[DONE]":
+                            stream_complete = True
+                            continue
+                        if not decoded.startswith("data:"):
+                            continue
+                        try:
+                            chunk = json.loads(decoded[5:].strip())
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("error"):
+                            raise RuntimeError(f"Model stream error: {chunk['error']}")
+                        backend_payload.update({key: value for key, value in chunk.items()
+                                                if key != "choices" and value is not None})
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            delta = choices[0].get("delta") or {}
+                            content = delta.get("content") or ""
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                            now = time.monotonic()
+                            if reasoning:
+                                if reasoning_started_at is None:
+                                    reasoning_started_at = now
+                                reasoning_last_at = now
+                                reasoning_characters += len(reasoning)
+                                backend_payload["reasoning_observed"] = True
+                            if (content or delta.get("tool_calls")) and first_visible_at is None:
+                                first_visible_at = now
+                            if (content or reasoning or delta.get("tool_calls")) and first_token_at is None:
+                                first_token_at = time.monotonic()
+                            for call in (delta.get("tool_calls") or []):
+                                # Deltas stream a tool call's arguments in fragments keyed by
+                                # index; collect fragments now (O(1) append), join once at end.
+                                slot = tool_calls_acc.setdefault(call.get("index", 0), {"name": "", "arguments": []})
+                                function = call.get("function") or {}
+                                if function.get("name"):
+                                    slot["name"] = function["name"]
+                                if function.get("arguments"):
+                                    slot["arguments"].append(function["arguments"])
+                            if keep_content:
+                                output_parts.append(content)
+                                reasoning_parts.append(reasoning)
+                            if choices[0].get("finish_reason") is not None:
+                                backend_payload["finish_reason"] = choices[0]["finish_reason"]
+                    if not stream_complete:
+                        raise RuntimeError("Model stream ended before [DONE]; completion may be truncated.")
+
+            elapsed = time.monotonic() - started
+            if not stream:
+                choice = (backend_payload.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                output_parts = [message.get("content") or choice.get("text") or ""]
+                reasoning_parts = [message.get("reasoning_content") or message.get("reasoning") or ""]
+                backend_payload["finish_reason"] = choice.get("finish_reason")
+            if stream:
+                # Streamed reasoning deltas are not retained on backend_payload, so
+                # hand the observed character count to usage normalization. It yields
+                # the exact backend reasoning-token count when present, else a labeled
+                # estimate from these characters.
+                backend_payload["reasoning_characters"] = reasoning_characters
+            usage = ChatService._normalize_usage(backend_payload)
+            tool_calls = (
+                [{"function": {"name": slot["name"], "arguments": "".join(slot["arguments"])}}
+                 for slot in tool_calls_acc.values()]
+                if stream
+                else ((backend_payload.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
+            )
+            usage.update(ChatService._tool_call_stats(tool_calls))
+            timing = ChatService._normalize_timing(backend_payload, usage, elapsed)
+            if first_token_at is not None:
+                timing["time_to_first_token_ms"] = round((first_token_at - started) * 1000, 2)
+            timing["reasoning_duration_ms"] = (
+                round((reasoning_last_at - reasoning_started_at) * 1000, 2)
+                if reasoning_started_at is not None and reasoning_last_at is not None else None
+            )
+            timing["reasoning_duration_source"] = "observed_stream_span" if reasoning_started_at is not None else None
+            timing["time_to_first_visible_token_ms"] = (
+                round((first_visible_at - started) * 1000, 2) if first_visible_at is not None else None
+            )
+            samples = state.chat._sample_window(started, baseline)
+            resources = ChatService._resource_summary(samples, target)
+            stored_backend = backend_payload if capture_content else {
+                key: value
+                for key, value in backend_payload.items()
+                if key not in {"choices"}
+            }
+            final = {
+                "status": "completed",
+                "output_text": "".join(output_parts) if capture_content else None,
+                "reasoning_text": ("".join(reasoning_parts) or None) if capture_content else None,
+                "finish_reason": backend_payload.get("finish_reason"),
+                "usage": usage,
+                "timing": timing,
+                "resources": resources,
+                "backend_response": stored_backend,
+                "reasoning": reasoning_settings,
+            }
+            state.store.finish_run(run_id, final)
+            state.store.save_samples(run_id, samples, started)
+            if history_on:
+                # Full content lives only here, in the separate archive -- never in the
+                # metrics DB, whose stored_request/backend_response stay redacted.
+                state.chat.history.enqueue({
+                    "id": run_id, "created_at": utc_now(),
+                    "project_id": project_id, "client_id": client["id"] if client else None,
+                    "agent_role": agent_role, "agent_session_id": session_id,
+                    "coding_task_id": coding_task_id, "model_name": handle.model.name,
+                    "target": target, "workload_kind": "coding_agent", "usage": usage,
+                    "timing": timing, "finish_reason": backend_payload.get("finish_reason"),
+                    "messages": payload.get("messages"), "tools": payload.get("tools"),
+                    "output_text": "".join(output_parts) or None,
+                    "reasoning_text": "".join(reasoning_parts) or None, "tool_calls": tool_calls,
+                })
+            state.chat._deliver_to_client(client, run_id, target, handle, final)
+            if not stream:
+                backend_payload["dgpu_run_id"] = run_id
+                self._send_json(HTTPStatus.OK, backend_payload)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            self._finish_gateway_failure(run_id, target, started, baseline, "cancelled", str(exc))
+        except urlerror.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self._finish_gateway_failure(run_id, target, started, baseline, "failed", detail)
+            if response_started:
+                return
+            raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
+        except Exception as exc:
+            self._finish_gateway_failure(run_id, target, started, baseline, "failed", str(exc))
+            if response_started:
+                return
+            raise
+
+    def _finish_gateway_failure(
+        self,
+        run_id: str,
+        target: str,
+        started: float,
+        baseline: dict[str, Any] | None,
+        status: str,
+        error_text: str,
+    ) -> None:
+        state = self.server.app_state
+        try:
+            samples = state.chat._sample_window(started, baseline)
+            final = {
+                "status": status,
+                "usage": {},
+                "timing": {"end_to_end_duration_ms": round((time.monotonic() - started) * 1000, 2)},
+                "resources": ChatService._resource_summary(samples, target),
+                "error_text": error_text,
+            }
+            state.store.finish_run(run_id, final)
+            state.store.save_samples(run_id, samples, started)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -1520,13 +3453,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Web UI bind address. Defaults to all interfaces for local-network access.",
+        default="127.0.0.1",
+        help="Web UI bind address. Defaults to localhost; use 0.0.0.0 explicitly for LAN access.",
     )
     parser.add_argument("--port", type=int, default=8090, help="Web UI port. Defaults to 8090.")
     parser.add_argument("--data-dir", default="./chat_runs", help="Directory for SQLite data and server logs.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the UI in the default browser.")
     parser.add_argument("--check", action="store_true", help="Validate configuration and storage, then exit.")
+    parser.add_argument(
+        "--prune-older-than-days",
+        type=int,
+        default=None,
+        help=(
+            "One-shot maintenance: delete runs (and their resource samples) older than "
+            "this many days, then continue starting normally. There is no automatic "
+            "retention policy otherwise -- the run database keeps everything forever "
+            "unless this is passed."
+        ),
+    )
     return parser
 
 
@@ -1537,9 +3481,16 @@ def main() -> int:
     if not data_dir.is_absolute():
         data_dir = (config_path.parent / data_dir).resolve()
     state = ApplicationState(config_path, data_dir)
+    if args.prune_older_than_days is not None:
+        result = state.store.prune_older_than(args.prune_older_than_days)
+        print(
+            f"Pruned {result['deleted_runs']} run(s) and {result['deleted_deployments']} "
+            f"deployment(s) older than {result['cutoff']}."
+        )
     if args.check:
         print(json.dumps({"status": "ok", "config": str(config_path), "data_dir": str(data_dir)}, indent=2))
         state.manager.shutdown()
+        state.history.close()
         return 0
 
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -1580,6 +3531,7 @@ def main() -> int:
         server.serve_forever(poll_interval=0.5)
     finally:
         state.manager.shutdown()
+        state.history.close()  # flush any queued conversation records
         server.server_close()
     return 0
 
