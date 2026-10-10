@@ -3,15 +3,25 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
-from dual_gpu_setup.lmstudio import backend_env, resolve_device, runtime_dir, server_binary
+from dual_gpu_setup.lmstudio import backend_env, resolve_device, resolve_model_path, runtime_dir, server_binary
+
+# Every helper process spawned in this module (netstat/tasklist/taskkill/powershell for
+# metrics, the llama-server process itself) is launched without an inherited console --
+# app.py normally runs detached (see launch_service.py), so a plain subprocess.run/Popen on
+# Windows would otherwise allocate and briefly show a brand-new console window for EACH call.
+# gpu_process_metrics_batch alone runs every ResourceSampler tick (every 2s, for the whole
+# life of the process -- see app.py's ResourceSampler), so without this flag that's a new
+# console window popping up every 2 seconds, forever.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -27,6 +37,7 @@ def _pid_listening_on(port: int) -> int | None:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -48,6 +59,7 @@ def _is_llama_server(pid: int) -> bool:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return False
@@ -63,18 +75,35 @@ def _wait_port_free(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def gpu_process_metrics(pid: int) -> dict[str, float] | None:
+def gpu_process_metrics_batch(pids: list[int]) -> dict[int, dict[str, float]]:
+    """Read GPU dedicated/shared memory and utilization for several PIDs in one PowerShell
+    invocation. Get-Counter's PDH counter-set resolution is the dominant cost here (multiple
+    seconds cold), roughly halved by requesting all three counter paths in a single Get-Counter
+    call instead of three, and only paid once per tick by collapsing N per-server calls (the
+    resource sampler and every chat request's before/after capture) into one per sampling tick.
+
+    Instance names look like 'pid_1234_luid_...' -- the filter anchors on the trailing
+    underscore so pid 123 can't accidentally match an instance for pid 1234."""
+    unique_pids = sorted(set(pids))
+    if not unique_pids:
+        return {}
+    pid_array = ",".join(str(pid) for pid in unique_pids)
     script = (
-        "$d=(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' -EA SilentlyContinue)"
-        f".CounterSamples | Where-Object {{$_.InstanceName -like 'pid_{pid}*'}} | "
-        "Measure-Object CookedValue -Sum; "
-        "$s=(Get-Counter '\\GPU Process Memory(*)\\Shared Usage' -EA SilentlyContinue)"
-        f".CounterSamples | Where-Object {{$_.InstanceName -like 'pid_{pid}*'}} | "
-        "Measure-Object CookedValue -Sum; "
-        "$u=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -EA SilentlyContinue)"
-        f".CounterSamples | Where-Object {{$_.InstanceName -like 'pid_{pid}*'}} | "
-        "Measure-Object CookedValue -Sum; "
-        "Write-Output \"$([double]$d.Sum) $([double]$s.Sum) $([double]$u.Sum)\""
+        f"$targets=@({pid_array}); "
+        "$samples=(Get-Counter -Counter @("
+        "'\\GPU Process Memory(*)\\Dedicated Usage',"
+        "'\\GPU Process Memory(*)\\Shared Usage',"
+        "'\\GPU Engine(*)\\Utilization Percentage'"
+        ") -EA SilentlyContinue).CounterSamples; "
+        "$d=$samples | Where-Object {$_.Path -like '*dedicated usage'}; "
+        "$s=$samples | Where-Object {$_.Path -like '*shared usage'}; "
+        "$u=$samples | Where-Object {$_.Path -like '*utilization percentage'}; "
+        "foreach ($targetPid in $targets) { "
+        "$pattern=\"pid_${targetPid}_*\"; "
+        "$dd=($d | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
+        "$ss=($s | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
+        "$uu=($u | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
+        "Write-Output \"$targetPid $([double]$dd) $([double]$ss) $([double]$uu)\" }"
     )
     try:
         output = subprocess.run(
@@ -82,19 +111,29 @@ def gpu_process_metrics(pid: int) -> dict[str, float] | None:
             capture_output=True,
             text=True,
             timeout=30,
-        ).stdout.split()
+            creationflags=_NO_WINDOW,
+        ).stdout
     except (OSError, subprocess.SubprocessError):
-        return None
-    if len(output) < 3:
-        return None
-    try:
-        return {
-            "dedicated_gb": float(output[0]) / 1024**3,
-            "shared_gb": float(output[1]) / 1024**3,
-            "utilization_pct": max(0.0, min(100.0, float(output[2]))),
+        return {}
+    results: dict[int, dict[str, float]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        try:
+            pid, dedicated, shared, utilization = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+        except ValueError:
+            continue
+        results[pid] = {
+            "dedicated_gb": dedicated / 1024**3,
+            "shared_gb": shared / 1024**3,
+            "utilization_pct": max(0.0, min(100.0, utilization)),
         }
-    except ValueError:
-        return None
+    return results
+
+
+def gpu_process_metrics(pid: int) -> dict[str, float] | None:
+    return gpu_process_metrics_batch([pid]).get(pid)
 
 
 def vram_placement(pid: int) -> tuple[float, float] | None:
@@ -221,7 +260,8 @@ class LlamaServerProcess:
             return
         if not _is_llama_server(pid):
             raise RuntimeError(f"Port {port} is held by PID {pid}, which is not llama-server.exe.")
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True, timeout=30)
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True, timeout=30,
+                        creationflags=_NO_WINDOW)
         _wait_port_free(port, timeout=30)
 
     def build_command(self) -> list[str]:
@@ -265,8 +305,30 @@ class LlamaServerProcess:
             args.extend(["--ubatch-size", str(self.model.ubatch_size)])
         if self.model.threads:
             args.extend(["--threads", str(self.model.threads), "--threads-batch", str(self.model.threads)])
+        args.extend(self._draft_args(policy))
         args.extend(self.lane_extra_args or [])
         args.extend(self.model.extra_args)
+        return args
+
+    def _draft_args(self, policy: "PolicyConfig") -> list[str]:
+        # Speculative decoding: run a small draft model on the same lane(s) as the
+        # target. It is lossless -- the target verifies every proposed token -- so it
+        # only changes throughput. Omitted knobs fall back to llama-server defaults.
+        if not self.model.draft_model:
+            return []
+        draft_path = resolve_model_path(self.config, replace(self.model, path=self.model.draft_model))
+        draft_layers = self.model.draft_gpu_layers if self.model.draft_gpu_layers is not None else policy.gpu_layers
+        args = [
+            "--model-draft", str(draft_path),
+            "--gpu-layers-draft", str(draft_layers),
+            "--device-draft", self.device,
+        ]
+        if self.model.draft_max:
+            args.extend(["--draft-max", str(self.model.draft_max)])
+        if self.model.draft_min:
+            args.extend(["--draft-min", str(self.model.draft_min)])
+        if self.model.draft_p_min > 0:
+            args.extend(["--draft-p-min", str(self.model.draft_p_min)])
         return args
 
     def start(self) -> None:
@@ -289,6 +351,7 @@ class LlamaServerProcess:
             stderr=subprocess.STDOUT,
             env=backend_env(self.config, self.backend),
             cwd=str(runtime_dir(self.config, self.backend)),
+            creationflags=_NO_WINDOW,
         )
 
         deadline = time.time() + self.config.project.start_timeout_seconds
@@ -333,6 +396,7 @@ class LlamaServerProcess:
                     capture_output=True,
                     text=True,
                     timeout=30,
+                    creationflags=_NO_WINDOW,
                 )
                 try:
                     self.proc.wait(timeout=30)

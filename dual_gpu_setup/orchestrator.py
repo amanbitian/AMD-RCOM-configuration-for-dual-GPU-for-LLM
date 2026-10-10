@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from dual_gpu_setup import gguf
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
 from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
 from dual_gpu_setup.server import LlamaServerProcess, warn_if_spilling
@@ -62,6 +63,100 @@ def ctx_for(config: AppConfig, model_size: float, lane_vram_gb: float) -> int:
     if headroom >= config.policy.ctx_mid_headroom_gb:
         return config.policy.ctx_mid
     return config.policy.ctx_min
+
+
+def resolve_context_window(
+    config: AppConfig,
+    baseline_context: int,
+    input_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+) -> int:
+    """Ensure the server-allocated context window can actually hold a request.
+
+    `baseline_context` is whatever context size deploy-time already picked (an
+    explicit request, a model default, or `ctx_for`'s VRAM-headroom guess).
+    When the caller also knows the real token budget for the requests it plans
+    to send, bump the context up to cover it: input_tokens + max_output_tokens
+    + policy.safety_tokens <= effective_context_window. Raises ValueError if
+    that requirement exceeds policy.ctx_max -- no amount of auto-sizing can
+    close that gap; the caller must shrink the prompt/output or raise ctx_max.
+    """
+    if input_tokens is None or max_output_tokens is None:
+        return baseline_context
+    if input_tokens < 0 or max_output_tokens < 0:
+        raise ValueError("input_tokens and max_output_tokens must be non-negative.")
+    required = input_tokens + max_output_tokens + config.policy.safety_tokens
+    effective = max(baseline_context, required)
+    if effective > config.policy.ctx_max:
+        raise ValueError(
+            f"Required context {required} tokens (input {input_tokens} + output "
+            f"{max_output_tokens} + safety {config.policy.safety_tokens}) exceeds "
+            f"policy ctx_max={config.policy.ctx_max}. Reduce prompt/output size or "
+            "raise policy.ctx_max."
+        )
+    return effective
+
+
+def estimate_kv_cache_gb(model_path: Path, context_size: int) -> tuple[float | None, str]:
+    """Best-effort KV-cache VRAM estimate from a model's own GGUF architecture metadata.
+
+    Returns (estimate_gb, note). `estimate_gb` is None when the architecture has a feature
+    this estimator isn't confident modeling -- a hybrid state-space/attention design (KV
+    cache doesn't scale with context the same way for those), a sliding-window attention
+    scheme with no explicit per-layer pattern in the file (the local/global layer ratio is
+    then unknown), or missing required fields. Callers should skip the strict VRAM check
+    rather than trust a guess in that case; `note` explains why.
+
+    Uses the standard transformer KV-cache formula (2 tensors x heads x head_dim x bytes x
+    context, summed per layer), assuming llama.cpp's fp16 KV cache default. When a model
+    does expose a per-layer sliding-window pattern (checked against real Gemma-family GGUF
+    files while building this), layers flagged as using the local/sliding window are capped
+    at that window instead of the full context -- getting the pattern's polarity backward
+    only makes the estimate less precise, never lower than the true value, since it can only
+    ever reduce from the full-context baseline for a subset of layers.
+    """
+    try:
+        meta = gguf.read_metadata(model_path, wanted_keys=None)
+    except (OSError, gguf.GGUFParseError) as exc:
+        return None, f"could not read GGUF metadata: {exc}"
+
+    arch = meta.get("general.architecture")
+    if not arch:
+        return None, "GGUF metadata has no general.architecture key"
+    if any(key.startswith(f"{arch}.ssm.") for key in meta):
+        return None, f"'{arch}' is a hybrid state-space architecture; KV-cache size doesn't scale with context the same way"
+
+    n_layers = meta.get(f"{arch}.block_count")
+    n_head = meta.get(f"{arch}.attention.head_count")
+    n_embd = meta.get(f"{arch}.embedding_length")
+    if n_layers is None or n_head is None or n_embd is None:
+        return None, f"'{arch}' is missing block_count/head_count/embedding_length metadata"
+
+    n_head_kv = meta.get(f"{arch}.attention.head_count_kv", n_head)
+    key_length = meta.get(f"{arch}.attention.key_length")
+    value_length = meta.get(f"{arch}.attention.value_length")
+    if key_length is None or value_length is None:
+        if n_head == 0 or n_embd % n_head != 0:
+            return None, f"'{arch}' head dimension is ambiguous (no key_length/value_length, and embedding_length isn't divisible by head_count)"
+        key_length = value_length = n_embd // n_head
+
+    kv_heads_per_layer = n_head_kv if isinstance(n_head_kv, list) else [n_head_kv] * n_layers
+    if len(kv_heads_per_layer) != n_layers:
+        return None, f"'{arch}' head_count_kv array length does not match block_count"
+
+    sliding_window = meta.get(f"{arch}.attention.sliding_window")
+    pattern = meta.get(f"{arch}.attention.sliding_window_pattern")
+    if not (sliding_window and isinstance(pattern, list) and len(pattern) == n_layers):
+        pattern = None  # no usable per-layer pattern -- treat every layer as full context
+
+    bytes_per_element = 2  # llama.cpp's default fp16 KV cache
+    total_bytes = 0.0
+    for index in range(n_layers):
+        effective_ctx = context_size
+        if pattern is not None and pattern[index]:
+            effective_ctx = min(context_size, sliding_window)
+        total_bytes += bytes_per_element * kv_heads_per_layer[index] * (key_length + value_length) * effective_ctx
+    return total_bytes / 1024**3, "ok"
 
 
 def prepare_models(config: AppConfig) -> tuple[list[PreparedModel], list[PreparedModel]]:

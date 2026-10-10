@@ -19,6 +19,12 @@ class ProjectConfig:
     log_dir: str = "./runs"
     cleanup_ports_on_start: bool = True
     start_timeout_seconds: int = 900
+    # Full-conversation archive (opt-in: it retains complete prompts and responses). When on,
+    # every request through /api/chat and the OpenAI gateway is logged -- content plus token
+    # counts -- to a SEPARATE SQLite file, written off the request path. Empty path = default
+    # next to the metrics DB. See CODING_AGENTS.md "Conversation archive".
+    store_chat_history: bool = False
+    chat_history_path: str = ""
 
 
 @dataclass(slots=True)
@@ -37,6 +43,7 @@ class PolicyConfig:
     ctx_max: int = 49152
     ctx_mid_headroom_gb: float = 5.0
     ctx_max_headroom_gb: float = 10.0
+    safety_tokens: int = 256
     reasoning_mode: str = "off"
     reasoning_budget: int = 0
     cache_reuse: int = 256
@@ -48,6 +55,9 @@ class PolicyConfig:
     kill_busy_ports: bool = True
     health_poll_seconds: float = 1.0
     settle_seconds_after_restart: float = 2.0
+    # How long to let a lane's in-flight requests finish before stopping its server during a
+    # deployment change, so a hot-swap does not kill another client's request mid-generation.
+    drain_timeout_seconds: float = 30.0
 
 
 @dataclass(slots=True)
@@ -71,6 +81,17 @@ class ModelConfig:
     parallel: int = 0
     reasoning_mode: str = ""
     reasoning_budget: int | None = None
+    reasoning_effort: str = "default"
+    # Speculative decoding (lossless): a small draft model proposes tokens that the
+    # target model verifies, raising tokens/sec without changing the output. draft_model
+    # is a path/glob resolved like `path`; empty disables it. The remaining knobs map to
+    # llama-server --draft-max/--draft-min/--draft-p-min/--gpu-layers-draft (0/None = let
+    # the backend default decide). See CODING_AGENTS.md.
+    draft_model: str = ""
+    draft_max: int = 0
+    draft_min: int = 0
+    draft_p_min: float = 0.0
+    draft_gpu_layers: int | None = None
     cache_reuse: int | None = None
     flash_attn: str = ""
     gpu_layers: int | None = None
@@ -127,39 +148,55 @@ def load_config(path: str | Path) -> AppConfig:
     discovery_raw = raw.get("discovery", {})
     policy_raw = raw.get("policy", {})
 
+    # NOTE: defaults below are read from *instances*, not the classes themselves.
+    # `@dataclass(slots=True)` replaces a class's own attribute with a slot descriptor,
+    # so `PolicyConfig.reasoning_budget` (class access) is not the default value `0` --
+    # it's a `member_descriptor` object. `PolicyConfig().reasoning_budget` (instance
+    # access) is. Using the class directly here would crash with a confusing TypeError
+    # the moment a config omits a field instead of falling back to its real default.
+    project_defaults = ProjectConfig()
+    discovery_defaults = DiscoveryConfig()
+    policy_defaults = PolicyConfig()
+
     discovery = DiscoveryConfig(
-        lmstudio_home=_expand(discovery_raw.get("lmstudio_home", DiscoveryConfig.lmstudio_home)),
+        lmstudio_home=_expand(discovery_raw.get("lmstudio_home", discovery_defaults.lmstudio_home)),
         models_dir=_expand(discovery_raw.get("models_dir", "")),
         backend_runtime_overrides=_dict_of_strings(discovery_raw.get("backend_runtime_overrides")),
         backend_vendor_bin_overrides=_dict_of_strings(discovery_raw.get("backend_vendor_bin_overrides")),
     )
     project = ProjectConfig(
-        name=str(project_raw.get("name", ProjectConfig.name)),
-        suite_prefix=str(project_raw.get("suite_prefix", ProjectConfig.suite_prefix)),
-        host=str(project_raw.get("host", ProjectConfig.host)),
-        log_dir=str(project_raw.get("log_dir", ProjectConfig.log_dir)),
-        cleanup_ports_on_start=bool(project_raw.get("cleanup_ports_on_start", ProjectConfig.cleanup_ports_on_start)),
-        start_timeout_seconds=int(project_raw.get("start_timeout_seconds", ProjectConfig.start_timeout_seconds)),
+        name=str(project_raw.get("name", project_defaults.name)),
+        suite_prefix=str(project_raw.get("suite_prefix", project_defaults.suite_prefix)),
+        host=str(project_raw.get("host", project_defaults.host)),
+        log_dir=str(project_raw.get("log_dir", project_defaults.log_dir)),
+        cleanup_ports_on_start=bool(project_raw.get("cleanup_ports_on_start", project_defaults.cleanup_ports_on_start)),
+        start_timeout_seconds=int(project_raw.get("start_timeout_seconds", project_defaults.start_timeout_seconds)),
+        store_chat_history=bool(project_raw.get("store_chat_history", project_defaults.store_chat_history)),
+        chat_history_path=_expand(str(project_raw.get("chat_history_path", ""))),
     )
     policy = PolicyConfig(
-        vram_safety_fraction=float(policy_raw.get("vram_safety_fraction", PolicyConfig.vram_safety_fraction)),
-        ctx_min=int(policy_raw.get("ctx_min", PolicyConfig.ctx_min)),
-        ctx_mid=int(policy_raw.get("ctx_mid", PolicyConfig.ctx_mid)),
-        ctx_max=int(policy_raw.get("ctx_max", PolicyConfig.ctx_max)),
-        ctx_mid_headroom_gb=float(policy_raw.get("ctx_mid_headroom_gb", PolicyConfig.ctx_mid_headroom_gb)),
-        ctx_max_headroom_gb=float(policy_raw.get("ctx_max_headroom_gb", PolicyConfig.ctx_max_headroom_gb)),
-        reasoning_mode=str(policy_raw.get("reasoning_mode", PolicyConfig.reasoning_mode)),
-        reasoning_budget=int(policy_raw.get("reasoning_budget", PolicyConfig.reasoning_budget)),
-        cache_reuse=int(policy_raw.get("cache_reuse", PolicyConfig.cache_reuse)),
-        flash_attn=str(policy_raw.get("flash_attn", PolicyConfig.flash_attn)),
-        gpu_layers=int(policy_raw.get("gpu_layers", PolicyConfig.gpu_layers)),
-        parallel=int(policy_raw.get("parallel", PolicyConfig.parallel)),
-        no_mmproj=bool(policy_raw.get("no_mmproj", PolicyConfig.no_mmproj)),
-        jinja=bool(policy_raw.get("jinja", PolicyConfig.jinja)),
-        kill_busy_ports=bool(policy_raw.get("kill_busy_ports", PolicyConfig.kill_busy_ports)),
-        health_poll_seconds=float(policy_raw.get("health_poll_seconds", PolicyConfig.health_poll_seconds)),
+        vram_safety_fraction=float(policy_raw.get("vram_safety_fraction", policy_defaults.vram_safety_fraction)),
+        ctx_min=int(policy_raw.get("ctx_min", policy_defaults.ctx_min)),
+        ctx_mid=int(policy_raw.get("ctx_mid", policy_defaults.ctx_mid)),
+        ctx_max=int(policy_raw.get("ctx_max", policy_defaults.ctx_max)),
+        ctx_mid_headroom_gb=float(policy_raw.get("ctx_mid_headroom_gb", policy_defaults.ctx_mid_headroom_gb)),
+        ctx_max_headroom_gb=float(policy_raw.get("ctx_max_headroom_gb", policy_defaults.ctx_max_headroom_gb)),
+        safety_tokens=int(policy_raw.get("safety_tokens", policy_defaults.safety_tokens)),
+        reasoning_mode=str(policy_raw.get("reasoning_mode", policy_defaults.reasoning_mode)),
+        reasoning_budget=int(policy_raw.get("reasoning_budget", policy_defaults.reasoning_budget)),
+        cache_reuse=int(policy_raw.get("cache_reuse", policy_defaults.cache_reuse)),
+        flash_attn=str(policy_raw.get("flash_attn", policy_defaults.flash_attn)),
+        gpu_layers=int(policy_raw.get("gpu_layers", policy_defaults.gpu_layers)),
+        parallel=int(policy_raw.get("parallel", policy_defaults.parallel)),
+        no_mmproj=bool(policy_raw.get("no_mmproj", policy_defaults.no_mmproj)),
+        jinja=bool(policy_raw.get("jinja", policy_defaults.jinja)),
+        kill_busy_ports=bool(policy_raw.get("kill_busy_ports", policy_defaults.kill_busy_ports)),
+        health_poll_seconds=float(policy_raw.get("health_poll_seconds", policy_defaults.health_poll_seconds)),
         settle_seconds_after_restart=float(
-            policy_raw.get("settle_seconds_after_restart", PolicyConfig.settle_seconds_after_restart)
+            policy_raw.get("settle_seconds_after_restart", policy_defaults.settle_seconds_after_restart)
+        ),
+        drain_timeout_seconds=float(
+            policy_raw.get("drain_timeout_seconds", policy_defaults.drain_timeout_seconds)
         ),
     )
 
@@ -184,8 +221,16 @@ def load_config(path: str | Path) -> AppConfig:
             ctx_size=int(item.get("ctx_size", 0)),
             parallel=int(item.get("parallel", 0)),
             reasoning_mode=str(item.get("reasoning_mode", "")),
+            reasoning_effort=str(item.get("reasoning_effort", "default")),
             reasoning_budget=(
                 int(item["reasoning_budget"]) if "reasoning_budget" in item and item["reasoning_budget"] is not None else None
+            ),
+            draft_model=_expand(str(item.get("draft_model", ""))),
+            draft_max=int(item.get("draft_max", 0)),
+            draft_min=int(item.get("draft_min", 0)),
+            draft_p_min=float(item.get("draft_p_min", 0.0)),
+            draft_gpu_layers=(
+                int(item["draft_gpu_layers"]) if "draft_gpu_layers" in item and item["draft_gpu_layers"] is not None else None
             ),
             cache_reuse=int(item["cache_reuse"]) if "cache_reuse" in item and item["cache_reuse"] is not None else None,
             flash_attn=str(item.get("flash_attn", "")),

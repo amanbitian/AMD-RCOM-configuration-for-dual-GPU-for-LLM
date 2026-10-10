@@ -12,8 +12,17 @@ requires-python = ">=3.11"
 [project.scripts]
 dual-gpu = "dual_gpu_setup.cli:main"
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["dual_gpu_setup*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# pytest's default basetemp (a shared dir under the system temp root) can hit permission
+# errors in some sandboxed environments; keeping it inside the repo avoids that.
+addopts = "--basetemp=.pytest_tmp"

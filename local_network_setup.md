@@ -200,7 +200,7 @@ For access from outside the home/local network, use a secure VPN such as a priva
 
 Check that:
 
-- the terminal shows a `Local network:` URL (the default bind is `0.0.0.0`); if you supplied `--host`, make sure it was not `127.0.0.1`;
+- the service was started with `--host 0.0.0.0` and the terminal shows a `Local network:` URL (the secure default bind is `127.0.0.1`);
 - the Mac is using the current Windows IPv4 address;
 - both machines are connected to the same network;
 - the Windows network profile is Private;
