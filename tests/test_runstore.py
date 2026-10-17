@@ -244,6 +244,32 @@ def test_day_after_bound_and_validation():
         app.RunStore._day_after("09-10-2026")
 
 
+def test_usage_ledger_disabled_is_a_noop(tmp_path: Path):
+    ledger = app.UsageLedger(tmp_path / "u.sqlite3", enabled=False)
+    ledger.record("p1", "autocomplete", 10, 5)
+    ledger.flush()
+    assert ledger.query() == []
+    ledger.close()
+
+
+def test_usage_ledger_rolls_up_per_project_and_connection_type(tmp_path: Path):
+    ledger = app.UsageLedger(tmp_path / "u.sqlite3", enabled=True, flush_interval=100)
+    ledger.record("p1", "coding_agent", 100, 20)
+    ledger.record("p1", "coding_agent", 50, 10)   # same bucket -> accumulates
+    ledger.record("p1", "autocomplete", 30, 5)
+    ledger.record(None, "inference", 1, 1)         # unattributed -> ""
+    rows = ledger.query()                           # query() flushes pending first
+
+    coding = next(r for r in rows if r["project_id"] == "p1" and r["connection_type"] == "coding_agent")
+    assert (coding["requests"], coding["input_tokens"], coding["output_tokens"]) == (2, 150, 30)
+    assert next(r for r in rows if r["connection_type"] == "autocomplete")["requests"] == 1
+    assert next(r for r in rows if r["connection_type"] == "inference")["project_id"] == ""
+
+    assert all(r["connection_type"] == "autocomplete" for r in ledger.query(connection_type="autocomplete"))
+    assert all(r["project_id"] == "p1" for r in ledger.query(project_id="p1"))
+    ledger.close()
+
+
 def test_chat_history_disabled_is_a_noop_with_no_file(tmp_path: Path):
     history = app.ChatHistoryStore(tmp_path / "hist.sqlite3", enabled=False)
     history.enqueue({"id": "x", "created_at": "2026-10-09T00:00:00+00:00"})

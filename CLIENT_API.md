@@ -27,7 +27,10 @@ This is a one-shot command, not an always-on daemon: it checks whether the servi
 healthy at the given host/port and exits immediately if so; otherwise it starts `app.py` as a
 detached background process, waits until it reports healthy, prints its `base_url`, and exits.
 The service itself keeps running after the launcher exits — the launcher does not stay
-resident. Safe to call before every session; it's idempotent.
+resident. Safe to call before every session; it's idempotent. Run by hand from a terminal it also
+opens the UI in your browser; a program launching it (no terminal) gets none, and `--open-browser` /
+`--no-browser` force either. Once running, restart or stop it from the dashboard's **Service** page
+or `POST /api/service/restart` (see [API_CONTRACT.md](API_CONTRACT.md#service-control)).
 
 ```python
 # from any Python client, before using the API below
@@ -233,7 +236,8 @@ The full working sequence, in order:
    chat wrapper that physically cannot deploy) is worth the few lines; the failure is silent
    otherwise.
 5. **When a lane's model is done, that worker calls `deploy_lane` again** for its next model and
-   carries on. It never waits for the other lane.
+   carries on. It never waits for the other lane. When a lane's queue is empty, that worker releases
+   the lane (step 7) instead.
 
 ```python
 import threading
@@ -253,6 +257,12 @@ threads = [threading.Thread(target=worker, args=(lane, models))
 for t in threads: t.start()
 for t in threads: t.join()
 ```
+
+**GPU-only placement.** A deploy starts a model only if its weights and KV cache fit the VRAM actually
+free on the GPU, counting other applications. If not, the deploy fails with a `500` whose message
+starts `Not enough free VRAM`; lower `context_window`, pick the other lane, or free the GPU. Besides
+explicit deploys, a gateway request whose `model` names a catalog model loads it on demand and
+evicts an idle model if needed (see [API_CONTRACT.md](API_CONTRACT.md#openai-compatible-coding-agent-gateway)).
 
 **Ordering rules the service enforces for you:** two lane workers that finish at the same moment
 both get served — simultaneous `deploy_lane` calls are serialized server-side and the second
@@ -352,3 +362,34 @@ programmatically as `categories`/`category_models` in `/api/dashboard` — see
 
 Runs made without a `task_label` are unaffected — they still count in the dashboard's
 Overview tab and per-model figures, just not in this category breakdown.
+
+## 7. Release the GPU when your task is done
+
+This is a rule for every client. The service keeps a model on the GPU until something unloads it; it
+does not notice that your task ended. When your task is finished, on success or failure, release what
+you loaded:
+
+```python
+import time, requests
+
+def release(base_url, lane, model):
+    """Unload `model` from `lane` if it is still what serves it. Never stops anyone else's model."""
+    for _ in range(5):
+        r = requests.post(f"{base_url}/api/unload", json={"lane": lane, "model": model}, timeout=60)
+        if r.status_code != 409:        # 409: a load or unload is in progress, retry shortly
+            return r.ok and r.json().get("released")
+        time.sleep(2)
+
+lanes = [s["lane_keys"][0] for s in deploy_reply["servers"]]
+try:
+    run_your_pipeline()
+finally:
+    for lane in lanes:
+        release("http://127.0.0.1:8090", lane, model)
+```
+
+Release only after your last request has returned, not between requests of the same task. Do not send
+the bare `POST /api/unload {}` or `{"force": true}`: they stop every model, including other
+applications'. `released: false` means the lane was already empty or another application's model is
+there now, so nothing needs doing. The full rule is in
+[API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when-a-task-is-done).

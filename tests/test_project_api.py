@@ -56,7 +56,10 @@ def test_project_session_tool_and_dashboard_endpoints(tmp_path: Path):
         models = _json(f"{base_url}/v1/r9700/developer/models")
 
         assert dashboard["tool_summary"]["events"] == 1
-        assert models == {"object": "list", "data": []}
+        assert models["object"] == "list"
+        # Nothing is loaded: no lane entries, and every listed catalog model is loadable on demand.
+        assert [entry for entry in models["data"] if "loaded" not in entry] == []
+        assert all(entry["loaded"] is False for entry in models["data"])
     finally:
         server.shutdown()
         server.server_close()

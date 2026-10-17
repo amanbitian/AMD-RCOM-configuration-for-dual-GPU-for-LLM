@@ -25,7 +25,7 @@ Only the Dual GPU Studio web port needs to be reachable from the Mac. The underl
 - The Windows PC and Mac must be connected to the same trusted Ethernet or Wi-Fi network.
 - The Windows network profile should be set to **Private**.
 - Guest Wi-Fi or wireless client isolation must not block communication between devices.
-- The configured LM Studio runtime and model files must be accessible on the Windows PC.
+- The configured `llama-server` runtime (an official llama.cpp build set in `discovery.backend_server_binaries`, or LM Studio's bundled one) and the model files must be accessible on the Windows PC.
 - The Windows PC must remain awake while the Mac is using the application.
 
 ## 1. Start the application for LAN access
@@ -56,6 +56,12 @@ What these options mean:
 - `--config` selects the GPU, model, and runtime configuration.
 
 Keep this terminal open. Press `Ctrl+C` when you want to stop the application and unload model servers managed by it.
+
+If the service was started in the background with `py launch_service.py`, there is no terminal to close. Use
+the dashboard's **Service** page from the Mac: **Restart service** or **Stop service**, **Unload** for each GPU,
+and the settings. Starting it again after **Stop service** needs the Windows PC (`py launch_service.py`).
+Anyone who can open the UI can use these controls; see the security notes in
+[app_overview.md](app_overview.md#12-security-posture).
 
 Passing `--host 127.0.0.1` intentionally disables LAN access. A Mac cannot connect while the application is bound only to `127.0.0.1`.
 
@@ -241,7 +247,7 @@ Create a DHCP reservation in the router for the Windows PC and update the Mac bo
 LAN connectivity is working in this case. Check the Windows application terminal and confirm:
 
 - model files exist at the configured paths;
-- the LM Studio runtime can be discovered;
+- the `llama-server` runtime can be found (the configured build, or LM Studio's) and the model fits the free VRAM (a `Not enough free VRAM` error means another application holds the GPU);
 - GPU device matching is correct;
 - lane ports are not occupied by unrelated applications.
 

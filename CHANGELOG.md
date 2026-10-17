@@ -1,5 +1,232 @@
 # Changelog
 
+## 2026-10-17 — Measured: where the context cache lives
+
+Documentation only; no code changed. With Qwen3-8B at a 262,144-token context on the R9700 (a 36.9 GB cache on
+a 32 GB card), the default silently spilled 11.4 GB into system RAM and decoded at 77 tok/s at a 2k prompt and
+32 tok/s at 16k. `--no-kv-offload` put the cache in RAM (24 tok/s at 2k, 7 tok/s at 16k). `--cache-type-k q8_0
+--cache-type-v q8_0` kept it on the GPU at 85 and 72 tok/s. `--fit on` changed nothing because context and layers
+are set explicitly. The repo has no deploy parameter for this and its capacity check counts the cache at 16-bit
+size in VRAM, so large contexts are refused. The table and the known issue are in
+[app_overview.md](app_overview.md#where-the-context-cache-lives-kv-cache).
+
+## 2026-10-17 — app_overview.md
+
+New [app_overview.md](app_overview.md): the single description of what the app is and is not, where it is
+verified, its architecture, every feature, the HTTP API map, the configuration reference, the files it writes,
+measured speed, time and memory on the reference machine, the rules for applications that use it, known
+issues, security posture and test status. It states what was measured or tested and marks the rest not
+verified. README and API_CONTRACT now point to it, and it says to be updated in the same change as any
+behaviour change.
+
+## 2026-10-17 — Control the service from the UI
+
+**Clients release the GPU when their task is done.** New contract clause (API_CONTRACT.md, "Releasing the
+GPUs when a task is done"; also CLIENT_API.md step 7, CODING_AGENTS.md and the README): an application that
+loaded a model must unload it when its task finishes, on success and on failure. The service does not do
+this itself, and has no idle timeout. To make that safe on a shared service, `POST /api/unload` accepts
+`{"lane": ..., "model": ...}`: it stops the lane's model only if `model` is still what serves it, so a
+client cannot stop a model another application loaded there since. Lane-scoped unloads now reply
+`released: true/false`. `model` without `lane` is a `400`.
+
+**Unload while a model is answering.** Measured on a model writing a long answer: Unload said nothing for
+30.8 s (the drain timeout), then cut the answer. Nothing in the UI showed a request was running, an
+Unload error appeared only on the Chat page, and there was no way to stop sooner. Now each server reports
+`inflight`, and a bar on every page says "Waiting for N running request(s) to finish (up to 30 s)" with
+a **Stop now** button (`POST /api/unload {"force": true}`). The same scenario now ends in 3.8 s when Stop
+now is pressed after 3 s. Cancelling one answer while keeping the model loaded is not built.
+
+`launch_service.py` started the service but never opened it: it always passed `--no-browser`, which
+suits a program calling it. It now opens the UI when run from a terminal (also when the service is
+already running) and stays silent when no terminal is attached; `--open-browser` / `--no-browser`
+force either.
+
+New **Service** page in the dashboard, backed by new endpoints (see API_CONTRACT.md, "Service control"):
+- **Restart / stop the service** (`POST /api/service/restart`, `/stop`). A restart stops the models,
+  starts a replacement process that waits for this one to exit before binding the port
+  (`--replace-pid`), and can load the same models again. The deployment is saved with its
+  coding-agent mode, and a saved deployment older than 10 minutes is ignored. The page reconnects by
+  itself.
+- **Settings** (`GET`/`POST /api/settings`): the loading, memory and residency options in `[policy]`,
+  validated, applied to the running service and saved into the config file with its comments intact
+  (the first save keeps `<config>.bak`). The residency guard now reads its setting on every tick, so
+  it can be switched live.
+- **Unload one GPU** (`POST /api/unload {"lane": ...}`), or only the leftovers (`{"orphans_only": true}`).
+- **Orphaned servers.** A llama-server left on a lane port by an instance that was killed is now reported
+  (`orphans` in `/api/status`, a banner in the UI) and stopped by Unload. Two things were wrong without
+  this: the new service did not know the leftover existed, so it kept holding VRAM and RAM, and its VRAM
+  made the free-VRAM check refuse a load that was fine once it was gone. A load now stops such a leftover
+  first (`kill_busy_ports`).
+- The state-changing control endpoints require a JSON content type (`415` otherwise), so a web page cannot
+  trigger a restart or stop with a blind form POST.
+
+The test suite can no longer see or stop real servers. Its example config uses the real lane ports, and
+the restart test's `unload()` found and stopped a llama-server a developer had running on 8081. `conftest.py`
+now hides listeners on lane ports from every test and refuses to terminate a real process. Verified with
+decoy `llama-server.exe` processes on both ports: none survived before the guard, all survived the full suite after.
+
+Found by testing the restart against the real service: a deployment loaded on demand is recorded with a
+`models` list even for one GPU, which `deploy()` rejected, so the first restart did not reload it. The
+saved deployment is now converted to a deployable one.
+
+Verified on spare ports against real processes: restart with reload (new PID, old one exited, the model
+loaded again), settings saved and still in force after a restart, an orphan found, listed and stopped,
+a load that replaced an orphan, unloading one GPU, and a full stop that left no process behind. The new
+dashboard functions were also run against a fake DOM in Node (rendering, escaping, the typed settings
+payload, the reconnect after a restart). The page was not opened in a real browser here.
+## 2026-10-17 — Models stay on the GPU; on-demand model manager
+
+**Why llama-server used so much RAM.** Measured on Qwen3-8B (4.7 GB) on the R9700, with one flag
+changed per run. llama.cpp itself places everything on the GPU (verbose log: 4,455 MiB weights and
+2,304 MiB KV cache on ROCm0, 334 MiB token embeddings on the CPU). Two things hold host RAM anyway:
+- After load, the process holds about one model's worth of RAM (4.78 GB) in every load mode. It
+  matches the uploaded weights, not the KV cache, so it looks like the driver's host-side copy of
+  data uploaded from RAM. With `--load-mode none` it is still committed but no longer resident
+  (0.62 GB resident instead of 4.64 GB).
+- llama.cpp's prompt cache (`--cache-ram`, 8 GiB default) keeps every new prompt in RAM: +4.1 GB
+  after 20 distinct prompts, and +6.8 GB after 150 on gpt-oss-20b, still growing.
+
+New `[policy]` defaults `load_mode = "none"` and `cache_ram_mib = 0` hold 0.62 GB resident and flat
+after 20 requests, against 8.77 GB with the old flags. Decode speed is unchanged (96 tok/s), load is
+faster (1.5 s vs 3.1 s), and a same-conversation follow-up still reprocesses only its new tokens
+(from the GPU KV cache). Flags apply only to builds that have them; a model's `extra_args` win.
+
+**Windows moves idle model VRAM into RAM.** This is the big, intermittent RAM use. A loaded Qwen3.8-27B
+(16.85 GB) on the R9700 read **0 GB** resident while idle. Its next request took **10.3 s** (10.2 s
+"prompt" for a 13-token prompt) as Windows copied it back into VRAM, and system free RAM rose by
+about 15 GB once it was back. A second request took 0.2 s.
+- Ruled out as triggers: idle time alone (it stayed resident for 3 min idle), `--list-devices`, and
+  loading another model on either GPU.
+- The trigger is not identified. Evictions coincided with lower free system RAM (about 15 GB vs 27 GB).
+- The 9070 XT model was never evicted during the observations.
+
+**Residency guard** (`residency_guard`, `residency_check_seconds`, default on, every 15 s). Each idle
+server whose weights are no longer resident gets a 1-token request on a reserved warm-up slot. That
+pages the weights back in the background instead of during the next real request.
+- Servers with one slot now start with `--parallel 2 --kv-unified`. The two slots share one KV
+  pool, so there is no extra KV VRAM, and each slot keeps the full context.
+- Real requests are pinned to slot 0, so they still queue one at a time.
+- Measured: a warm-up on slot 1 ran immediately while slot 0 was busy. A pinned second request
+  queued behind the first and did not error.
+- A warm-up on the only slot made the next turn reprocess 2,510 tokens. On slot 1, the next turn
+  reprocessed 10.
+- `/api/status` servers report `resident_gb`, `evictions` and `rewarmed_at`.
+
+**GPU-only admission** (`vram_admission`, `vram_headroom_gb`). A server starts only when its weights,
+estimated KV cache and headroom fit the VRAM actually free on its GPU(s). Windows would otherwise back
+the shortfall with system RAM.
+- On Windows, free VRAM is total VRAM (DXGI) minus what the OS counts as in use by every process.
+- HIP's `--list-devices` figure is not used on Windows. It is per process: it reported an R9700
+  holding a 16.85 GB model as 32,472 of 32,624 MiB free, and a 9070 XT with 3 GB really free as
+  15.8 GB free.
+- Linux keeps `--list-devices`.
+- The check waits up to 20 s for a just-stopped server's VRAM to free, then refuses with 503.
+- It applies to `/api/deploy`, the client deploy endpoints and on-demand loads.
+
+**On-demand model manager** (`auto_load_models`). A gateway request whose `model` is a catalog model
+is served by that model:
+- If it is not loaded, it goes to a GPU where it fits the VRAM obtainable now. That is free VRAM
+  plus what evicting our own idle model there releases. It prefers a free GPU (smallest first),
+  else replaces the least recently used idle model.
+- If it fits nowhere, the request is refused with 503 **before** anything is evicted.
+- A model no single GPU can hold spans both GPUs.
+- Routed requests claim their server, so a concurrent load cannot evict a model between routing
+  and sending.
+- A busy model is never stopped mid-request. If every candidate stays busy for the drain timeout,
+  the request gets 503 and should retry.
+- `dgpu:<lane>` and unknown model names route as before.
+- `GET /v1/models` now also lists requestable catalog models.
+
+Verified on R9700 + 9070 XT through a second app instance, with another app's Qwen3.8-27B and
+gemma-4-12B loaded:
+- Four on-demand loads answered correctly. Qwen3-8B went to the R9700 because the 9070 XT lacked
+  room, and the least recently used idle model was replaced.
+- Two concurrent requests for different models both succeeded.
+- A 15.7 GB model was refused in 2.1 s ("r9700 needs 16.7 GB, 16.3 GB obtainable") with nothing
+  evicted.
+- Our servers held 0.61 to 0.64 GB of resident RAM, and unload stopped only our servers.
+
+Not yet seen live: the guard re-warming a model. No eviction happened to our servers during the
+40 s check. The re-warm path is covered by tests.
+
+## 2026-10-17 — Official llama.cpp builds instead of LM Studio's runtime
+
+Single-lane servers now run the official llama.cpp ROCm release b11699
+(`discovery.backend_server_binaries`) instead of LM Studio's bundled fork (runtime 2.55.0, which
+reports `build 1`). Compared head-to-head on gpt-oss-20b with identical flags, b11699 was faster on
+both cards: prefill +3.6% to +8.2%, decode +4.1% to +7.1%. The LM Studio fallback is unchanged:
+remove the config line and LM Studio's newest runtime is used again.
+
+- **Split models stay on LM Studio** (`discovery.multi_gpu_runtime = "lmstudio"`). b11699 answers
+  correctly on either card alone, but produces garbage whenever a model spans R9700 + 9070 XT.
+  Tested and still broken: Qwen3-8B and Qwen3-32B; 1:1 and 2:1 splits; either device order;
+  `--split-mode layer` and `tensor`; flash attention on and off; integrated GPU hidden; peer copies
+  disabled. `--split-mode row` does not start. LM Studio's runtime answers correctly on the same
+  splits. Re-run this check before setting `"configured"` with a newer build.
+- **Build is recorded:** each server's `runtime` (binary, source, version, build, commit) appears in
+  `/api/status`, every run's stored configuration, CLI `load.json` and `dual-gpu inspect`.
+- **Flag compatibility:** each binary is probed once (`--version`, `--help`). Builds with `--fit` get
+  `--fit off`, because this repo sizes context and offload itself. A renamed `--no-mmap` in
+  `extra_args` becomes `--load-mode none` on builds that dropped it. A server that exits during
+  startup now quotes its own last log lines in the error.
+- A configured build no longer gets LM Studio's vendor DLL folder on `PATH`; the release zip
+  bundles its own HIP runtime.
+
+Verified on the R9700 + 9070 XT machine through `app.py`:
+- single-GPU, parallel and split deployments, each answering a fixed question correctly
+- `/api/chat` compare
+- the coding gateway: chat, lane-pinned streaming, autocomplete and models
+- run history, dashboard, LM Studio GPU, lease, hardware, project and usage APIs, and unload
+
+Not covered by this change: the deploy capacity check still rejects gpt-oss-120b (59 GB) as too
+large for 43.2 GB of VRAM, because it does not count the expert weights `--n-cpu-moe` keeps on the
+CPU.
+
+## 2026-10-13 — Pick LM Studio's GPUs over the API
+
+`GET`/`POST /api/lmstudio/gpus` read and set which GPUs LM Studio's own llama.cpp runtime may use, by
+editing `load.gpuSplitConfig.disabledGpus` in LM Studio's `hardware-config.json` (see
+[API_CONTRACT.md](API_CONTRACT.md#get--post-apilmstudiogpus)). Other fields are preserved, the first
+original is backed up, and an unparseable file is never overwritten. It changes the saved setting only:
+already-loaded models keep their placement. `POST /api/lmstudio/release` unloads LM Studio's models
+(and optionally stops its server) so the GPUs and RAM are free first; it refuses while a model is busy.
+Both POSTs require `Content-Type: application/json`. Checked on the R9700 + 9070 XT machine: release,
+set R9700-only, restart the server, reload — the 27B model landed entirely on the R9700.
+
+## 2026-10-11 — Training telemetry, GPU leases, checkpoint evaluation, DDP metrics
+
+New **Training** and **Hardware** dashboard tabs and a stdlib-only `TrainingTracker` (plus a Hugging Face
+`Trainer` callback) that streams loss, learning rate, gradient norm, token accounting, step time, GPU
+phase timing and memory from a training script. Metrics are per window, never per microbatch, and the
+client never blocks or fails training (JSONL spool + replay when the dashboard is unreachable).
+
+- **Host layer:** `hostos/` moves all Windows-only code (ctypes, PowerShell, netstat, taskkill) behind
+  one interface and adds Linux (`/proc`, DRM fdinfo, signals). Native Linux `llama-server` builds work
+  through `discovery.backend_server_binaries`.
+- **GPU identity and telemetry:** lanes accept `pci_bus`; an independent 1 Hz amdgpu sysfs sampler (with
+  optional AMD SMI) reports utilisation, VRAM, three temperatures, power, clocks and the negotiated PCIe
+  link. Missing sensors are `null` with a reason, never `0`. amdgpu resets/page faults are captured from
+  the kernel log.
+- **Leases:** exclusive, expiring, token-protected claims on one or more lanes (all-or-nothing). Inference
+  deploys onto a leased lane get HTTP 409, training cannot take a lane inference holds, and process
+  termination verifies PID start time first. New `/api/leases` endpoints.
+- **Reliability:** runs are `stalled` on step progress (not heartbeats), rank loss in DDP is detected,
+  checkpoints are valid only once a manifest is committed, and a resume continuity report checks
+  optimizer/scheduler/RNG state, LR schedule and loss continuity.
+- **Evaluation pipeline:** bounded, coalescing checkpoint queue; adapter compatibility checks; native,
+  GGUF F16 and quantized GGUF levels on a spare lane with explicit failures and server changeover timing;
+  best-checkpoint selection on the deployed score (not training loss) and regression detection.
+- **Experiments and analysis:** equal-token-budget comparison with seed-noise gating, batch/context/LoRA/
+  gradient-checkpointing/precision benchmark sweeps (recommendations only), thermal degradation,
+  cross-GPU contention, energy per million tokens, MFU estimate, memory forecaster with measured profiles,
+  alerts, DDP straggler and scaling-efficiency analysis, rocprofv3 artifact attachments.
+- **Storage:** pooled SQLite connections, incremental per-run aggregates, SQL-side downsampling, idempotent
+  schema upgrades. Free-form payloads are scrubbed of personal data before storage.
+
+Not verified on real hardware here: the Linux sysfs/AMD SMI readings, the LoRA to GGUF conversion and
+`llama-server` changeover, and the DDP numerical-equivalence check (skipped without torch). All are
+covered by fakes and run on the training machine without code changes.
+
 ## 2026-10-09 — Project-aware dual coding-agent mode
 
 Added a coding-agent preset without removing or changing the existing evaluation modes or metric

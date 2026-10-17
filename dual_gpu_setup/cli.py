@@ -4,8 +4,8 @@ import argparse
 import json
 from collections import defaultdict
 
-from dual_gpu_setup.config import load_config
-from dual_gpu_setup.lmstudio import list_devices, resolve_device, runtime_dir
+from dual_gpu_setup.config import AppConfig, load_config
+from dual_gpu_setup.lmstudio import list_devices, multi_gpu_config, resolve_device, runtime_dir, runtime_info
 from dual_gpu_setup.orchestrator import DualGPUOrchestrator, prepare_models
 
 
@@ -20,6 +20,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _describe_runtime(config: AppConfig, backend: str) -> str:
+    runtime = runtime_info(config, backend)
+    build = f"build {runtime.build}, commit {runtime.commit}" if runtime.build is not None else "version unknown"
+    return f"{runtime_dir(config, backend)} ({runtime.source}, {build})"
+
+
 def _inspect(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     grouped: dict[str, list[str]] = defaultdict(list)
@@ -28,7 +34,10 @@ def _inspect(args: argparse.Namespace) -> int:
     print(f"Project: {config.project.name}")
     for backend, lane_keys in grouped.items():
         print(f"\nBackend: {backend}")
-        print(f"  Runtime: {runtime_dir(config, backend)}")
+        print(f"  Runtime: {_describe_runtime(config, backend)}")
+        split_config = multi_gpu_config(config)
+        if split_config is not config:
+            print(f"  Multi-GPU runtime: {_describe_runtime(split_config, backend)}")
         devices = list_devices(config, backend)
         for device_id, description in devices:
             print(f"  Device: {device_id} -> {description}")

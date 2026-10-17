@@ -122,6 +122,42 @@
     @media(max-width:900px){ .app{grid-template-columns:1fr}.sidebar{position:static;height:auto;display:block;padding:12px}.brand{margin-bottom:10px}.nav{grid-template-columns:repeat(3,1fr)}.nav button{justify-content:center}.nav-icon,.sidebar-foot{display:none}.topbar{top:0;padding:0 16px}.content{padding:18px 14px}.chat-layout,.dashboard-grid,.dashboard-grid.equal{grid-template-columns:1fr}.sticky-card{position:static}.kpi-grid{grid-template-columns:repeat(2,1fr)}.resource-stack{grid-template-columns:1fr}.detail-grid{grid-template-columns:repeat(2,1fr)} }
     @media(max-width:720px){ .response-grid.split{grid-template-columns:1fr}.response-body{max-height:420px}.response-stats{grid-template-columns:1fr 1fr} }
     @media(max-width:560px){ .kpi-grid,.metric-strip,.model-slot,.detail-grid{grid-template-columns:1fr}.composer-tools{grid-template-columns:1fr 1fr}.composer-tools .button{grid-column:1/-1}.top-actions .button{display:none}.page-head{align-items:flex-start;flex-direction:column}.token-split{grid-template-columns:1fr}.donut{margin:auto} }
+    .pill { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:99px; border:1px solid var(--border); font-size:11px; font-weight:700; white-space:nowrap; }
+    .pill.running { color:#92ecc2; border-color:#285544; background:#10251e; } .pill.completed { color:#a9c8ff; border-color:#2c4670; background:#12203a; }
+    .pill.stalled, .pill.lost { color:#ffd9a0; border-color:#6b5224; background:#2a2010; } .pill.failed { color:#ffabb1; border-color:#5d3038; background:#25151a; } .pill.cancelled { color:var(--muted); }
+    tr.clickable { cursor:pointer; } tr.clickable:hover td { background:#0f1824; } tr.selected td { background:#122033; }
+    .chart-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin-bottom:14px; }
+    .chart-card { padding:14px 16px 10px; } .chart-head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:6px; min-height:20px; }
+    .chart { position:relative; } .chart svg { width:100%; height:auto; display:block; overflow:visible; }
+    .chart .grid line { stroke:#1c2a3b; stroke-width:1; } .chart text { fill:var(--muted); font-size:10px; font-variant-numeric:tabular-nums; }
+    .chart .cursor { stroke:#4d6283; stroke-width:1; stroke-dasharray:3 3; visibility:hidden; } .chart .evmark { stroke:var(--red); stroke-width:1; stroke-dasharray:2 3; opacity:.7; }
+    .chart-tip { position:absolute; top:6px; pointer-events:none; visibility:hidden; z-index:3; min-width:130px; padding:7px 9px; border:1px solid var(--border); border-radius:8px; background:#0b121b; box-shadow:var(--shadow); font-size:11px; }
+    .chart-tip b { display:block; margin-bottom:3px; color:var(--muted); font-weight:600; } .chart-tip div { display:flex; justify-content:space-between; gap:12px; font-variant-numeric:tabular-nums; }
+    .legend-inline { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:11px; } .legend-inline i { display:inline-block; width:14px; height:3px; border-radius:2px; margin-right:5px; vertical-align:middle; }
+    .event-list { display:grid; gap:6px; max-height:300px; overflow:auto; } .event-row { display:grid; grid-template-columns:150px 120px 80px 1fr; gap:10px; padding:7px 10px; border:1px solid var(--border-soft); border-radius:8px; background:#0b121b; font-size:12px; }
+    .event-row.error { border-color:#5d3038; } .event-row.warning { border-color:#6b5224; }
+    .hw-bar { height:8px; border-radius:99px; background:#1b293a; overflow:hidden; margin:6px 0 4px; } .hw-bar i { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,var(--teal),var(--blue)); }
+    .hw-bar.hot i { background:linear-gradient(90deg,var(--amber),var(--red)); }
+    @media(max-width:1100px){ .chart-grid{grid-template-columns:1fr} .event-row{grid-template-columns:1fr 1fr} }
+    .subtabs { display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; } .subtabs button { padding:8px 14px; border:1px solid var(--border); border-radius:9px; background:#0d151f; color:var(--muted); font-weight:600; }
+    .subtabs button:hover { color:var(--text); } .subtabs button.active { color:var(--text); background:var(--surface-3); border-color:#2a3a50; }
+    input[type=checkbox] { width:auto; min-width:0; }
+    .filters input[type=checkbox] { min-width:0; }
+    .train-pane { display:none; } .train-pane.active { display:block; }
+    .alert-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:9px 14px; margin-bottom:8px; border:1px solid var(--border); border-radius:10px; background:#0e1620; font-size:13px; }
+    .alert-row strong { white-space:nowrap; } .alert-row span { color:var(--muted); flex:1; min-width:200px; }
+    .alert-row.error { border-color:#5d3038; background:#1d1217; } .alert-row.error strong { color:#ffabb1; } .alert-row.warning { border-color:#6b5224; background:#1e180d; } .alert-row.warning strong { color:#ffd9a0; }
+    .pick-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:8px; } .pick { display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--border-soft); border-radius:9px; background:#0b121b; cursor:pointer; } .pick input { width:auto; }
+    textarea.mono { font-family:Consolas,monospace; font-size:12px; resize:vertical; }
+    .banner { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:11px 14px; margin-bottom:14px; border:1px solid #6b5224; border-radius:11px; background:#1e180d; color:#ffd9a0; }
+    .banner .sub { color:#d9b977; font-size:12px; }
+    .banner.error-banner { border-color:#63313b; background:#1d1217; color:#ffb1b8; }
+    .svc-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; margin-bottom:8px; border:1px solid var(--border-soft); border-radius:11px; background:#0a111a; }
+    .svc-row.orphan { border-color:#6b5224; background:#1a150c; } .svc-row .sub { font-size:11px; }
+    .svc-actions { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:14px; }
+    .setting-row { display:grid; grid-template-columns:minmax(0,1fr) 150px; align-items:center; gap:14px; padding:10px 12px; border:1px solid var(--border-soft); border-radius:11px; background:#0a111a; }
+    .setting-row input[type=checkbox] { justify-self:end; width:18px; height:18px; }
+    @media(max-width:560px){ .setting-row { grid-template-columns:1fr; } .setting-row input[type=checkbox] { justify-self:start; } }
   </style>
 </head>
 <body>
@@ -134,6 +170,9 @@
       <button data-view="runs" onclick="showView('runs')"><span class="nav-icon">RH</span>Run history</button>
       <button data-view="analytics" onclick="showView('analytics')"><span class="nav-icon">AN</span>Analytics</button>
       <button data-view="projects" onclick="showView('projects')"><span class="nav-icon">PR</span>Projects</button>
+      <button data-view="training" onclick="showView('training')"><span class="nav-icon">TR</span>Training</button>
+      <button data-view="hardware" onclick="showView('hardware')"><span class="nav-icon">HW</span>Hardware</button>
+      <button data-view="service" onclick="showView('service')"><span class="nav-icon">SV</span>Service</button>
       <button onclick="openWizard()"><span class="nav-icon">SET</span>Setup wizard</button>
     </nav>
     <div class="sidebar-foot"><div class="eyebrow">Runtime status</div><div class="status-line" style="margin-top:8px"><i id="side-dot" class="status-dot"></i><strong id="side-state">Connecting</strong></div><div id="side-models" class="sub">No deployment</div></div>
@@ -141,6 +180,8 @@
   <div class="workspace">
     <header class="topbar"><div><h1 id="page-title">Overview</h1><div id="project" class="subtitle">Loading configuration…</div></div><div class="top-actions"><select id="project-scope" class="scope-select" onchange="scopeChanged()"><option value="">All projects</option></select><button class="button" onclick="openWizard()">Setup wizard</button><span class="status-pill"><i id="top-dot" class="status-dot"></i><span id="top-state">Connecting</span></span><button class="button danger" onclick="unload()">Unload models</button></div></header>
     <main class="content">
+      <div id="notice" class="banner hidden"></div>
+      <div id="orphan-banner" class="banner hidden"></div>
       <section id="view-overview" class="view active">
         <div class="page-head"><div><h2>Performance overview</h2><p>Every model invocation, token, timing, and resource sample in one place.</p></div><button class="button" onclick="loadDashboard()">Refresh dashboard</button></div>
         <div id="kpis" class="kpi-grid"></div>
@@ -204,6 +245,102 @@
         <div class="page-head"><div><h2>Projects &amp; coding agents</h2><p>Register repositories once, then attribute agent requests and GPU samples to the correct project.</p></div><button class="button" onclick="loadProjects()">Refresh</button></div>
         <div class="card card-pad" style="margin-bottom:14px"><div class="card-head"><div><div class="eyebrow">Project registry</div><h3>Add or update a repository</h3></div></div><div class="filters"><input id="project-name" placeholder="Project name"><input id="project-path" placeholder="F:/Projects/my-repo" style="min-width:260px"><input id="project-remote" placeholder="Git remote (optional)" style="min-width:240px"><button class="button primary" onclick="saveProject()">Save project</button></div><div id="project-error" class="error" style="margin-top:9px"></div></div>
         <div class="dashboard-grid equal"><div class="card table-card"><div class="card-pad card-head"><div><div class="eyebrow">Usage by project</div><h3>Tokens and model throughput</h3></div></div><div class="table-wrap"><table><thead><tr><th>Project</th><th>Runs</th><th>Input</th><th>Output</th><th>Decode</th><th>Success</th></tr></thead><tbody id="project-rows"></tbody></table></div></div><div class="card table-card"><div class="card-pad card-head"><div><div class="eyebrow">Coding roles</div><h3>Agent activity</h3></div></div><div class="table-wrap"><table><thead><tr><th>Role</th><th>Runs</th><th>Tokens</th><th>Decode</th><th>GPU</th><th>Success</th></tr></thead><tbody id="agent-rows"></tbody></table></div></div></div>
+      </section>
+
+      <section id="view-training" class="view">
+        <div class="page-head"><div><h2>Training telemetry</h2><p>Runs reported by the training tracker: throughput, loss, memory, GPU hardware, checkpoint quality and the experiments built on them. Training and inference share the GPUs but are tracked separately.</p></div><button class="button" onclick="trRefresh(true)">Refresh</button></div>
+        <div id="train-alerts"></div>
+        <div class="subtabs" id="train-tabs">
+          <button data-tab="runs" class="active" onclick="trSetTab('runs')">Runs</button>
+          <button data-tab="compare" onclick="trSetTab('compare')">Compare</button>
+          <button data-tab="evaluation" onclick="trSetTab('evaluation')">Evaluation</button>
+          <button data-tab="benchmarks" onclick="trSetTab('benchmarks')">Benchmarks</button>
+          <button data-tab="forecast" onclick="trSetTab('forecast')">Memory forecast</button>
+        </div>
+
+        <div id="train-pane-runs" class="train-pane active">
+          <div class="sub" style="margin:-4px 0 8px;display:flex;justify-content:flex-end"><label style="display:flex;align-items:center;gap:6px"><input id="show-bench" type="checkbox" style="width:auto" onchange="delete trSig.rows;loadTraining(true)"> show benchmark trials</label></div>
+          <div class="card table-card" style="margin-bottom:14px"><div class="table-wrap"><table style="min-width:1040px"><thead><tr><th>Run</th><th>Status</th><th>Progress</th><th>Tokens seen</th><th>Tokens / s</th><th>Supervised / s</th><th>Loss</th><th>Peak VRAM (torch)</th><th>Started</th></tr></thead><tbody id="train-rows"></tbody></table></div></div>
+          <div id="train-detail"></div>
+        </div>
+
+        <div id="train-pane-compare" class="train-pane">
+          <div class="card card-pad"><div class="card-head"><div><div class="eyebrow">Experiment comparison</div><h3>Compare runs at an equal token budget</h3></div><span class="tag">pick 2–4 runs</span></div>
+            <div id="cmp-choices" class="pick-grid"></div>
+            <div class="filters" style="margin-top:12px"><input id="cmp-budget" placeholder="Token budget (blank = the largest every run reached)" style="min-width:320px"><button class="button primary" onclick="runCompare()">Compare</button></div></div>
+          <div id="cmp-out" style="margin-top:14px"></div>
+          <div class="card card-pad" style="margin-top:14px"><div class="card-head"><div><div class="eyebrow">Multi-GPU</div><h3>DDP scaling efficiency</h3></div><span class="tag">T<sub>DDP</sub> ÷ (T<sub>A</sub> + T<sub>B</sub>)</span></div>
+            <div class="filters"><select id="scale-ddp"></select><select id="scale-a"></select><select id="scale-b"></select><button class="button" onclick="runScaling()">Compute</button></div><div id="scale-out"></div></div>
+        </div>
+
+        <div id="train-pane-evaluation" class="train-pane">
+          <div id="eval-out"></div>
+          <div class="card card-pad" style="margin-top:14px"><div class="card-head"><div><div class="eyebrow">Manual</div><h3>Queue a checkpoint for evaluation</h3></div></div>
+            <div class="filters"><select id="ev-run"></select><input id="ev-step" type="number" min="0" placeholder="Step" style="min-width:100px"><input id="ev-path" placeholder="Checkpoint directory" style="min-width:320px"><label class="sub" style="display:flex;align-items:center;gap:6px"><input id="ev-final" type="checkbox" style="width:auto"> final</label><button class="button primary" onclick="submitEval()">Queue</button></div><div id="ev-msg" class="sub" style="margin-top:8px"></div></div>
+        </div>
+
+        <div id="train-pane-benchmarks" class="train-pane">
+          <div class="dashboard-grid equal">
+            <div class="card table-card"><div class="card-pad card-head"><div><div class="eyebrow">Controlled sweeps</div><h3>Benchmarks</h3></div></div><div class="table-wrap"><table style="min-width:420px"><thead><tr><th>Name</th><th>Kind</th><th>State</th><th>Created</th></tr></thead><tbody id="bm-list"></tbody></table></div></div>
+            <div class="card card-pad"><div class="card-head"><div><div class="eyebrow">New</div><h3>Launch a sweep</h3></div></div>
+              <div class="wizard-grid">
+                <label>Name<input id="bm-name" placeholder="batch-size sweep"></label>
+                <label>Kind<select id="bm-kind"><option value="batch_size">Batch size</option><option value="context">Context length</option><option value="lora">LoRA configuration</option><option value="gradient_checkpointing">Gradient checkpointing</option><option value="precision">Precision</option><option value="custom">Custom</option></select></label>
+                <label class="wide">Command (JSON array; {param} placeholders are filled per trial)<textarea id="bm-command" rows="2" class="mono">["python", "train.py", "--batch-size", "{batch_size}", "--max-steps", "{steps}"]</textarea></label>
+                <label class="wide">Grid (JSON object of value lists)<textarea id="bm-grid" rows="2" class="mono">{"batch_size": [1, 2, 4, 8]}</textarea></label>
+                <label>Steps per trial<input id="bm-steps" type="number" value="60" min="10"></label>
+                <label>VRAM budget (GB)<input id="bm-budget" type="number" placeholder="e.g. 32"></label>
+                <label class="wide">Lanes<input id="bm-lanes" placeholder="r9700"></label>
+              </div>
+              <div class="filters" style="margin-top:12px"><button class="button primary" onclick="submitBenchmark()">Start sweep</button><span id="bm-msg" class="error"></span></div>
+              <div class="wizard-note" style="margin-top:12px">The command is your own training script reporting through <span class="mono">TrainingTracker</span>. Sweeps only recommend; they never edit training settings.</div></div>
+          </div>
+          <div id="bm-detail"></div>
+        </div>
+
+        <div id="train-pane-forecast" class="train-pane">
+          <div class="dashboard-grid equal">
+            <div class="card card-pad"><div class="card-head"><div><div class="eyebrow">Before you launch</div><h3>Will it fit?</h3></div></div>
+              <div class="filters" style="margin-bottom:10px"><select id="fc-lane"></select><label class="sub" style="display:flex;align-items:center;gap:6px"><input id="fc-flash" type="checkbox" checked style="width:auto"> flash attention</label><button class="button primary" onclick="runForecast()">Forecast</button></div>
+              <textarea id="fc-config" rows="14" class="mono" spellcheck="false"></textarea></div>
+            <div class="card card-pad"><div class="card-head"><div><div class="eyebrow">Verdict</div><h3>Forecast</h3></div></div><div id="fc-out"><div class="empty">Choose a lane and press Forecast.</div></div></div>
+          </div>
+          <div class="card table-card" style="margin-top:14px"><div class="card-pad card-head"><div><div class="eyebrow">Measured</div><h3>Profiles from completed runs</h3></div></div><div class="table-wrap"><table style="min-width:760px"><thead><tr><th>Model</th><th>Seq len</th><th>Micro-batch</th><th>Precision</th><th>LoRA</th><th>GPU</th><th>Peak VRAM</th><th>Tokens / s</th></tr></thead><tbody id="fc-profiles"></tbody></table></div></div>
+        </div>
+      </section>
+
+      <section id="view-hardware" class="view">
+        <div class="page-head"><div><h2>GPU hardware</h2><p>Live readings sampled by the dashboard, independent of any training or inference process. Sensors a card does not expose show as unavailable, never as zero.</p></div><button class="button" onclick="loadHardware()">Refresh</button></div>
+        <div id="hw-note"></div>
+        <div id="hw-cards" class="dashboard-grid equal"></div>
+        <div id="hw-sampler" class="card card-pad"></div>
+      </section>
+
+      <section id="view-service" class="view">
+        <div class="page-head"><div><h2>Service &amp; models</h2><p>Restart or stop the service, free GPU memory, and change how models are loaded. Everything here acts on the running service.</p></div><button class="button" onclick="loadService()">Refresh</button></div>
+        <div class="dashboard-grid equal">
+          <div class="card card-pad">
+            <div class="card-head"><div><div class="eyebrow">Process</div><h3>Service</h3></div><span id="svc-state" class="tag">—</span></div>
+            <div class="metric-strip" style="grid-template-columns:1fr 1fr">
+              <div class="metric-box"><b id="svc-pid">—</b><span>Process ID</span></div>
+              <div class="metric-box"><b id="svc-uptime">—</b><span>Running for</span></div>
+            </div>
+            <div class="sub mono" style="margin-top:10px">Address: <span id="svc-address">—</span></div>
+            <div class="sub mono">Config: <span id="svc-config">—</span></div>
+            <div class="sub mono">Data: <span id="svc-data">—</span></div>
+            <div class="svc-actions">
+              <button id="svc-restart" class="button primary" onclick="serviceAction('restart')">Restart service</button>
+              <label class="pick" style="padding:6px 10px"><input id="svc-reload" type="checkbox" checked>Load the current models again afterwards</label>
+              <button id="svc-stop" class="button danger" onclick="serviceAction('stop')">Stop service</button>
+            </div>
+            <div id="svc-msg" class="sub" style="margin-top:10px"></div>
+          </div>
+          <div class="card card-pad">
+            <div class="card-head"><div><div class="eyebrow">GPUs</div><h3>Loaded models</h3></div><button class="button danger" onclick="unload()">Unload everything</button></div>
+            <div id="svc-models"><div class="sub">Loading…</div></div>
+          </div>
+        </div>
+        <div id="svc-settings" class="card card-pad" style="margin-top:14px"></div>
       </section>
     </main>
   </div>
@@ -272,10 +409,9 @@ function setMode(mode){currentMode=mode;document.querySelectorAll('[data-mode]')
 async function refreshModels(){try{const result=await api('/api/models/refresh',{method:'POST',body:'{}'});bootstrap.catalog=result.catalog;setMode(currentMode);}catch(error){$('deploy-error').textContent=error.message;}}
 function readSlot(index,withLane=true){const value={model:$('model-'+index).value,context_window:Number($('ctx-'+index).value),...(currentWorkload==='coding_agent'?{workload_kind:'coding_agent',reasoning_effort:$('reason-'+index).value}:{reasoning_budget:Number($('reason-'+index).value)})};if(withLane)value.lane=$('lane-'+index).value;if($('split-'+index))value.tensor_split=$('split-'+index).value;return value;}
 async function deploy(){const button=$('deploy-button');try{$('deploy-error').textContent='';button.disabled=true;button.textContent='Loading model…';let profile={mode:currentMode};if(currentMode==='parallel_models')profile.models=[readSlot(0),readSlot(1)];else profile.model=readSlot(0,currentMode!=='single_large_model');await api('/api/deploy',{method:'POST',body:JSON.stringify(profile)});await refreshStatus();}catch(error){$('deploy-error').textContent=error.message;}finally{button.disabled=false;button.textContent='Load deployment';}}
-async function unload(){try{await api('/api/unload',{method:'POST',body:'{}'});await refreshStatus();}catch(error){$('deploy-error').textContent=error.message;}}
 
 function updateSendLabel(){const button=$('send-button');button.textContent=chatBusy?($('chat-target').value==='compare'?'Running both models…':'Generating…'):($('chat-target').value==='compare'?'Run both models':'Send message');}
-function renderStatus(status){const stateText=status.state+' · '+modeLabel(status.mode);['top-state','side-state'].forEach(id=>$(id).textContent=stateText);['top-dot','side-dot'].forEach(id=>$(id).className='status-dot '+(status.state==='ready'?'ready':status.state==='error'?'error':''));const servers=status.servers||[],previous=$('chat-target').value,deploymentChanged=Boolean(status.deployment_id&&status.deployment_id!==activeDeploymentId);activeServers=servers;activeDeploymentId=status.deployment_id||null;$('side-models').textContent=servers.length?servers.map(server=>server.model).join(' + '):'No deployment';$('active-models').textContent=servers.length?servers.map(server=>`${server.model} · ${server.lane_keys.join(' + ')} · ${number(server.context_window)} ctx`).join('  |  '):'No model loaded';const compareOption=servers.length>1?'<option value="compare">Both models · Split view</option>':'';$('chat-target').innerHTML=compareOption+servers.map(server=>`<option value="${esc(server.target)}">${esc(server.model)} · ${esc(server.target)} only</option>`).join('');const values=[...$('chat-target').options].map(option=>option.value);if(servers.length>1&&(deploymentChanged||!values.includes(previous)))$('chat-target').value='compare';else if(values.includes(previous))$('chat-target').value=previous;$('send-button').disabled=status.state!=='ready'||chatBusy;updateSendLabel();renderLive(status.metrics);}
+function renderStatus(status){window.lastStatus=status;const stateText=status.state+' · '+modeLabel(status.mode);['top-state','side-state'].forEach(id=>$(id).textContent=stateText);['top-dot','side-dot'].forEach(id=>$(id).className='status-dot '+(status.state==='ready'?'ready':status.state==='error'?'error':''));const servers=status.servers||[],previous=$('chat-target').value,deploymentChanged=Boolean(status.deployment_id&&status.deployment_id!==activeDeploymentId);activeServers=servers;activeDeploymentId=status.deployment_id||null;$('side-models').textContent=servers.length?servers.map(server=>server.model).join(' + '):'No deployment';$('active-models').textContent=servers.length?servers.map(server=>`${server.model} · ${server.lane_keys.join(' + ')} · ${number(server.context_window)} ctx`).join('  |  '):'No model loaded';const compareOption=servers.length>1?'<option value="compare">Both models · Split view</option>':'';$('chat-target').innerHTML=compareOption+servers.map(server=>`<option value="${esc(server.target)}">${esc(server.model)} · ${esc(server.target)} only</option>`).join('');const values=[...$('chat-target').options].map(option=>option.value);if(servers.length>1&&(deploymentChanged||!values.includes(previous)))$('chat-target').value='compare';else if(values.includes(previous))$('chat-target').value=previous;$('send-button').disabled=status.state!=='ready'||chatBusy;updateSendLabel();renderLive(status.metrics);if(typeof serviceStatusChanged==='function')serviceStatusChanged(status);}
 function renderLive(sample){if(!sample){$('system-metrics').innerHTML=metric('—','Waiting for sample');return;}const system=sample.system||{};$('sample-time').textContent=new Date(sample.sampled_at).toLocaleTimeString();$('system-metrics').innerHTML=metric(system.cpu_pct==null?'—':number(system.cpu_pct)+'%','System CPU')+metric(system.ram_used_pct==null?'—':number(system.ram_used_pct)+'%','RAM pressure')+metric(bytes(system.ram_used_bytes),'RAM used')+metric(bytes(system.pagefile_used_bytes),'Pagefile / commit');$('server-metrics').innerHTML=(sample.servers||[]).map(server=>`<div class="resource-card"><h4>${esc(server.model)} <span class="tag">${esc(server.target)}</span></h4><div class="resource-grid">${metric(server.gpu_utilization_pct==null?'—':number(server.gpu_utilization_pct)+'%','GPU utilization')}${metric(server.cpu_pct==null?'—':number(server.cpu_pct)+'%','Process CPU')}${metric(bytes(server.rss_bytes),'Process RAM')}${metric(bytes(server.dedicated_vram_bytes),'Dedicated VRAM')}${metric(bytes(server.shared_gpu_memory_bytes),'Shared GPU memory')}</div><div class="sub" style="margin-top:9px">PID ${server.pid} · ${esc((server.lane_keys||[]).join(' + '))}</div></div>`).join('')||'<div class="empty" style="min-height:100px">No active model process</div>';}
 async function refreshStatus(){try{renderStatus(await api('/api/status'));}catch(error){$('top-state').textContent='Disconnected';}}
 
@@ -303,6 +439,521 @@ renderDashboard=function(data){renderDashboardBase(data);const value=data.summar
 const openRunBase=openRun;
 openRun=async function(id){await openRunBase(id);const resources=allRuns.find(run=>run.id===id)?.resources||{};const strips=$('modal-body').querySelectorAll('.detail-section .metric-strip');if(strips[2])strips[2].insertAdjacentHTML('afterbegin',metric(resources.avg_gpu_utilization_pct==null?'—':number(resources.avg_gpu_utilization_pct)+'%','Average GPU utilization')+metric(resources.peak_gpu_utilization_pct==null?'—':number(resources.peak_gpu_utilization_pct)+'%','Peak GPU utilization'));};
 $('prompt').addEventListener('keydown',event=>{if(event.key==='Enter'&&(event.ctrlKey||event.metaKey))sendMessage();});document.addEventListener('keydown',event=>{if(event.key==='Escape')closeRun();});init();
+</script>
+<script>
+/* Training + Hardware tabs. Self-contained: reuses $, esc, number, bytes, metric, api from the main script. */
+const TR_COLORS = ['#50dfbc', '#72a7ff', '#f7b955', '#b490ff'];
+const TR_STATUS_ICON = {running: '●', completed: '✓', failed: '✕', stalled: '⚠', lost: '⚠', cancelled: '–', queued: '…', oom: '✕', timeout: '⚠', unstable: '⚠', pending: '…', no_telemetry: '⚠'};
+let trSelected = null, trTimer = null, hwTimer = null, trSeq = 0, trReg = {}, trTab = 'runs', trRuns = [], trSig = {}, trExtras = {}, bmSelected = null;
+const trNum = (v, d = 2) => v == null ? '—' : Number(v).toLocaleString(undefined, {maximumFractionDigits: d});
+const trPct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+const trSecs = s => { if (s == null) return '—'; s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
+const trTime = ts => ts ? new Date(ts * 1000).toLocaleString() : '—';
+const trTemp = v => v == null ? 'n/a' : v.toFixed(0) + ' °C';
+const trPill = status => `<span class="pill ${esc(status)}">${TR_STATUS_ICON[status] || ''} ${esc(status)}</span>`;
+const trBytesShort = v => v == null ? '—' : bytes(v);
+const trPost = (path, body) => api(path, {method: 'POST', body: JSON.stringify(body || {})});
+const trRender = (key, el, html, after) => { /* skip DOM work when nothing changed since the last poll */
+  if (trSig[key] === html) return false;
+  trSig[key] = html; el.innerHTML = html; if (after) after(); return true;
+};
+
+/* ------------------------------------------------------------------ charts */
+function trChart(o) {
+  const id = 'trc' + (++trSeq), W = o.w || 560, H = o.h || 190, L = 54, R = 12, T = 10, B = 24;
+  const pts = []; o.series.forEach(s => s.pts.forEach(p => { if (p[1] != null) pts.push(p); }));
+  const head = `<div class="chart-head"><div class="eyebrow">${esc(o.title)}</div>${o.series.length > 1 ? `<div class="legend-inline">${o.series.map((s, i) => `<span><i style="background:${s.color || TR_COLORS[i % 4]}"></i>${esc(s.name)}</span>`).join('')}</div>` : ''}</div>`;
+  if (!pts.length) return `<div class="card chart-card">${head}<div class="empty" style="min-height:90px">${esc(o.empty || 'No data yet.')}</div></div>`;
+  let xmin = pts.reduce((a, p) => Math.min(a, p[0]), Infinity), xmax = pts.reduce((a, p) => Math.max(a, p[0]), -Infinity);
+  let ymin = pts.reduce((a, p) => Math.min(a, p[1]), Infinity), ymax = pts.reduce((a, p) => Math.max(a, p[1]), -Infinity);
+  if (o.zero && ymin > 0) ymin = 0; if (xmin === xmax) xmax = xmin + 1; if (ymin === ymax) ymax = ymin + (ymin === 0 ? 1 : Math.abs(ymin) * .1);
+  const pad = (ymax - ymin) * .06, nonNegative = ymin >= 0; if (!(o.zero && ymin === 0)) ymin -= pad; if (nonNegative && ymin < 0) ymin = 0; ymax += pad;
+  const sx = x => L + (x - xmin) / (xmax - xmin) * (W - L - R), sy = y => T + (1 - (y - ymin) / (ymax - ymin)) * (H - T - B);
+  const fy = o.fmt || (v => trNum(v)), fx = o.xfmt || (v => trNum(v, 0));
+  let grid = ''; for (let i = 0; i <= 3; i++) { const v = ymin + (ymax - ymin) * i / 3, y = sy(v); grid += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}"/><text x="${L - 6}" y="${y + 3}" text-anchor="end">${esc(fy(v))}</text>`; }
+  let xt = ''; for (let i = 0; i <= 3; i++) { const v = xmin + (xmax - xmin) * i / 3; xt += `<text x="${sx(v)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : i === 3 ? 'end' : 'middle'}">${esc(fx(v))}</text>`; }
+  const dots = pts.length <= 40;
+  const paths = o.series.map((s, i) => {
+    const c = s.color || TR_COLORS[i % 4]; let d = '', pen = false;
+    s.pts.forEach(p => { if (p[1] == null) { pen = false; return; } d += (pen ? 'L' : 'M') + sx(p[0]).toFixed(1) + ' ' + sy(p[1]).toFixed(1); pen = true; });
+    const dot = dots ? s.pts.filter(p => p[1] != null).map(p => `<circle cx="${sx(p[0]).toFixed(1)}" cy="${sy(p[1]).toFixed(1)}" r="3" fill="${c}" stroke="#0d131c" stroke-width="2"/>`).join('') : '';
+    return `<path d="${d}" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>${dot}`;
+  }).join('');
+  const marks = (o.markers || []).filter(x => x >= xmin && x <= xmax).map(x => `<line class="evmark" x1="${sx(x)}" x2="${sx(x)}" y1="${T}" y2="${H - B}"/>`).join('');
+  trReg[id] = {o, geo: {W, L, R, xmin, xmax, fy, fx, sx}};
+  return `<div class="card chart-card">${head}<div class="chart" id="${id}"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(o.title)}"><g class="grid">${grid}</g>${xt}${marks}${paths}<line class="cursor" y1="${T}" y2="${H - B}"/><rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" class="hit"/></svg><div class="chart-tip"></div></div></div>`;
+}
+function trBind(root) {
+  root.querySelectorAll('.chart').forEach(el => {
+    const reg = trReg[el.id]; if (!reg) return;
+    const {o, geo} = reg, svg = el.querySelector('svg'), tip = el.querySelector('.chart-tip'), cur = el.querySelector('.cursor');
+    const hide = () => { tip.style.visibility = 'hidden'; cur.style.visibility = 'hidden'; };
+    svg.addEventListener('mouseleave', hide);
+    svg.addEventListener('mousemove', e => {
+      const r = svg.getBoundingClientRect(), px = (e.clientX - r.left) / r.width * geo.W, x = geo.xmin + (px - geo.L) / (geo.W - geo.L - geo.R) * (geo.xmax - geo.xmin);
+      const rows = []; o.series.forEach((s, i) => { let best = null; s.pts.forEach(p => { if (p[1] != null && (best == null || Math.abs(p[0] - x) < Math.abs(best[0] - x))) best = p; }); if (best) rows.push([s, i, best]); });
+      if (!rows.length) return; const snap = rows.reduce((a, row) => Math.abs(row[2][0] - x) < Math.abs(a - x) ? row[2][0] : a, rows[0][2][0]), cx = geo.sx(snap);
+      cur.setAttribute('x1', cx); cur.setAttribute('x2', cx); cur.style.visibility = 'visible';
+      tip.innerHTML = `<b>${esc(geo.fx(snap))}</b>` + rows.map(([s, i, p]) => `<div><span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${s.color || TR_COLORS[i % 4]};margin-right:6px"></i>${esc(s.name)}</span><span>${esc(geo.fy(p[1]))}</span></div>`).join('');
+      const frac = cx / geo.W; tip.style.left = frac > .6 ? 'auto' : (frac * 100 + 2) + '%'; tip.style.right = frac > .6 ? ((1 - frac) * 100 + 2) + '%' : 'auto'; tip.style.visibility = 'visible';
+    });
+  });
+}
+
+/* -------------------------------------------------------------- tab plumbing */
+function trSetTab(name) {
+  trTab = name;
+  document.querySelectorAll('#train-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.train-pane').forEach(p => p.classList.toggle('active', p.id === 'train-pane-' + name));
+  trRefresh(true);
+}
+function trRefresh(force) {
+  loadAlerts();
+  if (trTab === 'runs') loadTraining(force);
+  if (trTab === 'compare') loadCompareChoices();
+  if (trTab === 'evaluation') loadEvaluation();
+  if (trTab === 'benchmarks') loadBenchmarks();
+  if (trTab === 'forecast') loadForecast();
+}
+async function loadAlerts() {
+  try {
+    const {alerts} = await api('/api/training/alerts');
+    trRender('alerts', $('train-alerts'), alerts.map(a => `<div class="alert-row ${esc(a.severity)}"><strong>${a.severity === 'error' ? '✕' : '⚠'} ${esc(a.kind.replace(/_/g, ' '))}</strong><span>${esc(a.message)}</span>${a.run_id ? `<button class="button" onclick="trSelect('${esc(a.run_id)}');trSetTab('runs')">Open run</button>` : `<button class="button" onclick="trSetTab('evaluation')">Open evaluation</button>`}</div>`).join(''));
+  } catch (error) { console.error(error); }
+}
+
+/* ---------------------------------------------------------------------- runs */
+function trRunRow(r) {
+  const prog = r.progress == null ? `step ${trNum(r.last_step, 0)}` : `<div>${trNum(r.last_step, 0)} / ${trNum(r.max_steps, 0)} · ${(r.progress * 100).toFixed(0)}%</div><div class="progress"><i style="width:${(r.progress * 100).toFixed(1)}%"></i></div>`;
+  return `<tr class="clickable ${r.id === trSelected ? 'selected' : ''}" onclick="trSelect('${esc(r.id)}')"><td><strong>${esc(r.name)}</strong><div class="sub mono">${esc(r.id.slice(0, 8))}${(r.lanes || []).length ? ' · ' + esc(r.lanes.join(' + ')) : ''}${r.world_size > 1 ? ' · DDP×' + r.world_size : ''}</div></td><td>${trPill(r.status)}${r.stall_reason ? `<div class="sub">${esc(r.stall_reason)}</div>` : ''}</td><td style="min-width:150px">${prog}${r.eta_s != null ? `<div class="sub">ETA ${trSecs(r.eta_s)}</div>` : ''}</td><td>${trNum(r.tokens.nonpad, 0)}</td><td>${trNum(r.throughput.tokens_per_sec, 0)}</td><td>${trNum(r.throughput.supervised_tokens_per_sec, 0)}</td><td>${r.latest_scalars ? trNum(r.latest_scalars.loss, 4) : '—'}</td><td>${trBytesShort(r.peak_mem_bytes)}</td><td>${trTime(r.started_at)}</td></tr>`;
+}
+async function loadTraining(force) {
+  try {
+    const data = await api('/api/training/runs');
+    trRuns = data.runs;
+    const showBench = $('show-bench')?.checked;
+    const visible = data.runs.filter(r => showBench || !r.tags?.benchmark_id);
+    trRender('rows', $('train-rows'), visible.map(trRunRow).join('') || '<tr><td colspan="9"><div class="empty">No training runs yet. Create a <span class="mono">TrainingTracker</span> in your training script (see docs/TRAINING_TELEMETRY.md) and runs appear here live.</div></td></tr>');
+    if (!trSelected || !data.runs.some(r => r.id === trSelected)) trSelected = data.runs[0]?.id || null;
+    const selected = data.runs.find(r => r.id === trSelected);
+    if (!selected) { $('train-detail').innerHTML = ''; return; }
+    const live = ['running', 'stalled', 'lost'].includes(selected.status);
+    if (force || live || trSig['detail-id'] !== trSelected + ':' + selected.status + ':' + selected.last_step) await loadTrainingDetail(trSelected);
+    trSig['detail-id'] = trSelected + ':' + selected.status + ':' + selected.last_step;
+  } catch (error) { $('train-rows').innerHTML = `<tr><td colspan="9" class="error">${esc(error.message)}</td></tr>`; }
+}
+function trSelect(id) { trSelected = id; delete trSig.rows; trSig['detail-id'] = ''; trExtras = {}; loadTraining(true); }
+async function loadTrainingDetail(id) {
+  const base = '/api/training/runs/' + encodeURIComponent(id);
+  const [detail, series] = await Promise.all([api(base), api(base + '/series?max_points=600')]);
+  if (id !== trSelected) return;
+  const signature = JSON.stringify([detail, series]); /* chart ids change every render, so compare the data, not the HTML */
+  if (trSig.detail !== signature) { trSig.detail = signature; $('train-detail').innerHTML = trDetailHTML(detail, series); trBind($('train-detail')); }
+  loadRunExtras(id, detail);
+}
+async function loadRunExtras(id, detail) {
+  const live = ['running', 'stalled', 'lost'].includes(detail.run.status);
+  const cached = trExtras[id];
+  if (cached && !(live && Date.now() - cached.at > 30000)) { trShowExtras(id, detail, cached); return; }
+  const base = '/api/training/runs/' + encodeURIComponent(id);
+  const [analysis, evals] = await Promise.all([api(base + '/analysis').catch(() => null), api(base + '/evals').catch(() => null)]);
+  trExtras[id] = {analysis, evals, at: Date.now()};
+  if (id === trSelected) trShowExtras(id, detail, trExtras[id]);
+}
+function trShowExtras(id, detail, extras) {
+  const a = $('tr-analysis'); if (a && extras.analysis) { a.innerHTML = trAnalysisHTML(extras.analysis, detail.run); trBind(a); }
+  const c = $('tr-ckpts'); if (c) c.innerHTML = trCkptHTML(detail.checkpoints, extras.evals, id);
+}
+function trAlertsHTML(alerts) {
+  return alerts.map(a => `<div class="alert-row ${esc(a.severity)}"><strong>${a.severity === 'error' ? '✕' : '⚠'} ${esc(a.kind.replace(/_/g, ' '))}</strong><span>${esc(a.message)}</span></div>`).join('');
+}
+function trDetailHTML(d, s) {
+  const r = d.run, pts = s.steps.points, steady = pts.filter(p => p.phase === 'train'), start = r.started_at;
+  const markers = d.events.filter(e => e.severity === 'error' && e.step != null).map(e => e.step);
+  const stepSeries = (name, key, src = pts, color) => ({name, color, pts: src.map(p => [p.step, p[key]])});
+  const hwGpus = Object.entries(s.hardware.gpus || {}), hwName = ([bus, g]) => g.lane || bus;
+  const hwSeries = key => hwGpus.map((e, i) => ({name: hwName(e), color: TR_COLORS[i % 4], pts: e[1].points.map(p => [p.ts - start, p[key]])}));
+  const hwNote = 'No GPU samples for this run (the sampler needs Linux amdgpu sysfs and runs only while a run is live).';
+  const base = {markers, empty: 'No data yet.'}, hwBase = {xfmt: trSecs, empty: hwNote};
+  const sum = d.hardware_summary.gpus, sumRows = Object.entries(sum);
+  const maxJ = sumRows.reduce((a, [, g]) => g.max_temp_junction_c == null ? a : Math.max(a ?? 0, g.max_temp_junction_c), null);
+  const maxM = sumRows.reduce((a, [, g]) => g.max_temp_memory_c == null ? a : Math.max(a ?? 0, g.max_temp_memory_c), null);
+  const latest = r.latest || {};
+  const kpis = [metric(r.status, 'Status', r.error ? r.error.split('\n').filter(Boolean).pop() : `elapsed ${trSecs(r.elapsed_s)}${r.seconds_since_step != null && r.status !== 'completed' ? ` · last step ${trSecs(r.seconds_since_step)} ago` : ''}`),
+    metric(r.max_steps ? `${trNum(r.last_step, 0)} / ${trNum(r.max_steps, 0)}` : trNum(r.last_step, 0), 'Optimizer step', r.eta_s != null ? 'ETA ' + trSecs(r.eta_s) : ''),
+    metric(r.latest_scalars ? trNum(r.latest_scalars.loss, 4) : '—', 'Loss (latest)', r.latest_scalars ? `step ${r.latest_scalars.step}` : ''),
+    metric(trNum(r.throughput.tokens_per_sec, 0), 'Input tokens / s', 'steady-state, non-padding'),
+    metric(trNum(r.throughput.supervised_tokens_per_sec, 0), 'Supervised tokens / s', 'labels != -100'),
+    metric(trPct(r.tokens.padding_ratio), 'Padding ratio', `supervision ${trPct(r.tokens.supervision_ratio)}`),
+    metric(trNum(latest.step_time_ms, 0) + (latest.step_time_ms == null ? '' : ' ms'), 'Optimizer step time', 'latest window mean'),
+    metric(trBytesShort(r.peak_mem_bytes), 'Peak VRAM (torch)', 'max allocated'),
+    metric(maxM == null ? 'n/a' : maxM.toFixed(0) + ' °C', 'Peak memory temp', maxJ == null ? 'junction n/a' : `junction ${maxJ.toFixed(0)} °C`),
+    metric(trNum(r.nan_count, 0), 'NaN / Inf events', `${r.checkpoints.valid} / ${r.checkpoints.total} checkpoints valid`)].join('');
+  const phaseKeys = [['data wait', 'data_wait_ms'], ['forward', 'fwd_ms'], ['backward + other', 'bwd_ms'], ['optimizer', 'opt_ms'], ['all-reduce', 'comm_ms']];
+  const hasPhases = phaseKeys.some(([, k]) => steady.some(p => p[k] != null));
+  const charts = [
+    trChart({...base, title: 'Training loss', series: [stepSeries('loss', 'loss')], fmt: v => trNum(v, 3)}),
+    trChart({...base, title: 'Throughput (steady state)', zero: true, series: [stepSeries('input tokens/s', 'tokens_per_sec', steady), stepSeries('supervised tokens/s', 'supervised_tokens_per_sec', steady)], fmt: v => trNum(v, 0)}),
+    trChart({...base, title: 'Optimizer step time (ms)', zero: true, series: [stepSeries('step time', 'step_time_ms', steady)], fmt: v => trNum(v, 0)}),
+    hasPhases ? trChart({...base, title: 'Where each step goes (ms)', zero: true, series: phaseKeys.filter(([, k]) => steady.some(p => p[k] != null)).slice(0, 4).map(([n, k]) => stepSeries(n, k, steady)), fmt: v => trNum(v, 0)}) : '',
+    trChart({...base, title: 'Learning rate', series: [stepSeries('lr', 'lr')], fmt: v => v.toExponential(2)}),
+    trChart({...base, title: 'Gradient norm', series: [stepSeries('grad norm', 'grad_norm')], fmt: v => trNum(v, 3)}),
+    trChart({...base, title: 'PyTorch memory', zero: true, series: [stepSeries('peak', 'mem_peak_bytes'), stepSeries('reserved', 'mem_reserved_bytes'), stepSeries('allocated', 'mem_alloc_bytes')], fmt: v => bytes(v)}),
+  ].join('') + (hwGpus.length ? [
+    trChart({...hwBase, title: 'GPU busy (%)', zero: true, series: hwSeries('gpu_busy_pct'), fmt: v => trNum(v, 0)}),
+    trChart({...hwBase, title: 'Device VRAM used', zero: true, series: hwSeries('vram_used_bytes'), fmt: v => bytes(v)}),
+    trChart({...hwBase, title: 'Memory temperature (°C)', series: hwSeries('temp_memory_c'), fmt: v => trNum(v, 0), empty: 'Memory temperature is not exposed by this card/driver.'}),
+    trChart({...hwBase, title: 'Junction temperature (°C)', series: hwSeries('temp_junction_c'), fmt: v => trNum(v, 0), empty: 'Junction temperature is not exposed by this card/driver.'}),
+    trChart({...hwBase, title: 'Board power (W)', zero: true, series: hwSeries('power_w'), fmt: v => trNum(v, 0), empty: 'Board power is not exposed by this card/driver.'}),
+  ].join('') : `<div class="card card-pad" style="grid-column:1/-1"><div class="eyebrow">GPU hardware</div><div class="empty" style="min-height:60px">${hwNote}</div></div>`);
+  const hwTable = sumRows.length ? `<div class="card table-card" style="margin-bottom:14px"><div class="card-pad card-head"><div><div class="eyebrow">Hardware during this run</div><h3>Per-GPU summary</h3></div><span class="tag">alert ≥ ${d.hardware_summary.alerts.memory_temp_c} °C memory · ${d.hardware_summary.alerts.junction_temp_c} °C junction</span></div><div class="table-wrap"><table style="min-width:900px"><thead><tr><th>GPU</th><th>Busy avg</th><th>Peak VRAM</th><th>Max edge</th><th>Max junction</th><th>Max memory</th><th>Time over alert</th><th>Power avg / max</th><th>Energy</th><th>PCIe width</th></tr></thead><tbody>${sumRows.map(([bus, g]) => `<tr><td><strong>${esc(g.lane || bus)}</strong><div class="sub mono">${esc(bus)}</div></td><td>${g.avg_busy_pct == null ? '—' : trNum(g.avg_busy_pct, 0) + '%'}</td><td>${trBytesShort(g.peak_vram_bytes)}${g.vram_total_bytes ? ` / ${bytes(g.vram_total_bytes)}` : ''}</td><td>${trTemp(g.max_temp_edge_c)}</td><td>${trTemp(g.max_temp_junction_c)}</td><td>${trTemp(g.max_temp_memory_c)}</td><td>${g.seconds_memory_over_alert == null && g.seconds_junction_over_alert == null ? 'n/a' : `mem ${trSecs(g.seconds_memory_over_alert)} · jct ${trSecs(g.seconds_junction_over_alert)}`}</td><td>${g.avg_power_w == null ? 'n/a' : trNum(g.avg_power_w, 0) + ' / ' + trNum(g.max_power_w, 0) + ' W'}</td><td>${g.energy_wh == null ? 'n/a' : trNum(g.energy_wh, 2) + ' Wh'}</td><td>${g.min_pcie_width == null ? 'n/a' : 'x' + g.min_pcie_width}</td></tr>`).join('')}</tbody></table></div></div>` : '';
+  const events = `<div class="card card-pad"><div class="card-head"><div><div class="eyebrow">Timeline</div><h3>Events</h3></div></div><div class="event-list">${d.events.map(e => `<div class="event-row ${esc(e.severity)}"><span>${trTime(e.ts)}</span><strong>${esc(e.kind)}</strong><span>${e.step == null ? '' : 'step ' + e.step}</span><span class="sub">${e.payload ? esc(JSON.stringify(e.payload)).slice(0, 300) : ''}</span></div>`).join('') || '<div class="empty">No events.</div>'}</div></div>`;
+  const artifacts = `<div class="card table-card"><div class="card-pad card-head"><div><div class="eyebrow">Attachments</div><h3>Profiler traces &amp; artifacts</h3></div></div><div class="table-wrap"><table style="min-width:600px"><thead><tr><th>Kind</th><th>File</th><th>Size</th><th>Added</th><th></th></tr></thead><tbody>${d.artifacts.map(x => `<tr><td>${esc(x.kind)}</td><td class="mono sub">${esc(x.path.split(/[\\/]/).pop())}</td><td>${trBytesShort(x.size_bytes)}</td><td>${trTime(x.created_at)}</td><td>${x.downloadable ? `<a class="button" href="/api/training/runs/${encodeURIComponent(r.id)}/artifacts/${x.id}" download>Download</a>` : '<span class="sub">path only</span>'}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty">No attachments. Use <span class="mono">tracker.attach_artifact(path)</span> to link a rocprofv3 trace.</div></td></tr>'}</tbody></table></div></div>`;
+  const notes = `<div class="card card-pad"><div class="card-head"><div><div class="eyebrow">Lab notebook</div><h3>Hypothesis → change → outcome</h3></div></div><div class="event-list" style="max-height:200px">${d.notes.map(n => `<div class="event-row" style="grid-template-columns:150px 1fr"><span>${trTime(n.ts)}</span><span><strong>${esc(n.hypothesis || '')}</strong> ${n.change ? '· ' + esc(n.change) : ''} ${n.outcome ? '→ ' + esc(n.outcome) : ''}</span></div>`).join('') || '<div class="empty">No notes.</div>'}</div><div class="filters" style="margin-top:12px"><input id="note-hyp" placeholder="Hypothesis"><input id="note-change" placeholder="Change"><input id="note-outcome" placeholder="Outcome"><button class="button primary" onclick="trAddNote('${esc(r.id)}')">Add note</button></div></div>`;
+  const env = r.env || {}, pk = env.packages || {}, hw = env.server_hardware || {};
+  const envBox = `<details class="detail-section"><summary>Environment &amp; reproducibility snapshot</summary><div class="metric-strip" style="margin:10px 0">${metric(env.rocm_version || hw.rocm_version || '—', 'ROCm')}${metric(env.torch?.version || pk.torch || '—', 'PyTorch', env.torch?.hip ? 'HIP ' + env.torch.hip : '')}${metric(pk.transformers || '—', 'transformers', pk.peft ? 'peft ' + pk.peft : '')}${metric(env.kernel || hw.kernel || '—', 'Kernel', (env.amdgpu_driver || hw.amdgpu_driver) ? 'amdgpu ' + (env.amdgpu_driver || hw.amdgpu_driver) : '')}</div>${(hw.gpus || []).length ? `<div class="table-wrap"><table style="min-width:640px"><thead><tr><th>GPU</th><th>PCI</th><th>Negotiated link</th><th>Max link</th></tr></thead><tbody>${hw.gpus.map(g => `<tr><td>${esc(g.lane || g.name)}</td><td class="mono">${esc(g.pci_bus)}</td><td>${esc(g.pcie_speed || 'n/a')} x${esc(g.pcie_width || '?')}</td><td>${esc(g.pcie_max_speed || 'n/a')} x${esc(g.pcie_max_width || '?')}</td></tr>`).join('')}</tbody></table></div>` : ''}${(env.gpu_map || []).length ? `<div class="sub" style="margin:8px 0">PyTorch device → physical GPU: ${env.gpu_map.map(m => `cuda:${m.torch_index} → ${esc(m.lane || m.pci_bus || '?')} (${esc(m.matched_by || 'unmatched')})`).join(' · ')}</div>` : ''}<pre>${esc(JSON.stringify({seed: r.seed, git_commit: r.git_commit, lanes: r.lanes, tags: r.tags, config: r.config, dataset: r.dataset, environment: r.env}, null, 2))}</pre></details>`;
+  const table = `<details class="detail-section"><summary>Metrics as a table (${pts.length} of ${s.steps.total_windows} windows)</summary><div class="table-wrap"><table style="min-width:800px"><thead><tr><th>Step</th><th>Phase</th><th>Loss</th><th>LR</th><th>Grad norm</th><th>Tokens/s</th><th>Supervised/s</th><th>Step ms</th><th>Peak VRAM</th></tr></thead><tbody>${pts.slice(-100).map(p => `<tr><td>${p.step}</td><td>${esc(p.phase)}</td><td>${trNum(p.loss, 4)}</td><td>${p.lr == null ? '—' : p.lr.toExponential(2)}</td><td>${trNum(p.grad_norm, 3)}</td><td>${trNum(p.tokens_per_sec, 0)}</td><td>${trNum(p.supervised_tokens_per_sec, 0)}</td><td>${trNum(p.step_time_ms, 0)}</td><td>${trBytesShort(p.mem_peak_bytes)}</td></tr>`).join('')}</tbody></table></div></details>`;
+  return `<div class="page-head" style="margin-top:6px"><div><h2 style="font-size:20px">${esc(r.name)} ${trPill(r.status)}</h2><p class="mono">${esc(r.id)}${r.parent_run_id ? ' · resumed from ' + esc(r.parent_run_id.slice(0, 8)) : ''}</p></div></div>${trAlertsHTML(d.alerts)}<div class="metric-strip" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:14px 0">${kpis}</div><div class="chart-grid">${charts}</div><div id="tr-analysis" class="card card-pad" style="margin-bottom:14px"><div class="eyebrow">Efficiency, thermals &amp; contention</div><div class="empty" style="min-height:50px">Analysing…</div></div>${hwTable}<div style="display:grid;gap:14px;margin-bottom:14px">${events}<div id="tr-ckpts"></div>${artifacts}${notes}</div>${envBox}${table}`;
+}
+async function trAddNote(id) {
+  const body = {hypothesis: $('note-hyp').value, change: $('note-change').value, outcome: $('note-outcome').value};
+  try { await trPost(`/api/training/runs/${encodeURIComponent(id)}/notes`, body); delete trSig.detail; loadTrainingDetail(id); } catch (error) { alert(error.message); }
+}
+async function trAct(id, path, body) {
+  try { await trPost(`/api/training/runs/${encodeURIComponent(id)}/${path}`, body); delete trExtras[id]; delete trSig.detail; loadTrainingDetail(id); } catch (error) { alert(error.message); }
+}
+async function trQueueEval(id, step, path) {
+  try { const r = await trPost('/api/training/eval-queue', {run_id: id, step, path}); if (!r.accepted) alert(r.reason); } catch (error) { alert(error.message); }
+}
+
+/* ------------------------------------------------- analysis & checkpoint card */
+function trAnalysisHTML(a, run) {
+  const e = a.energy, m = a.mfu, c = a.contention, t = a.thermal;
+  const gpuDrop = c.other_gpu.slowdown_pct, hostDrop = c.host_cpu.slowdown_pct;
+  const strip = [
+    metric(e.wh == null ? 'n/a' : trNum(e.wh, 1) + ' Wh', 'Board energy', e.wh_per_million_input_tokens == null ? 'no power samples' : trNum(e.wh_per_million_input_tokens, 2) + ' Wh / M input tokens'),
+    metric(e.joules_per_million_supervised_tokens == null ? 'n/a' : trNum(e.joules_per_million_supervised_tokens / 1000, 1) + ' kJ', 'Per M supervised tokens', 'GPU board power only'),
+    metric(t.throughput_degradation_pct == null ? 'n/a' : trNum(t.throughput_degradation_pct, 1) + '%', 'Throughput drop, early → late', t.throttle_suspected ? '⚠ thermal throttling suspected' : 'no throttling signature'),
+    metric(gpuDrop == null ? 'n/a' : trNum(gpuDrop, 1) + '%', 'Slowdown while other GPU busy', `${c.other_gpu.busy_windows} busy / ${c.other_gpu.quiet_windows} quiet windows`),
+    metric(hostDrop == null ? 'n/a' : trNum(hostDrop, 1) + '%', 'Slowdown at host CPU ≥ ' + c.thresholds.host_cpu_pct + '%', `${c.host_cpu.busy_windows} loaded windows`),
+    metric(m.mfu_trainable_basis == null ? 'n/a' : trPct(m.mfu_trainable_basis), 'MFU (estimate)', m.mfu_frozen_base_basis == null ? 'needs peak_tflops + params' : 'frozen-base basis ' + trPct(m.mfu_frozen_base_basis)),
+  ].join('');
+  const gpus = Object.entries(t.gpus || {}), ts = (key, name) => gpus.map(([bus, g], i) => ({name: g.lane || bus, color: TR_COLORS[i % 4], pts: g.buckets.map(b => [b.t, b[key]])}));
+  const throttleMarks = gpus.flatMap(([, g]) => g.throttle_buckets);
+  const charts = gpus.length ? `<div class="chart-grid" style="margin:14px 0 0">${trChart({title: 'Core clock per minute (MHz)', xfmt: trSecs, zero: true, markers: throttleMarks, series: ts('sclk_mhz'), fmt: v => trNum(v, 0), empty: 'Core clock is not exposed by this card/driver.'})}${trChart({title: 'Tokens/s per minute', xfmt: trSecs, zero: true, markers: throttleMarks, series: [{name: 'training', pts: (gpus[0][1].buckets).map(b => [b.t, b.tokens_per_sec])}], fmt: v => trNum(v, 0)})}</div>` : '';
+  let ranks = '';
+  if (a.ranks && a.ranks.ranks.length) {
+    ranks = `<div class="table-wrap" style="margin-top:14px"><table style="min-width:860px"><thead><tr><th>Rank</th><th>GPU</th><th>Step time</th><th>Waiting on slowest</th><th>Idle</th><th>All-reduce</th><th>Data wait</th><th>Peak VRAM</th><th>Headroom</th><th>Slowest in</th></tr></thead><tbody>${a.ranks.ranks.map(x => `<tr><td>${x.rank}</td><td class="mono">${esc(x.pci_bus || '—')}</td><td>${trNum(x.mean_step_ms, 0)} ms</td><td>${trNum(x.mean_wait_ms, 0)} ms</td><td>${x.idle_pct == null ? '—' : trNum(x.idle_pct, 1) + '%'}</td><td>${x.comm_share == null ? '—' : trPct(x.comm_share)}</td><td>${trNum(x.mean_data_wait_ms, 0)} ms</td><td>${trBytesShort(x.peak_mem_bytes)}</td><td ${x.vram_headroom_bytes != null && x.vram_headroom_bytes < 1.5 * 1024 ** 3 ? 'style="color:var(--amber)"' : ''}>${trBytesShort(x.vram_headroom_bytes)}</td><td>${x.slowest_windows} / ${a.ranks.windows_compared}</td></tr>`).join('')}</tbody></table></div><div class="sub" style="margin-top:6px">The 16 GB card sets the replica memory limit under DDP.</div>`;
+  }
+  let resume = '';
+  if (a.resume && a.resume.checks.length) {
+    resume = `<div style="margin-top:14px"><div class="eyebrow">Resume validation ${trPill(a.resume.verdict === 'ok' ? 'completed' : a.resume.verdict === 'warning' ? 'stalled' : 'failed')}</div><div class="event-list" style="max-height:none;margin-top:8px">${a.resume.checks.map(c => `<div class="event-row ${c.ok === false ? 'error' : ''}" style="grid-template-columns:260px 1fr"><strong>${c.ok === false ? '✕' : c.ok ? '✓' : '·'} ${esc(c.name.replace(/_/g, ' '))}</strong><span class="sub">${esc(c.detail)}</span></div>`).join('')}</div></div>`;
+  }
+  return `<div class="card-head"><div><div class="eyebrow">Efficiency, thermals &amp; contention</div><h3>What limited this run?</h3></div><span class="tag">estimates are labelled</span></div><div class="metric-strip" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">${strip}</div>${charts}${ranks}${resume}`;
+}
+function trCkptHTML(ckpts, evals, runId) {
+  const sel = evals?.selection, card = Object.fromEntries((sel?.scorecard || []).map(r => [r.step, r])), metricName = sel?.metric || 'score';
+  const cell = (row, level) => { const v = row?.scores?.[level]; return v == null ? '<span class="sub">—</span>' : trNum(v, 3); };
+  const drop = (v, label) => v == null ? '' : `<div class="sub" ${v > 0.02 ? 'style="color:var(--amber)"' : ''}>${label} ${v >= 0 ? '−' : '+'}${Math.abs(v).toFixed(3)}</div>`;
+  const rows = ckpts.map(c => {
+    const row = card[c.step];
+    return `<tr><td>${c.step}${c.best ? ' <span class="pill running">★ best</span>' : ''}${c.designated ? ' <span class="tag">designated</span>' : ''}</td><td>${c.valid ? '<span class="pill running">✓ valid</span>' : `<span class="pill failed">✕ incomplete</span><div class="sub">${esc(c.error || '')}</div>`}</td><td>${cell(row, 'native')}</td><td>${cell(row, 'gguf_f16')}${drop(row?.drop_native_to_f16, 'conversion')}</td><td>${cell(row, 'gguf_quant')}${drop(row?.drop_f16_to_quant, 'quantization')}</td><td>${row?.latency_ms == null ? '—' : trNum(row.latency_ms, 0) + ' ms'}</td><td>${trNum(c.tokens_seen, 0)}</td><td class="mono sub" title="${esc(c.path)}">${esc(c.path.split(/[\\/]/).pop())}</td><td style="white-space:nowrap">${c.valid ? `<button class="button" onclick="trAct('${esc(runId)}','checkpoints/${c.step}/designate')">Designate</button> <button class="button" onclick="trAct('${esc(runId)}','checkpoints/${c.step}/promote')">Promote</button> <button class="button" onclick="trQueueEval('${esc(runId)}',${c.step},'${esc(c.path).replace(/\\/g, '\\\\')}')">Evaluate</button>` : ''}</td></tr>${(row?.flags || []).map(f => `<tr><td colspan="9" class="sub" style="color:var(--amber);padding-top:0">⚠ step ${c.step}: ${esc(f)}</td></tr>`).join('')}`;
+  }).join('') || '<tr><td colspan="9"><div class="empty">No checkpoints reported.</div></td></tr>';
+  const summary = sel?.selected_step != null ? `<div class="alert-row ${sel.deployable ? '' : 'warning'}" style="margin:0 18px 12px"><strong>${sel.deployable ? '★' : '⚠'} Selected step ${sel.selected_step}</strong><span>by ${esc(sel.level)} ${esc(metricName)}${sel.deployable ? '' : ' (no deployment-level score yet)'}${sel.differs_from_loss_only_choice ? `; a loss-only rule would have picked step ${sel.loss_only_choice}` : ''}</span><button class="button" onclick="trAct('${esc(runId)}','select',{apply:true})">Apply</button></div>` : '';
+  const regress = (evals?.regressions || []).map(f => `<div class="alert-row warning" style="margin:0 18px 8px"><strong>⚠ ${esc(f.kind.replace(/_/g, ' '))}</strong><span>step ${f.step}: ${esc(f.detail)}</span></div>`).join('');
+  return `<div class="card table-card"><div class="card-pad card-head"><div><div class="eyebrow">Integrity &amp; quality</div><h3>Checkpoints · native vs deployed (${esc(metricName)})</h3></div><span class="tag">valid only with a committed manifest</span></div>${summary}${regress}<div class="table-wrap"><table style="min-width:980px"><thead><tr><th>Step</th><th>State</th><th>Native</th><th>GGUF F16</th><th>GGUF quant</th><th>Eval latency</th><th>Tokens seen</th><th>Checkpoint</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+
+/* ------------------------------------------------------------------- compare */
+async function loadCompareChoices() {
+  try {
+    const data = await api('/api/training/runs'); trRuns = data.runs;
+    const checked = new Set([...document.querySelectorAll('.cmp-pick:checked')].map(n => n.value));
+    trRender('cmp-choices', $('cmp-choices'), data.runs.map(r => `<label class="pick"><input type="checkbox" class="cmp-pick" value="${esc(r.id)}" ${checked.has(r.id) ? 'checked' : ''}> <strong>${esc(r.name)}</strong> <span class="sub">${esc(r.id.slice(0, 6))} · ${trNum(r.tokens.nonpad, 0)} tokens · ${esc(r.status)}</span></label>`).join('') || '<div class="empty">No runs to compare yet.</div>');
+    const opts = '<option value="">—</option>' + data.runs.map(r => `<option value="${esc(r.id)}">${esc(r.name)} (${esc(r.id.slice(0, 6))})</option>`).join('');
+    ['scale-ddp', 'scale-a', 'scale-b'].forEach(id => { const el = $(id), old = el.value; if (el.dataset.sig !== opts) { el.innerHTML = opts; el.dataset.sig = opts; el.value = old; } });
+  } catch (error) { $('cmp-choices').innerHTML = `<div class="error">${esc(error.message)}</div>`; }
+}
+async function runCompare() {
+  const ids = [...document.querySelectorAll('.cmp-pick:checked')].map(n => n.value);
+  const out = $('cmp-out');
+  if (ids.length < 2) { out.innerHTML = '<div class="error">Pick at least two runs.</div>'; return; }
+  if (ids.length > 4) { out.innerHTML = '<div class="error">Compare at most four runs so every run keeps its own colour.</div>'; return; }
+  try {
+    const budget = $('cmp-budget').value.trim();
+    const [cmp, ...curves] = await Promise.all([api(`/api/training/compare?ids=${ids.join(',')}${budget ? '&budget=' + encodeURIComponent(budget) : ''}`),
+      ...ids.map(id => api(`/api/training/runs/${encodeURIComponent(id)}/series?max_points=300`))]);
+    const names = Object.fromEntries(cmp.runs.map(r => [r.run_id, r.name]));
+    const chart = trChart({title: 'Training loss vs tokens seen', zero: false, xfmt: v => trNum(v / 1000, 0) + 'k', markers: cmp.budget_tokens ? [cmp.budget_tokens] : [],
+      series: ids.map((id, i) => ({name: names[id], color: TR_COLORS[i], pts: curves[i].steps.points.map(p => [p.cum_nonpad_tokens, p.loss])})), fmt: v => trNum(v, 3)});
+    const evalCell = (r, level) => { const lv = r.evals?.[level]?.default; return lv?.status === 'completed' ? Object.entries(lv.metrics).slice(0, 2).map(([k, v]) => `${esc(k)} ${trNum(v, 3)}`).join(' · ') : lv?.status === 'failed' ? '<span class="sub" style="color:var(--amber)">failed</span>' : '<span class="sub">—</span>'; };
+    const rows = cmp.runs.map(r => `<tr><td><strong>${esc(r.name)}</strong><div class="sub mono">${esc(r.config_hash)} · seed ${r.seed ?? '—'}</div></td><td>${r.reached_budget ? '' : '<span class="sub" style="color:var(--amber)">did not reach budget </span>'}${trNum(r.loss_at_budget, 4)}</td><td>${trNum(r.tokens_total, 0)}</td><td>${trNum(r.tokens_per_sec, 0)}</td><td>${trBytesShort(r.peak_mem_bytes)}</td><td>${r.checkpoint_step ?? '—'}</td><td>${evalCell(r, 'native')}</td><td>${evalCell(r, 'gguf_quant')}</td></tr>`).join('');
+    const verdicts = cmp.verdicts.map(v => `<div class="alert-row ${v.verdict === 'insufficient seeds' ? 'warning' : ''}"><strong>${esc(v.verdict)}</strong><span class="mono">${esc(v.a)} vs ${esc(v.b)}: Δloss ${trNum(v.delta_loss, 4)}${v.noise ? ' · seed noise ±' + trNum(v.noise, 4) : ''}</span></div>`).join('');
+    const diff = Object.entries(cmp.config_diff).map(([k, vals]) => `<tr><td class="mono">${esc(k)}</td>${ids.map(id => `<td>${esc(JSON.stringify(vals[id]))}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${ids.length + 1}" class="sub">Configurations are identical apart from seeds and names.</td></tr>`;
+    out.innerHTML = `<div class="alert-row"><strong>Equal budget</strong><span>Runs are compared at ${trNum(cmp.budget_tokens, 0)} input (non-padding) tokens: comparing at equal steps or wall time favours whichever run is cheaper per step. Differences need ≥3 seeds per configuration to be called real.</span></div><div class="chart-grid" style="margin:14px 0">${chart}<div class="card table-card"><div class="card-pad"><div class="eyebrow">Seed statistics</div></div><div class="table-wrap"><table style="min-width:420px"><thead><tr><th>Config</th><th>Seeds</th><th>Mean loss</th><th>Spread</th></tr></thead><tbody>${cmp.seed_groups.map(g => `<tr><td class="mono">${esc(g.config_hash)}</td><td>${g.n}${g.trustworthy ? '' : ' <span class="sub">(too few)</span>'}</td><td>${trNum(g.mean_loss, 4)}</td><td>${g.std_loss == null ? '—' : '± ' + trNum(g.std_loss, 4)}</td></tr>`).join('')}</tbody></table></div></div></div>${verdicts}<div class="card table-card" style="margin-top:14px"><div class="table-wrap"><table style="min-width:900px"><thead><tr><th>Run</th><th>Loss @ budget</th><th>Tokens total</th><th>Tokens / s</th><th>Peak VRAM</th><th>Checkpoint ≤ budget</th><th>Native</th><th>Deployed (quant)</th></tr></thead><tbody>${rows}</tbody></table></div></div><div class="card table-card" style="margin-top:14px"><div class="card-pad"><div class="eyebrow">Configuration differences</div></div><div class="table-wrap"><table style="min-width:600px"><thead><tr><th>Key</th>${ids.map(id => `<th>${esc(names[id])}</th>`).join('')}</tr></thead><tbody>${diff}</tbody></table></div></div>`;
+    trBind(out);
+  } catch (error) { out.innerHTML = `<div class="error">${esc(error.message)}</div>`; }
+}
+async function runScaling() {
+  const ddp = $('scale-ddp').value, a = $('scale-a').value, b = $('scale-b').value, out = $('scale-out');
+  if (!ddp || !a || !b) { out.innerHTML = '<div class="error">Choose the DDP run and both single-GPU baselines.</div>'; return; }
+  try {
+    const r = await api(`/api/training/scaling?ddp=${ddp}&baselines=${a},${b}`);
+    out.innerHTML = `<div class="metric-strip" style="margin-top:12px">${metric(r.scaling_efficiency == null ? 'n/a' : trPct(r.scaling_efficiency), 'Scaling efficiency', 'DDP ÷ (A alone + B alone)')}${metric(r.speedup_vs_fastest_single == null ? 'n/a' : trNum(r.speedup_vs_fastest_single, 2) + '×', 'Speed-up vs fastest single')}${metric(trNum(r.ddp_tokens_per_sec, 0), 'DDP tokens / s')}</div>`;
+  } catch (error) { out.innerHTML = `<div class="error">${esc(error.message)}</div>`; }
+}
+
+/* ---------------------------------------------------------------- evaluation */
+async function loadEvaluation() {
+  try {
+    const {stats, jobs, settings} = await api('/api/training/eval-queue');
+    const names = Object.fromEntries(trRuns.map(r => [r.id, r.name]));
+    const priority = j => j.flags.final ? 'final' : j.flags.best ? 'best' : j.flags.designated ? 'designated' : j.flags.latest ? 'latest' : 'routine';
+    const banner = settings.enabled ? `<div class="alert-row ${stats.depth >= 0.8 * stats.capacity ? 'warning' : ''}"><strong>Evaluation lane: ${esc(settings.lane)}</strong><span>The 9070 XT evaluates native, GGUF F16 and quantized GGUF levels in turn while training keeps the other card. A failed level is recorded, never skipped.</span></div>` : '<div class="alert-row warning"><strong>Evaluation is disabled</strong><span>Add an <span class="mono">[evaluation]</span> section (lane, base GGUFs, converter, commands) to the config to enable the pipeline. Results can still be recorded through the API.</span></div>';
+    trRender('eval', $('eval-out'), `${banner}<div class="metric-strip" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:14px 0">${metric(`${stats.depth} / ${stats.capacity}`, 'Queue depth', 'bounded & coalescing')}${metric(stats.running, 'Running')}${metric(stats.completed, 'Completed')}${metric(stats.failed, 'Failed')}${metric(stats.dropped_total, 'Coalesced away', 'routine checkpoints replaced by newer ones')}${metric(stats.rejected_total, 'Rejected')}${metric(stats.oldest_wait_s == null ? '—' : trSecs(stats.oldest_wait_s), 'Oldest wait')}${metric(stats.lag_steps == null ? '—' : trNum(stats.lag_steps, 0) + ' steps', 'Eval lag behind training')}</div><div class="card table-card"><div class="table-wrap"><table style="min-width:800px"><thead><tr><th>Run</th><th>Step</th><th>Priority</th><th>State</th><th>Attempts</th><th>Queued</th><th>Detail</th></tr></thead><tbody>${jobs.map(j => `<tr><td>${esc(names[j.run_id] || j.run_id.slice(0, 8))}</td><td>${j.step}</td><td><span class="tag">${priority(j)}</span></td><td>${trPill(j.state === 'queued' ? 'queued' : j.state === 'running' ? 'running' : j.state === 'completed' ? 'completed' : 'failed')}</td><td>${j.attempts}</td><td>${trTime(j.created_at)}</td><td class="sub">${esc(j.error || '')}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty">The queue is empty. Valid checkpoints are queued automatically when evaluation is enabled.</div></td></tr>'}</tbody></table></div></div>`);
+    const options = '<option value="">Run…</option>' + trRuns.map(r => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    if ($('ev-run').dataset.sig !== options) { const old = $('ev-run').value; $('ev-run').innerHTML = options; $('ev-run').dataset.sig = options; $('ev-run').value = old; }
+  } catch (error) { $('eval-out').innerHTML = `<div class="error">${esc(error.message)}</div>`; }
+}
+async function submitEval() {
+  try {
+    const r = await trPost('/api/training/eval-queue', {run_id: $('ev-run').value, step: Number($('ev-step').value), path: $('ev-path').value.trim(), final: $('ev-final').checked});
+    $('ev-msg').textContent = r.accepted ? (r.duplicate ? 'Already queued (priority merged).' : 'Queued.') : r.reason; delete trSig.eval; loadEvaluation();
+  } catch (error) { $('ev-msg').textContent = error.message; }
+}
+
+/* ---------------------------------------------------------------- benchmarks */
+async function loadBenchmarks() {
+  try {
+    const {benchmarks} = await api('/api/training/benchmarks');
+    trRender('bm-list', $('bm-list'), benchmarks.map(b => `<tr class="clickable ${b.id === bmSelected ? 'selected' : ''}" onclick="bmSelect('${esc(b.id)}')"><td><strong>${esc(b.name)}</strong></td><td>${esc(b.kind.replace(/_/g, ' '))}</td><td>${trPill(b.state)}</td><td>${trTime(b.created_at)}</td></tr>`).join('') || '<tr><td colspan="4"><div class="empty">No benchmarks yet. Sweeps recommend a configuration; they never change your training settings.</div></td></tr>');
+    if (!bmSelected && benchmarks[0]) bmSelected = benchmarks[0].id;
+    if (bmSelected) loadBenchmarkDetail(bmSelected);
+  } catch (error) { $('bm-list').innerHTML = `<tr><td colspan="4" class="error">${esc(error.message)}</td></tr>`; }
+}
+function bmSelect(id) { bmSelected = id; delete trSig['bm-list']; delete trSig['bm-detail']; loadBenchmarks(); }
+async function loadBenchmarkDetail(id) {
+  const b = await api('/api/training/benchmarks/' + encodeURIComponent(id)); if (id !== bmSelected) return;
+  const rep = b.report;
+  const recommended = rep?.recommended ? `<div class="alert-row"><strong>★ Recommended</strong><span class="mono">${esc(JSON.stringify(rep.recommended.params))} → ${trNum(rep.recommended.tokens_per_sec, 0)} tokens/s, peak ${trBytesShort(rep.recommended.peak_mem_bytes)}</span><span class="sub">${esc(rep.note)}</span></div>` : rep ? '<div class="alert-row warning"><strong>No recommendation</strong><span>No trial completed within the VRAM budget.</span></div>' : '';
+  const oom = rep?.oom_boundary?.length ? `<div class="alert-row warning"><strong>Memory ran out at</strong><span class="mono">${esc(rep.oom_boundary.map(p => JSON.stringify(p)).join('  ·  '))}</span></div>` : '';
+  const gc = rep?.gradient_checkpointing ? `<div class="alert-row"><strong>Gradient checkpointing</strong><span>saves ${trNum(rep.gradient_checkpointing.memory_saved_pct, 1)}% memory (${trBytesShort(rep.gradient_checkpointing.memory_saved_bytes)}) for +${trNum(rep.gradient_checkpointing.time_added_pct, 1)}% step time</span></div>` : '';
+  trRender('bm-detail', $('bm-detail'), `<div class="page-head" style="margin-top:14px"><div><h2 style="font-size:18px">${esc(b.name)} ${trPill(b.state)}</h2><p>${esc(b.kind.replace(/_/g, ' '))} · ${b.trials.length} trials × ${b.steps} steps</p></div>${['running', 'queued'].includes(b.state) ? `<button class="button danger" onclick="bmCancel('${esc(b.id)}')">Cancel</button>` : ''}</div>${recommended}${oom}${gc}<div class="card table-card" style="margin-top:12px"><div class="table-wrap"><table style="min-width:760px"><thead><tr><th>#</th><th>Parameters</th><th>Outcome</th><th>Tokens / s</th><th>Peak VRAM</th><th>Step time</th><th>Run</th></tr></thead><tbody>${b.trials.map(t => `<tr><td>${t.idx}</td><td class="mono">${esc(JSON.stringify(t.params))}</td><td>${trPill(t.state)}${t.error ? `<div class="sub">${esc(t.error.slice(0, 120))}</div>` : ''}</td><td>${trNum(t.result?.tokens_per_sec, 0)}</td><td>${trBytesShort(t.result?.peak_mem_bytes)}</td><td>${t.result?.step_time_ms == null ? '—' : trNum(t.result.step_time_ms, 0) + ' ms'}</td><td><a href="#" class="mono" onclick="trSelect('${esc(t.run_id)}');trSetTab('runs');return false">${esc(t.run_id.slice(0, 6))}</a></td></tr>`).join('')}</tbody></table></div></div>`);
+}
+async function bmCancel(id) { try { await trPost(`/api/training/benchmarks/${id}/cancel`); } catch (error) { alert(error.message); } }
+async function submitBenchmark() {
+  const msg = $('bm-msg'); msg.textContent = '';
+  try {
+    const command = JSON.parse($('bm-command').value), grid = JSON.parse($('bm-grid').value);
+    const gb = Number($('bm-budget').value);
+    const r = await trPost('/api/training/benchmarks', {name: $('bm-name').value || undefined, kind: $('bm-kind').value, command, grid, steps: Number($('bm-steps').value) || 60,
+      lanes: $('bm-lanes').value.split(',').map(x => x.trim()).filter(Boolean), vram_budget_bytes: gb ? gb * 1024 ** 3 : undefined});
+    bmSelected = r.id; delete trSig['bm-list']; delete trSig['bm-detail']; loadBenchmarks();
+  } catch (error) { msg.textContent = error.message; }
+}
+
+/* ------------------------------------------------------------------ forecast */
+const FORECAST_EXAMPLE = {base_model: 'org/model-3b', max_seq_length: 4096, per_device_train_batch_size: 2, bf16: true, lora_r: 16, gradient_checkpointing: false,
+  total_params: 3e9, trainable_params: 30e6, hidden_size: 3072, num_hidden_layers: 28, num_attention_heads: 24, vocab_size: 128256};
+async function loadForecast() {
+  try {
+    const lanes = (bootstrap?.catalog?.lanes) || [];
+    if (!$('fc-lane').options.length) $('fc-lane').innerHTML = lanes.map(l => `<option value="${esc(l.key)}">${esc(l.display)} · ${l.vram_gb} GB</option>`).join('');
+    if (!$('fc-config').value) $('fc-config').value = JSON.stringify(FORECAST_EXAMPLE, null, 2);
+    const {profiles} = await api('/api/training/profiles');
+    trRender('fc-profiles', $('fc-profiles'), profiles.map(p => `<tr><td class="mono">${esc(p.key.model || '—')}</td><td>${esc(p.key.seq_len ?? '—')}</td><td>${esc(p.key.microbatch ?? '—')}</td><td>${esc(p.key.precision || '—')}</td><td>r=${esc(p.key.lora_r ?? '—')}${p.key.gradient_checkpointing ? ' · ckpt' : ''}</td><td>${esc(p.gpu_pci_bus || '—')}</td><td>${trBytesShort(p.peak_mem_bytes)}</td><td>${trNum(p.tokens_per_sec, 0)}</td></tr>`).join('') || '<tr><td colspan="8"><div class="empty">No measured profiles yet. Each completed run records its measured peak here and replaces the estimate for that configuration.</div></td></tr>');
+  } catch (error) { console.error(error); }
+}
+async function runForecast() {
+  const out = $('fc-out');
+  try {
+    const config = JSON.parse($('fc-config').value);
+    const r = await trPost('/api/training/forecast', {lane: $('fc-lane').value, config, flash_attention: $('fc-flash').checked});
+    const est = r.estimate, comps = est?.components || {}, total = Object.values(comps).reduce((a, b) => a + b, 0) || 1;
+    const bars = Object.entries(comps).map(([k, v]) => `<div class="bar-row" style="grid-template-columns:170px 1fr 90px"><span class="bar-label">${esc(k.replace(/_/g, ' '))}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(1, v / total * 100)}%"></div></div><span class="bar-value">${trBytesShort(v)}</span></div>`).join('');
+    out.innerHTML = `<div class="alert-row ${r.fits === false ? 'error' : r.fits ? '' : 'warning'}"><strong>${r.fits == null ? '⚠ Cannot estimate' : r.fits ? '✓ Fits' : '✕ Does not fit'} on ${esc(r.lane)}</strong><span>${r.source === 'measured' ? 'Based on a MEASURED peak from a previous run with this exact configuration.' : 'Analytic ESTIMATE (a measured run with this configuration will replace it).'}${est && est.missing && est.missing.length ? ' Missing: ' + esc(est.missing.join(', ')) : ''}</span></div><div class="metric-strip" style="margin:14px 0">${metric(trBytesShort(r.peak_bytes), r.source === 'measured' ? 'Measured peak' : 'Estimated peak')}${metric(trBytesShort(r.budget_bytes), 'Budget', 'safety fraction of VRAM')}${metric(r.headroom_bytes == null ? '—' : trBytesShort(r.headroom_bytes), 'Headroom')}${metric(r.measured_tokens_per_sec == null ? '—' : trNum(r.measured_tokens_per_sec, 0), 'Measured tokens / s')}</div>${r.source === 'estimate' ? `<div class="bar-list" style="gap:10px">${bars}</div>${(est?.notes || []).map(n => `<div class="sub">⚠ ${esc(n)}</div>`).join('')}` : ''}`;
+  } catch (error) { out.innerHTML = `<div class="error">${esc(error.message)}</div>`; }
+}
+
+/* ------------------------------------------------------------------ hardware */
+function hwTempRow(label, v, limit) { const hot = v != null && v >= limit; return `<div class="metric-box"><b ${hot ? 'style="color:var(--red)"' : ''}>${trTemp(v)}${hot ? ' ⚠' : ''}</b><span>${label}</span></div>`; }
+function hwCard(g, holders) {
+  const l = g.latest, holder = holders?.[g.lane];
+  const lease = holder ? `<span class="tag ${holder.kind === 'training' ? 'ok' : ''}" title="${esc(holder.holder)}">${esc(holder.kind)}: ${esc(holder.holder.replace(/^[a-z]+:/, '').slice(0, 10))}</span>` : '<span class="tag">free</span>';
+  if (!l) return `<div class="card card-pad"><div class="eyebrow">${esc(g.lane || 'unassigned lane')}</div><h3>${esc(g.name)}</h3><div class="empty">Waiting for the first sample…</div></div>`;
+  const total = l.vram_total_bytes || g.vram_total_bytes, used = l.vram_used_bytes, frac = total && used != null ? used / total : null, un = l.unavailable || {};
+  const hist = g.history, t0 = hist.length ? hist[0].ts : 0, hs = key => hist.map(p => [p.ts - t0, p[key]]), span = hist.length ? Math.max(...hist.map(p => p.ts - t0)) : 0;
+  const narrow = l.pcie_width != null && l.pcie_max_width && String(l.pcie_width) !== String(l.pcie_max_width);
+  return `<div class="card card-pad"><div class="card-head"><div><div class="eyebrow">${esc(g.lane || 'unassigned lane')} · <span class="mono">${esc(g.pci_bus)}</span></div><h3>${esc(g.name)}</h3></div><div style="display:flex;gap:6px;align-items:center">${lease}<span class="tag ${l.gpu_busy_pct > 50 ? 'ok' : ''}">${l.gpu_busy_pct == null ? 'busy n/a' : trNum(l.gpu_busy_pct, 0) + '% busy'}</span></div></div>
+    <div class="sub">VRAM ${trBytesShort(used)} / ${trBytesShort(total)}</div><div class="hw-bar ${frac > .92 ? 'hot' : ''}"><i style="width:${frac == null ? 0 : (frac * 100).toFixed(1)}%"></i></div>
+    <div class="metric-strip" style="margin-top:12px">${hwTempRow('Edge', l.temp_edge_c, 100)}${hwTempRow('Junction', l.temp_junction_c, 100)}${hwTempRow('Memory', l.temp_memory_c, 90)}${metric(l.power_w == null ? 'n/a' : trNum(l.power_w, 0) + ' W', 'Board power')}</div>
+    <div class="metric-strip" style="margin-top:10px">${metric(l.sclk_mhz == null ? 'n/a' : trNum(l.sclk_mhz, 0) + ' MHz', 'Core clock')}${metric(l.mclk_mhz == null ? 'n/a' : trNum(l.mclk_mhz, 0) + ' MHz', 'Memory clock')}${metric(l.gtt_used_bytes == null ? 'n/a' : bytes(l.gtt_used_bytes), 'GTT used', 'spill indicator')}${metric(l.pcie_speed ? l.pcie_speed.replace(' PCIe', '') + ' x' + (l.pcie_width ?? '?') : 'n/a', 'PCIe link', narrow ? '⚠ narrower than max x' + l.pcie_max_width : '')}</div>
+    ${l.throttle_status != null ? `<div class="sub" style="margin-top:8px">⚠ throttle status reported by AMD SMI: ${esc(JSON.stringify(l.throttle_status))}</div>` : ''}
+    ${Object.keys(un).length ? `<div class="sub" style="margin-top:8px" title="${esc(Object.entries(un).map(([k, v]) => k + ': ' + v).join('\n'))}">${Object.keys(un).length} sensor(s) not exposed by this card/driver (hover for details)${(l.amd_smi_fields || []).length ? ' · filled from AMD SMI: ' + esc(l.amd_smi_fields.join(', ')) : ''}</div>` : ''}
+    <div class="chart-grid" style="grid-template-columns:1fr 1fr;margin:12px 0 0">${trChart({title: 'GPU busy (%)', w: 300, h: 130, zero: true, xfmt: v => '-' + trSecs(span - v), series: [{name: 'busy', pts: hs('gpu_busy_pct')}], fmt: v => trNum(v, 0)})}${trChart({title: 'Temperature (°C)', w: 300, h: 130, xfmt: v => '-' + trSecs(span - v), series: [{name: 'memory', pts: hs('temp_memory_c')}, {name: 'junction', pts: hs('temp_junction_c')}], fmt: v => trNum(v, 0), empty: 'No temperature sensors exposed.'})}</div></div>`;
+}
+async function loadHardware() {
+  try {
+    const data = await api('/api/hardware'), hw = data.hardware;
+    $('hw-note').innerHTML = hw.available ? '' : `<div class="card card-pad" style="margin-bottom:14px"><div class="eyebrow">GPU telemetry unavailable</div><p class="section-copy" style="margin:6px 0 0">${esc(hw.unavailable_reason || 'No GPUs discovered.')} Hardware readings come from the Linux amdgpu sysfs interface, so run this dashboard on the Linux training machine to see them.</p></div>`;
+    $('hw-cards').innerHTML = hw.gpus.map(g => hwCard(g, data.lane_holders)).join(''); trBind($('hw-cards'));
+    const s = hw.sampler, kf = data.kernel_faults, sys = hw.system, smi = hw.amd_smi;
+    $('hw-sampler').innerHTML = `<div class="card-head"><div><div class="eyebrow">Host &amp; monitoring overhead</div><h3>Sampler health</h3></div></div><div class="metric-strip" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">${metric(sys && sys.cpu_pct != null ? trNum(sys.cpu_pct, 0) + '%' : 'n/a', 'Host CPU', sys && sys.ram_used_pct != null ? 'RAM ' + trNum(sys.ram_used_pct, 0) + '% used' : '')}${metric(trNum(s.ticks, 0), 'Samples taken', `every ${hw.interval_s}s`)}${metric(trNum(s.avg_sample_ms, 2) + (s.avg_sample_ms == null ? '' : ' ms'), 'Avg sample time', `max ${trNum(s.max_sample_ms, 2)} ms`)}${metric(trNum(s.dropped_ticks, 0), 'Dropped ticks', 'intervals that overran')}${metric(kf.active ? 'Watching' : 'Inactive', 'Kernel fault log', kf.active ? 'amdgpu resets / page faults' : (kf.reason || ''))}${metric(smi ? (smi.available ? 'Active' : 'Unavailable') : 'Off', 'AMD SMI', smi && !smi.available ? (smi.reason || '').slice(0, 60) : 'fills sensors sysfs lacks')}</div>`;
+  } catch (error) { $('hw-note').innerHTML = `<div class="error">${esc(error.message)}</div>`; }
+}
+
+/* ------------------------------------------------------------------ Service page */
+let serviceInfo = null, settingsDirty = false, svcTimer = null;
+const svcAge = s => s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.floor(s % 3600 / 60)} min` : s >= 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s} s`;
+function svcMsg(text, isError) { const node = $('svc-msg'); node.className = isError ? 'error' : 'sub'; node.textContent = text; }
+function serviceStatusChanged(status) { renderOrphanBanner(status); renderServiceModels(status); }
+
+function renderOrphanBanner(status) {
+  const orphans = status.orphans || [], box = $('orphan-banner');
+  box.classList.toggle('hidden', !orphans.length);
+  box.innerHTML = orphans.length
+    ? `<div><strong>${orphans.length} model server${orphans.length > 1 ? 's are' : ' is'} running that this service does not manage</strong><div class="sub">${orphans.map(o => `PID ${esc(o.pid)} on port ${esc(o.port)} (${esc(o.lane)})`).join(' · ')}. Left over from an earlier run; still holding GPU memory and RAM.</div></div><button class="button danger" onclick="stopOrphans()">Stop them</button>`
+    : '';
+}
+
+/* Stopping models. Running requests get up to 30 s to finish; the notice says so and offers Stop now. */
+function showNotice(text, {stopNow = false, error = false} = {}) {
+  const box = $('notice');
+  box.className = 'banner' + (error ? ' error-banner' : '');
+  box.innerHTML = `<div>${esc(text)}</div>${stopNow ? '<button class="button danger" onclick="stopNow()">Stop now</button>' : ''}${error ? '<button class="button" onclick="hideNotice()">Dismiss</button>' : ''}`;
+}
+function hideNotice() { const box = $('notice'); box.className = 'banner hidden'; box.innerHTML = ''; }
+function runningRequests() {
+  const servers = (window.lastStatus && window.lastStatus.servers) || [];
+  return servers.reduce((total, server) => total + (server.inflight || 0), 0);
+}
+async function stopModels(body, label) {
+  const busy = runningRequests();
+  showNotice(busy ? `${label} Waiting for ${busy} running request${busy > 1 ? 's' : ''} to finish (up to 30 s).` : label, {stopNow: busy > 0});
+  try { await api('/api/unload', {method: 'POST', body: JSON.stringify(body)}); await refreshStatus(); hideNotice(); }
+  catch (error) { showNotice(error.message, {error: true}); }
+}
+function unload() { return stopModels({}, 'Unloading models.'); }
+function unloadLane(lane) { return stopModels({lane}, 'Unloading.'); }
+function stopOrphans() { return stopModels({orphans_only: true}, 'Stopping leftover servers.'); }
+async function stopNow() {
+  try { await api('/api/unload', {method: 'POST', body: JSON.stringify({force: true})}); await refreshStatus(); }
+  catch (error) { showNotice(error.message, {error: true}); }
+}
+
+function renderServiceModels(status) {
+  const box = $('svc-models'); if (!box) return;
+  const servers = status.servers || [], orphans = status.orphans || [];
+  const rows = servers.map(s => `<div class="svc-row"><div><strong>${esc(s.model)}</strong>
+      <div class="sub">${esc((s.lane_keys || []).join(' + '))} · ${esc(s.device)} · ${number(s.context_window)} ctx · ${s.alive ? (s.inflight ? `answering ${esc(s.inflight)} request${s.inflight > 1 ? 's' : ''}` : 'idle') : '<span class="error">stopped</span>'}${s.runtime ? ` · llama.cpp ${esc(s.runtime.build ?? s.runtime.version)} (${esc(s.runtime.source)})` : ''}</div>
+      <div class="sub">${s.resident_gb != null ? `${esc(s.resident_gb)} GB in VRAM` : ''}${s.evictions ? ` · paged out to RAM ${esc(s.evictions)}×` : ''}${s.rewarmed_at ? ` · last paged back in ${esc(s.rewarmed_at)}` : ''}</div></div>
+      <button class="button" onclick="unloadLane('${esc((s.lane_keys || [])[0] || s.target)}')">Unload</button></div>`);
+  const stray = orphans.map(o => `<div class="svc-row orphan"><div><strong>Not managed by this service</strong><div class="sub">PID ${esc(o.pid)} · port ${esc(o.port)} · lane ${esc(o.lane)}</div></div><button class="button danger" onclick="unloadLane('${esc(o.lane)}')">Stop</button></div>`);
+  box.innerHTML = rows.concat(stray).join('') || '<div class="sub">No model is loaded.</div>';
+}
+
+function renderServiceProcess() {
+  const i = serviceInfo; if (!i) return;
+  $('svc-pid').textContent = i.pid; $('svc-uptime').textContent = svcAge(i.uptime_seconds);
+  $('svc-address').textContent = `http://${i.host === '0.0.0.0' ? '127.0.0.1' : i.host}:${i.port}`;
+  $('svc-config').textContent = i.config_path; $('svc-data').textContent = i.data_dir;
+  $('svc-state').textContent = i.pending ? i.pending + '…' : 'running';
+  $('svc-state').className = 'tag ' + (i.pending ? '' : 'ok');
+  $('svc-restart').disabled = $('svc-stop').disabled = !i.can_restart || Boolean(i.pending);
+}
+
+async function loadService() {
+  try {
+    const [info, cfg] = await Promise.all([api('/api/service'), settingsDirty ? null : api('/api/settings')]);
+    serviceInfo = info; renderServiceProcess();
+    if (cfg) renderSettings(cfg);
+    if (window.lastStatus) renderServiceModels(window.lastStatus);
+  } catch (error) { svcMsg(error.message, true); }
+}
+
+async function serviceAction(action) {
+  const reload = action === 'restart' && $('svc-reload').checked;
+  const question = action === 'restart'
+    ? `Restart the service? Loaded models stop${reload ? ' and are loaded again afterwards' : ''}. This page reconnects by itself.`
+    : 'Stop the service? All models stop and this page goes offline until you start the service again (python launch_service.py).';
+  if (!confirm(question)) return;
+  const oldPid = serviceInfo ? serviceInfo.pid : null;
+  svcMsg('Stopping models…');
+  try { await api('/api/service/' + action, {method: 'POST', body: JSON.stringify({reload_models: reload})}); }
+  catch (error) { svcMsg(error.message, true); return; }
+  if (action === 'stop') { svcMsg('The service has stopped. Start it again with: python launch_service.py'); return; }
+  svcMsg('Restarting…');
+  waitForRestart(oldPid);
+}
+function waitForRestart(oldPid) {
+  const started = Date.now();
+  const timer = setInterval(async () => {
+    try {
+      const response = await fetch('/api/service', {cache: 'no-store'});
+      if (response.ok) {
+        const info = await response.json();
+        if (info.pid && info.pid !== oldPid) { clearInterval(timer); svcMsg('Back online. Reloading this page…'); setTimeout(() => location.reload(), 400); return; }
+      }
+    } catch (error) { /* the old process is gone and the new one is not listening yet */ }
+    if (Date.now() - started > 120000) { clearInterval(timer); svcMsg('The service did not come back within 2 minutes. Start it with: python launch_service.py', true); }
+  }, 1000);
+}
+
+function settingField(setting) {
+  const id = 'set-' + setting.key; let input;
+  if (setting.type === 'bool') input = `<input id="${id}" data-key="${esc(setting.key)}" type="checkbox" ${setting.value ? 'checked' : ''}>`;
+  else if (setting.type === 'choice') input = `<select id="${id}" data-key="${esc(setting.key)}">${setting.choices.map(c => `<option ${c === setting.value ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
+  else input = `<input id="${id}" data-key="${esc(setting.key)}" type="number" min="${esc(setting.min)}" max="${esc(setting.max)}" step="${setting.type === 'int' ? 1 : 'any'}" value="${esc(setting.value)}">`;
+  const when = setting.apply === 'live' ? 'applies now' : 'applies on next model load';
+  return `<label class="setting-row"><span><strong>${esc(setting.label)}</strong> <span class="tag ${setting.apply === 'live' ? 'ok' : ''}">${when}</span><span class="sub" style="display:block">${esc(setting.help)}</span></span>${input}</label>`;
+}
+function renderSettings(cfg) {
+  settingsDirty = false;
+  $('svc-settings').innerHTML = `<div class="card-head"><div><div class="eyebrow">Policy</div><h3>Loading &amp; memory settings</h3><p class="section-copy">Saved to ${esc(cfg.config_path)} (a copy of the original is kept next to it as .bak).</p></div><button class="button primary" onclick="saveSettings()">Save settings</button></div><div id="svc-fields" class="form-stack">${cfg.settings.map(settingField).join('')}</div><div id="svc-settings-msg" class="sub" style="margin-top:10px"></div>`;
+  document.querySelectorAll('#svc-fields [data-key]').forEach(node => node.addEventListener('input', () => { settingsDirty = true; }));
+}
+async function saveSettings() {
+  const values = {};
+  document.querySelectorAll('#svc-fields [data-key]').forEach(node => {
+    values[node.dataset.key] = node.type === 'checkbox' ? node.checked : node.tagName === 'SELECT' ? node.value : Number(node.value);
+  });
+  try {
+    const result = await api('/api/settings', {method: 'POST', body: JSON.stringify({values})});
+    renderSettings(result);
+    const later = result.next_load.length ? ` ${result.next_load.join(', ')} take${result.next_load.length === 1 ? 's' : ''} effect when a model is next loaded; reload the loaded models to use ${result.next_load.length === 1 ? 'it' : 'them'} now.` : '';
+    $('svc-settings-msg').textContent = result.changed.length ? `Saved ${result.changed.length} setting${result.changed.length === 1 ? '' : 's'}.${later}` : 'Nothing changed.';
+  } catch (error) { $('svc-settings-msg').innerHTML = `<span class="error">${esc(error.message)}</span>`; }
+}
+async function refreshServiceInfo() {
+  try { serviceInfo = await api('/api/service'); renderServiceProcess(); } catch (error) { /* restarting */ }
+}
+
+(function () {
+  const base = showView;
+  showView = function (view) {
+    base(view);
+    $('page-title').textContent = {training: 'Training', hardware: 'Hardware', service: 'Service'}[view] || $('page-title').textContent;
+    clearInterval(trTimer); clearInterval(hwTimer); clearInterval(svcTimer);
+    if (view === 'training') { trRefresh(true); trTimer = setInterval(() => trRefresh(false), 5000); }
+    if (view === 'hardware') { loadHardware(); hwTimer = setInterval(loadHardware, 2000); }
+    if (view === 'service') { loadService(); svcTimer = setInterval(refreshServiceInfo, 5000); }
+    if (location.hash.slice(1).split('/')[0] !== view) history.replaceState(null, '', '#' + view);
+  };
+  /* Deep links: #training | #training/<run id> | #training/<tab> | #training/compare/<id,id,...> | #hardware */
+  const [initial, second, third] = location.hash.slice(1).split('/');
+  const tabs = ['runs', 'compare', 'evaluation', 'benchmarks', 'forecast'];
+  if (second && !tabs.includes(second)) trSelected = second;
+  if (['training', 'hardware', 'service'].includes(initial)) {
+    showView(initial);
+    if (initial === 'training' && tabs.includes(second)) {
+      trSetTab(second);
+      if (second === 'compare' && third) {
+        const ids = third.split(',');
+        loadCompareChoices().then(() => { document.querySelectorAll('.cmp-pick').forEach(n => { n.checked = ids.includes(n.value); }); runCompare(); });
+      }
+    }
+  }
+})();
 </script>
 </body>
 </html>

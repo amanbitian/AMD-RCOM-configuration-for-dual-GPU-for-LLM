@@ -16,6 +16,15 @@ start_timeout_seconds = 900
 [discovery]
 lmstudio_home = "C:/Users/user/.lmstudio"
 models_dir = "G:/LLM models"
+# llama-server per backend. Official llama.cpp release (github.com/ggml-org/llama.cpp/releases,
+# "Windows x64 (ROCm)" zip, which bundles its own HIP DLLs); keep the build number in the folder
+# name so runs are reproducible. Delete a line to fall back to LM Studio's newest bundled runtime.
+# On Linux: backend_server_binaries = { rocm = "/opt/llama.cpp/build/bin/llama-server" }
+backend_server_binaries = { rocm = "F:/llama.cpp/b11699-rocm/llama-server.exe" }
+# Models split across both GPUs run on LM Studio's runtime: b11699 serves each card correctly on
+# its own but produces garbage whenever a model spans R9700 + 9070 XT (any split ratio or mode).
+# Set to "configured" once a build passes the split check (CHANGELOG 2026-10-17).
+multi_gpu_runtime = "lmstudio"
 
 [policy]
 vram_safety_fraction = 0.90
@@ -36,11 +45,30 @@ jinja = true
 kill_busy_ports = true
 health_poll_seconds = 1.0
 settle_seconds_after_restart = 2.0
+# Host RAM per llama-server (measured on Qwen3-8B, R9700): llama.cpp's defaults keep a resident
+# copy of the weights (~1x the model) and a prompt cache that grows ~4 GB per 20 new prompts up
+# to 8 GiB. "none" + 0 hold ~0.6 GB flat at the same speed; same-conversation prompt reuse
+# still works from the GPU KV cache. Raise cache_ram_mib if many conversations interleave.
+load_mode = "none"        # none | mmap | auto (llama.cpp default)
+cache_ram_mib = 0         # 0 = no prompt cache in RAM
+# GPU-only placement: never start a server whose weights + KV cache + headroom exceed the VRAM
+# the GPU reports free (Windows would otherwise back the rest with system RAM).
+vram_admission = true
+vram_headroom_gb = 1.0
+# OpenAI gateway: a request whose "model" is a catalog model loads it on demand, evicting the
+# least recently used idle model(s). Busy models are never stopped; the caller gets 503 + retry.
+auto_load_models = true
+# Windows can move an idle server's VRAM into system RAM (measured: 16.85 GB -> 0 GB resident,
+# next request 10 s). The guard re-warms such servers on a reserved slot (servers start with
+# --parallel 2 --kv-unified; real requests stay on slot 0). Set false to keep one plain slot.
+residency_guard = true
+residency_check_seconds = 15
 
 [[lanes]]
 key = "r9700"
 display = "AMD Radeon AI PRO R9700"
 match = "R9700"
+# pci_bus = "0000:03:00.0"   # optional: stable GPU identity for training telemetry (see lspci)
 vram_gb = 32
 port = 8081
 backend = "rocm"
@@ -52,6 +80,20 @@ match = "9070 XT"
 vram_gb = 16
 port = 8082
 backend = "rocm"
+
+# Checkpoint evaluation on a spare lane (see docs/TRAINING_TELEMETRY.md, "Using it").
+# [evaluation]
+# enabled = true
+# lane = "9070xt"
+# base_model = "Qwen/Qwen2.5-3B-Instruct"
+# base_f16_gguf = "G:/models/qwen-3b-f16.gguf"
+# base_quant_gguf = "G:/models/qwen-3b-Q4_K_M.gguf"
+# converter_script = "G:/llama.cpp/convert_lora_to_gguf.py"
+# native_command = ["python", "eval_native.py", "--adapter", "{adapter_dir}", "--out", "{output_json}"]
+# gguf_command = ["python", "eval_gguf.py", "--base-url", "{base_url}", "--out", "{output_json}"]
+# designate_every = 3
+# [evaluation.peak_tflops]   # optional, enables the MFU estimate
+# r9700 = 96.0
 
 [[models]]
 name = "gpt-oss-20b-GGUF"
