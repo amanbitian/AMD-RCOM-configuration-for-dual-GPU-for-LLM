@@ -29,7 +29,8 @@ def gateway(tmp_path):
         capture=Mock(side_effect=AssertionError("Blocking GPU sampling on request path")),
     )
     manager = SimpleNamespace(lock=threading.Lock(), state="ready", handles={"r9700": handle},
-                              deployment_id=None, mode="single_gpu", sampler=sampler, config=config)
+                              deployment_id=None, mode="single_gpu", sampler=sampler, config=config,
+                              _mark_dead_lanes=lambda: None, knows_model=lambda _name: False)
     state = SimpleNamespace(config=config, store=store, manager=manager,
                             chat=app.ChatService(manager, store))
     handler = object.__new__(app.RequestHandler)
@@ -372,6 +373,75 @@ def test_completions_stream_passthrough_emits_full_done_event(gateway, monkeypat
                                       {"prompt": "a", "stream": True})
     assert handler.wfile.getvalue() == wire  # full stream incl. [DONE]'s terminating blank line
     assert store.count_runs() == 0
+
+
+def test_autocomplete_records_project_usage(gateway, monkeypatch, tmp_path):
+    handler, store, _ = gateway
+    ledger = app.UsageLedger(tmp_path / "u.sqlite3", enabled=True, flush_interval=100)
+    handler.server.app_state.chat.usage = ledger
+    body = json.dumps({"choices": [{"text": "x"}],
+                       "usage": {"prompt_tokens": 12, "completion_tokens": 4}}).encode()
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(body)))
+    handler._proxy_openai_completions("/v1/r9700/autocomplete/completions", {"prompt": "def f():"})
+    rows = ledger.query()
+    assert len(rows) == 1
+    assert rows[0]["connection_type"] == "autocomplete"
+    assert rows[0]["requests"] == 1
+    assert rows[0]["input_tokens"] == 12 and rows[0]["output_tokens"] == 4
+    ledger.close()
+
+
+def test_gateway_chat_records_usage_under_self_tagged_connection_type(gateway, monkeypatch, tmp_path):
+    handler, store, _ = gateway
+    ledger = app.UsageLedger(tmp_path / "u.sqlite3", enabled=True, flush_interval=100)
+    handler.server.app_state.chat.usage = ledger
+    handler.headers = {"X-DGPU-Connection-Type": "training"}  # any pipeline can self-tag
+    result = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 7, "completion_tokens": 3}}
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(json.dumps(result).encode())))
+    handler._proxy_openai_chat("/v1/r9700/developer/chat/completions",
+                               {"messages": [{"role": "user", "content": "hi"}]})
+    rows = ledger.query()
+    assert any(r["connection_type"] == "training" and r["requests"] == 1
+               and r["input_tokens"] == 7 and r["output_tokens"] == 3 for r in rows)
+    ledger.close()
+
+
+def _run_chat(handler, monkeypatch, headers):
+    handler.headers = headers
+    result = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(json.dumps(result).encode())))
+    handler._proxy_openai_chat("/v1/r9700/developer/chat/completions", {"messages": []})
+
+
+def test_unregistered_bearer_key_becomes_a_project_without_401(gateway, monkeypatch):
+    handler, store, _ = gateway
+    _run_chat(handler, monkeypatch, {"Authorization": "Bearer my-cool-repo"})  # not registered
+    run = store.recent(1)[0]
+    assert run["status"] == "completed"  # no 401 for an unknown key
+    assert store.get_project(run["project_id"])["name"] == "my-cool-repo"  # auto-created
+
+
+def test_project_header_auto_creates_and_attributes(gateway, monkeypatch):
+    handler, store, _ = gateway
+    _run_chat(handler, monkeypatch, {"X-DGPU-Project": "TeamAlpha"})
+    assert store.get_project(store.recent(1)[0]["project_id"])["name"] == "TeamAlpha"
+
+
+def test_anonymous_request_lands_in_the_default_project(gateway, monkeypatch):
+    handler, store, _ = gateway
+    _run_chat(handler, monkeypatch, {})  # nothing identifying -> watertight default
+    assert store.get_project(store.recent(1)[0]["project_id"])["name"] == "unassigned"
+
+
+def test_registered_client_id_still_resolves_to_its_project(gateway):
+    handler, store, _ = gateway
+    reg = store.register_client("RegisteredRepo", None, "/tmp/out.jsonl")
+    handler.headers = {"Authorization": f"Bearer {reg['client_id']}"}
+    project_id, client = handler._resolve_project()
+    assert client["id"] == reg["client_id"]
+    assert project_id == reg["project_id"]
 
 
 def test_fully_cached_prompt_and_zero_completion_are_not_missing():

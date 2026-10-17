@@ -1,5 +1,8 @@
 # API Contract
 
+> For what the app is, its features, limits and what to expect, see [app_overview.md](app_overview.md), the
+> source of truth for scope. This document is the authority for exact request and response shapes.
+
 Formal request/response contract for every HTTP endpoint [app.py](app.py) exposes. For a
 narrative walkthrough of the client-integration flow specifically, see
 [CLIENT_API.md](CLIENT_API.md); this document is the exhaustive reference — every field this
@@ -15,7 +18,9 @@ started it) runs [launch_service.py](launch_service.py) as a one-shot command, n
 always-on daemon: `python launch_service.py --config <path>`. It's idempotent (a no-op if
 already running) and exits once the service is confirmed healthy or has failed to start —
 it never itself stays resident. See [CLIENT_API.md](CLIENT_API.md#0-make-sure-the-service-is-actually-running)
-for the full example.
+for the full example. Run from a terminal it also opens the UI in your browser (a program
+calling it gets no browser; `--open-browser` / `--no-browser` override). Once running, the service
+can be restarted or stopped over HTTP (see [Service control](#service-control)).
 
 ## Conventions
 
@@ -27,8 +32,13 @@ for the full example.
   bound host/port can call any endpoint. Do not bind `--host` beyond `127.0.0.1`/`localhost`
   without your own network-level access control.
 - Error shape is the same everywhere: `{"error": "<message>"}` with an HTTP status code
-  (`400` bad input, `404` not found, `409` a deployment change is already in progress, `413`
-  body too large, `500` unexpected failure).
+  (`400` bad input, `404` not found, `409` a deployment change or service action is already in
+  progress, `413` body too large, `415` a control endpoint needs `Content-Type: application/json`,
+  `500` unexpected failure, `501` service control is not available in this process, `503` the model
+  cannot be served right now: all GPUs busy or not enough free VRAM, so retry later).
+- **Release what you load.** The service keeps a model on the GPU until something unloads it. An
+  application that loaded a model for a task must release it when the task is done; see
+  [Releasing the GPUs when a task is done](#releasing-the-gpus-when-a-task-is-done).
 - Fields marked **required** cause a `400` with a descriptive message if missing or invalid.
   Fields marked **optional** have the stated default when omitted.
 
@@ -61,6 +71,9 @@ Current deployment state and the latest resource sample. No input.
   "error": "string | null",
   "profile": { /* the deploy request that produced the current state, or null */ },
   "deployment_id": "uuid | null",
+  // llama-server processes on a lane port that this service does not manage (e.g. left behind by an
+  // instance that was killed). They still hold VRAM and RAM. Scanned at most every 10 s.
+  "orphans": [{"lane": "<lane_key>", "port": "int", "pid": "int"}],
   "servers": [
     {
       "target": "primary | <lane_key>",
@@ -71,7 +84,14 @@ Current deployment state and the latest resource sample. No input.
       "pid": "int | null",
       "alive": "bool",
       "context_window": "int",
-      "reasoning_budget": "int"
+      "reasoning_budget": "int",
+      // the llama-server build serving this target; also stored in each run's configuration
+      "runtime": {"binary": "path", "source": "llama.cpp | lmstudio", "version": "string", "build": "int | null", "commit": "string"} | null,
+      // residency guard (Windows): VRAM resident at the last check, times found paged out to RAM, last re-warm
+      "inflight": "int (requests being answered now; Unload waits for them)",
+      "resident_gb": "float | null",
+      "evictions": "int",
+      "rewarmed_at": "ISO-8601 timestamp | null"
     }
   ],
   "metrics": {
@@ -313,7 +333,8 @@ loaded first**: there is one active deployment at a time.
 **Errors:** `400` unsupported mode, unknown model/lane, model (or model + estimated KV cache)
 doesn't fit the lane, model is pinned to a different lane, invalid context/budget; `409`
 another deployment change is already in progress; `500` one or more servers failed to start
-(message includes each failure).
+(message includes each failure), including `Not enough free VRAM to keep <model> on the GPU ...`
+when the model would not fit the VRAM free on its GPU (`policy.vram_admission`).
 
 ## POST `/api/models/refresh`
 
@@ -337,10 +358,136 @@ Re-scans configured model paths and the LM Studio model directory for new/remove
 
 ## POST `/api/unload`
 
-Stops every active server and returns to `idle`.
+Frees GPU memory.
 
-**Needs:** nothing (body ignored). **Shares:** same shape as `GET /api/status`.
-**Errors:** `409` if another deployment change is already in progress.
+**Needs:** an optional JSON body.
+- `{}` (nothing): stops every active server **and** any leftover llama-server holding a lane port,
+  then returns to `idle`.
+- `{"lane": "<lane_key>"}`: stops only what serves that lane (a model split across both GPUs also
+  frees its other GPU, and a leftover server on that lane's port is stopped too). The other lane keeps
+  running and the profile is updated; with nothing left the state is `idle`. The reply carries
+  `"released": true` when a model was stopped and `false` when the lane had nothing loaded.
+- `{"lane": "<lane_key>", "model": "<model>"}`: the same, but only if `<model>` is still what serves
+  that lane. `<model>` is the string you deployed with (a catalog name or id) or the resolved model
+  name. If the lane is empty or another model has replaced yours, nothing is stopped and the reply
+  carries `"released": false`. This is how a client releases only its own model. `model` without `lane`
+  is a `400`.
+- `{"orphans_only": true}`: stops only the leftover servers and keeps every loaded model.
+
+**Running requests.** A model that is answering a request gets `policy.drain_timeout_seconds` (30 s) to
+finish before it is stopped, so one client's unload does not cut another client's answer. The status
+shows `state: "switching"` meanwhile, and each server reports `inflight` (requests it is answering).
+`{"force": true}` ends that wait: if an unload or load is already waiting, it is told to stop waiting and
+the call returns at once; otherwise the models are stopped immediately, cutting any request in progress
+(the client sees a closed connection). Combine with `lane` to force one GPU.
+
+**Shares:** same shape as `GET /api/status`, plus `"released": bool` for a lane-scoped unload.
+**Errors:** `400` unknown lane, or `model` without `lane`; `409` if another deployment change is
+already in progress.
+
+## Releasing the GPUs when a task is done
+
+**Requirement for every client application.** The service never unloads a model because a task ended
+(there is no idle timeout). A model stays in GPU memory, with a host process holding some RAM, until
+something unloads it, replaces it, or the service stops. An application that loaded a model for a task
+(through `/api/deploy`, `/api/clients/deploy*`, or a gateway request that loaded it on demand) **must
+release it when the task is complete.**
+
+1. **When.** After the last request of the task has finished and any streamed response has ended, on
+   success **and** on failure (use `finally`). Not between the requests of one task: loading a model
+   again takes seconds to tens of seconds.
+2. **What.** Only what you loaded. For each lane you used, send
+   `POST /api/unload {"lane": "<lane>", "model": "<the model you deployed>"}`. The lane is in the deploy
+   reply (`servers[].lane_keys`); for a model split across both GPUs either lane releases both.
+3. **Never the bare form.** `POST /api/unload {}` stops every model, including other applications', and
+   so does `{"force": true}`. Use them only if you are certain you are the service's only user, or when
+   a person asks for it.
+4. **Outcomes.** `200` with `released: true`: done. `200` with `released: false`: the lane was empty
+   or another application's model is there now; nothing to do, do not retry. `409` (a load or unload
+   is in progress): retry after about 2 s, a few times. `400`: a bug in the caller.
+5. **Per-lane queues** (`/api/clients/deploy_lane`): release each lane when that lane's queue is empty.
+   Do not wait for the other lane.
+6. **Tools that cannot call HTTP** (Cline, OpenCode, Continue): whoever starts the session releases the
+   models at its end, from the dashboard (Service, or the top-bar Unload) or with the call above.
+
+A graceful unload waits up to `policy.drain_timeout_seconds` for requests still running on that lane (which
+may be another application's) before it stops the model, so unloading right after your own last response
+is safe. GPU memory is freed within seconds of the reply; a following load waits up to 20 s for it.
+
+**What is not enforced.** The service does not record who loaded what, so this is a rule for clients, not
+a lock; the `model` guard in step 2 is what keeps it safe. The service separately evicts the least recently
+used **idle** model when it needs the GPU for another one, and never stops a model that is answering.
+
+```python
+import time, requests
+
+def release(base, lane, model):
+    for _ in range(5):
+        r = requests.post(f"{base}/api/unload", json={"lane": lane, "model": model}, timeout=60)
+        if r.status_code != 409:           # 409: another load/unload in progress, try again
+            return r.ok and r.json().get("released")
+        time.sleep(2)
+
+lanes = deploy(model)                      # your deploy call; note which lanes it used
+try:
+    run_your_task()
+finally:
+    for lane in lanes:
+        release(BASE, lane, model)
+```
+
+## Service control
+
+Everything the dashboard's **Service** page does is available here. The state-changing calls
+(`POST /api/service/*`, `POST /api/settings`) require `Content-Type: application/json`, which forces a
+CORS preflight so a web page cannot trigger them with a blind form POST (`415` otherwise).
+
+### GET `/api/service`
+
+**Shares:** `{"pid", "started_at", "uptime_seconds", "host", "port", "config_path", "data_dir",
+"app_version", "python", "can_restart": bool, "pending": "restart | stop | null", "restore_pending": bool}`.
+`pid` changes when the service restarts, which is how a client knows the new process is the one
+answering. `501` if this process has no service control (it was not started through `app.py`).
+
+### POST `/api/service/restart`
+
+**Needs:** `{"reload_models": bool}` (optional, default false).
+
+Stops every model server and any leftover one on a lane port **before replying**, so a deployment
+change in progress is reported to the caller. It then starts a replacement process (detached; it waits for
+this one to exit before binding the port) and shuts this one down, a moment after the reply. With
+`reload_models: true` the current deployment, including its coding-agent mode, is saved and the
+replacement loads it again; a saved deployment older than 10 minutes is ignored. Poll `GET /api/service`
+until `pid` changes. The replacement logs to `<data_dir>/launcher.log`.
+
+**Shares:** `{"ok": true, "action": "restart", "reload_models": bool, "pid": <this process>}`.
+**Errors:** `409` another deployment change or a service action is in progress, or this process cannot
+restart itself; `415` not JSON.
+
+### POST `/api/service/stop`
+
+Stops every model server and then the service. Nothing answers afterwards; start it again with
+`launch_service.py`. Same errors as restart.
+
+### GET `/api/settings` and POST `/api/settings`
+
+The `[policy]` settings that can be changed without editing the file:
+`load_mode`, `cache_ram_mib`, `vram_admission`, `vram_headroom_gb`, `auto_load_models`,
+`residency_guard`, `residency_check_seconds`, `drain_timeout_seconds` and `kill_busy_ports`.
+
+`GET` shares `{"settings": [{"key", "label", "help", "type": "bool | int | float | choice", "value", "min",
+"max", "choices", "apply": "live | next_load"}], "config_path"}`.
+
+`POST` needs `{"values": {"<key>": <value>, ...}}` (the keys may also be sent at the top level). Every value
+is validated first; nothing is applied unless all are valid. Changed values are applied to the running
+service and saved into the `[policy]` table of the config file, keeping its comments and layout; the
+first save leaves a copy of the original as `<config>.bak`. `apply: "live"` values take effect at once;
+`next_load` values change the command line of the next model load, so a model that is already loaded
+keeps its old behaviour until it is reloaded.
+
+**Shares:** the `GET` payload plus `"changed": [keys]` and `"next_load": [changed keys that wait for the next load]`.
+**Errors:** `400` unknown key or invalid value; `415` not JSON; `500` the file could not be written (nothing
+changed).
 
 ## POST `/api/chat`
 
@@ -426,11 +573,42 @@ Run a prompt against the currently loaded deployment.
 surface. Lane- and role-pinned variants are also supported:
 `/v1/<lane>/<agent-role>/models` and `/v1/<lane>/<agent-role>/chat/completions`.
 
-Use a registered `client_id` as the Bearer API key to attach the request to its project. Streaming
-requests are relayed as SSE and receive an `X-DGPU-Run-ID` response header. Non-streaming responses
-contain `dgpu_run_id`. The optional `X-DGPU-Project`, `X-DGPU-Agent-Role`, `X-DGPU-Session`,
-`X-DGPU-Task`, and `X-DGPU-Task-Label` headers add attribution. Coding prompt and completion content
-is redacted from storage unless `X-DGPU-Capture-Content: true` is supplied.
+**On-demand models (`policy.auto_load_models`, default on).** When `model` names a catalog model
+(a `catalog.models[].name` or `.id`), that model serves the request:
+- Already loaded: routed to it.
+- Not loaded: loaded in coding-agent mode onto a free GPU where it fits (smallest first), or in
+  place of the least recently used **idle** model on a GPU where it fits. A model no single GPU
+  can hold spans both GPUs after they are freed. A `/v1/<lane>/...` URL restricts placement to
+  that lane.
+- GPU only: the server starts only if its weights + estimated KV cache + `policy.vram_headroom_gb`
+  fit the VRAM actually free on the GPU, counting every process (`policy.vram_admission`; on Windows
+  from the OS's accounting, not HIP's per-process figure). Placement prefers a GPU where it fits
+  now, counting VRAM that evicting our own idle model there would release; when it fits nowhere
+  the request gets **503** with the shortfall and nothing is evicted. The same check guards
+  `/api/deploy` and the `/api/clients/deploy*` endpoints, which report it in their `500` message.
+- A model that is serving a request is never stopped: if every candidate stays busy for
+  `policy.drain_timeout_seconds`, the request gets **503** and should be retried. Loads are
+  serialized; a request waits up to `project.start_timeout_seconds` for another load to finish.
+
+`model: "dgpu:<lane>"`, a lane key, and model names that are not in the catalog keep plain lane
+routing to whatever is loaded. With auto-load on, `GET /v1/models` lists the loaded lanes followed
+by every requestable catalog model (`{"id", "object": "model", "owned_by", "loaded": bool}`).
+
+**Zero-config, watertight attribution (no API key, no pre-registration).** Every request is
+attributed to a real project, resolved in this order and **created on first use**:
+1. a Bearer value that is a registered `client_id` → that client's project;
+2. otherwise a project name/id from the `X-DGPU-Project` header, else the **Bearer value itself**
+   (so a tool whose only field is an "API key" just puts a project name there);
+3. nothing identifying → the configured `project.default_project` (default `"unassigned"`).
+
+An unknown Bearer value is **not** rejected — it becomes a project name. So a client connects by
+pointing at the base URL and naming itself once; nothing is ever left untracked. (Registering via
+`POST /api/clients/register` is still available and adds the metrics-file sink, but is optional.)
+
+Streaming requests are relayed as SSE and receive an `X-DGPU-Run-ID` response header; non-streaming
+responses contain `dgpu_run_id`. The optional `X-DGPU-Agent-Role`, `X-DGPU-Session`, `X-DGPU-Task`,
+`X-DGPU-Task-Label`, and `X-DGPU-Connection-Type` headers add finer attribution. Coding prompt and
+completion content is redacted from storage unless `X-DGPU-Capture-Content: true` is supplied.
 
 ### Inline autocomplete (FIM) endpoints
 
@@ -444,6 +622,95 @@ still drain-safe (counted in-flight during a deployment change). Point a small, 
 model (e.g. Qwen2.5-Coder-1.5B/7B) at the smaller lane for autocomplete and the agent model at
 the larger lane.
 
+## GET / POST `/api/lmstudio/gpus`
+
+Choose which GPUs **LM Studio's own** llama.cpp runtime may use (this is unrelated to the lanes
+this service launches itself). It reads and edits `<lmstudio_home>/.internal/hardware-config.json` —
+only `load.gpuSplitConfig.disabledGpus` for the backend; every other field is preserved, the first
+original is kept as `hardware-config.json.dgpu.bak`, and writes are atomic. A config that cannot be
+parsed is never overwritten (`409`).
+
+Device indexes are the order `llama-server --list-devices` prints (the same order LM Studio uses),
+e.g. `0` = R9700, `1` = 9070 XT, `2` = integrated graphics.
+
+**GET** — optional `?backend=rocm|vulkan` (default `rocm`).
+
+**POST needs:**
+
+| field | type | required? |
+|---|---|---|
+| `gpus` | `"all"`, or non-empty list of device indexes, device ids (`"ROCm0"`) or unique name fragments (`"R9700"`) | **required** |
+| `backend` | `"rocm"` \| `"vulkan"` | optional, default `"rocm"` |
+
+**Shares:**
+```jsonc
+{
+  "backend": "rocm", "config_path": "C:/Users/.../.lmstudio/.internal/hardware-config.json",
+  "devices": [{ "index": 0, "device": "ROCm0", "name": "AMD Radeon AI PRO R9700",
+                "memory": "32624 MiB, 32472 MiB free", "enabled": true }],
+  "enabled": [0], "disabled_gpus": [1, 2],
+  "lm_studio": { "reachable": true, "models": [{ "identifier": "qwen/qwen3.8-27b", "status": "idle",
+                 "queued": 0, "size_bytes": 17742040464, "context_length": 32768 }] },
+  // POST only:
+  "previous_disabled_gpus": [], "backup_path": "…/hardware-config.json.dgpu.bak", "note": "string"
+}
+```
+**Errors:** `400` unknown backend, empty/invalid `gpus`, or a selector matching no / several GPUs;
+`415` the POST is not `Content-Type: application/json` (a web page cannot trigger it with a blind
+form post); `409` the runtime or config file cannot be read or written.
+
+This changes LM Studio's saved setting, not its running process. A model that is already loaded keeps
+its placement, so apply it in this order: `POST /api/lmstudio/release` (with `stop_server`), then
+`POST /api/lmstudio/gpus`, then start LM Studio's server and load the model. That sequence was
+checked on the R9700 + 9070 XT machine: the reloaded 27B model sat entirely on the R9700. It was not
+isolated whether the server restart is required, and editing the file while models stay loaded was
+not seen to move them.
+
+## POST `/api/lmstudio/release`
+
+Free the GPU memory and RAM LM Studio holds: unload every model, optionally stop its server. Use it
+before deploying onto this service's lanes, which share the same GPUs.
+
+**Needs:** `{ "force": false, "stop_server": false }` — both optional, and only the JSON value `true`
+counts. Without `force` it refuses (`409`) while any model is generating or has queued requests.
+
+**Shares:** `{ "unloaded": ["<identifier>"], "server_stopped": bool, "lm_studio": { …as above… } }`
+
+**Errors:** `409` LM Studio is busy, the `lms` CLI is missing, or an `lms` command failed; `415` as above.
+
+## GET `/api/usage`
+
+Per-project usage across **every** connection — coding agents, model inference, inline
+autocomplete, and any client that self-tags. It is a **daily rollup** (one row per project ×
+connection-type × day), accumulated in memory and flushed on a background timer, so recording
+adds no per-request DB write and the table never bloats.
+
+The `connection_type` defaults per entry point — `coding_agent` (chat gateway), the request's
+`workload_kind` (`/api/chat`), `autocomplete` (`/v1/completions` and `/v1/infill`) — and any
+caller can override it with the `X-DGPU-Connection-Type` header (e.g. `training`, `batch`,
+`rag`), so a training/data pipeline is tracked under its own type. Project attribution comes
+from the Bearer `client_id` or the `X-DGPU-Project` header; unattributed usage is recorded
+under `project_id: ""`.
+
+**Query params:** `project_id`, `connection_type`, `start_date`/`end_date` (YYYY-MM-DD,
+inclusive; 400 on bad format).
+
+**Shares:**
+```jsonc
+{
+  "rows": [
+    { "project_id": "…", "connection_type": "coding_agent", "usage_date": "2026-10-11",
+      "requests": 42, "input_tokens": 183000, "output_tokens": 15200, "updated_at": "ISO-8601" }
+  ],
+  "by_connection_type": {
+    "coding_agent": { "requests": 42, "input_tokens": 183000, "output_tokens": 15200 },
+    "autocomplete": { "requests": 1900, "input_tokens": 240000, "output_tokens": 38000 }
+  }
+}
+```
+Token counts are exact for chat/inference and best-effort for autocomplete (counted for
+non-streamed completions; streamed autocomplete records the request without token totals).
+
 ## Project and agent telemetry endpoints
 
 - `GET /api/projects` lists registered projects with run/token totals.
@@ -456,7 +723,9 @@ the larger lane.
 
 ## POST `/api/clients/register`
 
-Register a consuming codebase once, up front.
+Register a consuming codebase once, up front. **Optional** — the gateway already auto-provisions
+a project from the Bearer key or `X-DGPU-Project` header (see "Zero-config attribution" above).
+Register only when you also want run metrics appended to a file in your repo (`output_path`).
 
 **Needs:**
 

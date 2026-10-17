@@ -306,6 +306,7 @@ class DualGPUOrchestrator:
             "ctx_actual": effective_ctx,
             "size_gb": model.size_gb,
             "load_seconds": round(time.time() - load_started, 1),
+            "runtime": process.runtime().public(),
             "vram": {
                 "dedicated_gb": round(placement[0], 2) if placement else None,
                 "shared_gb": round(placement[1], 2) if placement else None,
@@ -367,6 +368,7 @@ class DualGPUOrchestrator:
             "ctx_requested": ctx,
             "ctx_actual": effective_ctx,
             "size_gb": model.size_gb,
+            "runtime": process.runtime().public(),
             "vram": {
                 "dedicated_gb": round(placement[0], 2) if placement else None,
                 "shared_gb": round(placement[1], 2) if placement else None,

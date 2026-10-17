@@ -13,6 +13,11 @@ Behavior:
   - Otherwise, it starts app.py as a detached background process (it keeps running after
     this launcher exits), waits until it reports healthy, then exits. The launcher itself
     does not stay resident.
+  - Run from a terminal it opens the UI in your browser (also when the service was already
+    running). Run by another program (no terminal attached) it stays silent. `--open-browser`
+    and `--no-browser` override that.
+  - Once the UI is open, restarting or stopping the service, unloading models and editing
+    the policy settings are all done from its Service page.
 
 Exit code 0 with a JSON summary on stdout means "the service is up, here's its base_url."
 Exit code 1 with a JSON error on stdout means it could not confirm the service came up --
@@ -26,6 +31,7 @@ import json
 import subprocess
 import sys
 import time
+import webbrowser
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -43,6 +49,22 @@ def _probe(base_url: str, timeout: float = 2.0) -> dict | None:
     return payload
 
 
+def interactive() -> bool:
+    """A person is at a terminal (as opposed to a program launching this with pipes)."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def wants_browser(args: argparse.Namespace, is_interactive: bool) -> bool:
+    if args.open_browser:
+        return True
+    if args.no_browser:
+        return False
+    return is_interactive
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Start the dual-GPU web service on demand if it isn't already running."
@@ -58,7 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--open-browser",
         action="store_true",
-        help="Open a browser tab once started. Off by default since this is meant for programmatic starts.",
+        help="Always open the UI in a browser tab. Default: open it when run from a terminal.",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Never open a browser tab, even from a terminal.",
     )
     parser.add_argument(
         "--startup-timeout",
@@ -74,9 +101,13 @@ def main() -> int:
     probe_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
     base_url = f"http://{probe_host}:{args.port}"
 
+    open_browser = wants_browser(args, interactive())
     status = _probe(base_url)
     if status is not None:
-        print(json.dumps({"already_running": True, "base_url": base_url, "status": status}, indent=2))
+        if open_browser:
+            webbrowser.open(base_url)
+        print(json.dumps({"already_running": True, "base_url": base_url, "status": status,
+                          "browser_opened": open_browser}, indent=2))
         return 0
 
     app_path = Path(__file__).with_name("app.py")
@@ -88,8 +119,7 @@ def main() -> int:
         "--port", str(args.port),
         "--data-dir", args.data_dir,
     ]
-    if not args.open_browser:
-        command.append("--no-browser")
+    command.append("--no-browser")  # this launcher opens the tab itself, once the service is healthy
 
     log_dir = Path(args.data_dir).expanduser()
     if not log_dir.is_absolute():
@@ -125,12 +155,15 @@ def main() -> int:
             return 1
         status = _probe(base_url)
         if status is not None:
+            if open_browser:
+                webbrowser.open(base_url)
             print(json.dumps({
                 "started": True,
                 "pid": process.pid,
                 "base_url": base_url,
                 "status": status,
                 "log_path": str(log_path),
+                "browser_opened": open_browser,
             }, indent=2))
             return 0
         time.sleep(1.0)
