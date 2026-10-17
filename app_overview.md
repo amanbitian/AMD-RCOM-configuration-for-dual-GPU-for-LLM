@@ -173,8 +173,11 @@ Three deployment modes, available from the dashboard, `POST /api/deploy` and the
 1. **Fits the budget.** Weights (plus a draft model, if configured) must fit `vram_gb × vram_safety_fraction`
    (0.90 by default) of the lane or lanes. For a split model the budget is the sum.
 2. **KV cache.** When the GGUF metadata is readable, the estimated KV cache for the context window is added
-   and checked too. Architectures the estimator cannot read confidently (hybrid state-space,
-   sliding-window without a per-layer pattern) fall back to the weights-only check.
+   and checked too. The estimate assumes a 16-bit cache held in VRAM; it does not read a model's
+   `extra_args`, so a cache placed in RAM or quantized that way is still counted at full size (see
+   [9](#9-what-to-expect-measured-behaviour) and [11](#11-limits-non-goals-and-known-issues)).
+   Architectures the estimator cannot read confidently (hybrid state-space, sliding-window without a
+   per-layer pattern) fall back to the weights-only check.
 3. **Pinning.** A model with `pin_lane` is refused on any other lane.
 4. **Leases.** A lane held by a training lease returns `409`.
 5. **Free VRAM (GPU-only admission).** The model must also fit the VRAM actually free on the GPU, counting
@@ -556,6 +559,28 @@ guarantees; they change with the model, quantization, context and driver.
 Every model unloaded cleanly in the tests: the process exited and GPU and system memory returned to their
 starting levels.
 
+### Where the context cache lives (KV cache)
+
+`llama-server` reserves the whole KV cache for the configured context window when it loads. It does not grow as
+the window fills (VRAM stayed flat while 16k tokens were filled), so where it lives is decided at load, by flags.
+Measured on the R9700 with Qwen3-8B Q4_K_M at a 262,144-token context, which needs a 36.9 GB cache on a 32 GB
+card (2026-10-17, one run each):
+
+| llama-server flags | Cache lives | VRAM | Decode at 2k / 16k prompt (tok/s) | Prefill at 2k / 16k (tok/s) |
+|---|---|---|---|---|
+| none | GPU, but 11.4 GB was silently backed by system RAM (Windows) | 31.7 GB | 77 / 32 | 1,202 / 1,100 |
+| `--no-kv-offload` | system RAM, 36.9 GB | 5.9 GB | 24 / 7 | 3,173 / 2,168 |
+| `--cache-type-k q8_0 --cache-type-v q8_0` (needs `--flash-attn on`) | GPU, half size | 25.1 GB | 85 / 72 | 3,575 / 3,316 |
+| `--cache-type-k q4_0 --cache-type-v q4_0` (needs `--flash-attn on`) | GPU, quarter size | 16.1 GB | 91 / 71 | 3,895 / 3,310 |
+| `--fit on` (this build's default) | unchanged: it only adjusts arguments that are not set | 31.7 GB | 77 / 32 | 1,206 / 1,094 |
+
+- A cache in RAM works but decode slows sharply with context depth. A quantized cache kept on the GPU was
+  fastest. The quality cost of a quantized cache was **not measured**; q4_0 is the riskier choice.
+- The context was far beyond the model's trained 32,768, which llama.cpp warns about. That does not change
+  the memory behaviour, only the quality of long answers.
+- Weights can be moved to RAM instead with `--n-cpu-moe N`, `--cpu-moe`, `-ncffn N` or fewer GPU layers; these
+  were not measured here. `gpt-oss-120b` in the example config uses `--n-cpu-moe 20`.
+
 ## 10. Rules for applications that use the service
 
 These apply to every program that loads a model through this service.
@@ -613,6 +638,12 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
    empty), so the app uses the operating system's accounting instead. Anything else that reads the HIP figure
    will be misled.
 6. **Vulkan** is configured as a backend but has not been benchmarked or verified here.
+7. **No parameter places the KV cache in RAM or sets its precision.** A deploy request accepts
+   `context_window`, `input_tokens`, `max_output_tokens`, the reasoning fields and `tensor_split`, but nothing
+   about the cache. An operator can add the flags in section 9 to a model's `extra_args`, but the capacity check
+   still counts the cache at 16-bit size in VRAM, so a context that only fits with the cache in RAM or
+   quantized is refused before `llama-server` starts (Qwen3-8B at 262,144 on the R9700: "needs 40.68 GB, safe
+   budget 28.80 GB"; at 131,072 on the 9070 XT: "needs 22.68 GB, budget 14.40 GB"). Not built.
 
 ## 12. Security posture
 

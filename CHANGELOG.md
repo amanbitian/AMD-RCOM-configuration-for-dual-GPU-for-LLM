@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-17 — Measured: where the context cache lives
+
+Documentation only; no code changed. With Qwen3-8B at a 262,144-token context on the R9700 (a 36.9 GB cache on
+a 32 GB card), the default silently spilled 11.4 GB into system RAM and decoded at 77 tok/s at a 2k prompt and
+32 tok/s at 16k. `--no-kv-offload` put the cache in RAM (24 tok/s at 2k, 7 tok/s at 16k). `--cache-type-k q8_0
+--cache-type-v q8_0` kept it on the GPU at 85 and 72 tok/s. `--fit on` changed nothing because context and layers
+are set explicitly. The repo has no deploy parameter for this and its capacity check counts the cache at 16-bit
+size in VRAM, so large contexts are refused. The table and the known issue are in
+[app_overview.md](app_overview.md#where-the-context-cache-lives-kv-cache).
+
 ## 2026-10-17 — app_overview.md
 
 New [app_overview.md](app_overview.md): the single description of what the app is and is not, where it is
