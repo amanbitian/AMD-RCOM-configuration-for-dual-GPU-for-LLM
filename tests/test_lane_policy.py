@@ -102,7 +102,7 @@ def test_lane_replace_preserves_other_gpu(tmp_path):
     )
     new_model = ModelConfig(name="new-large", path="unused.gguf")
     manager = object.__new__(app.DeploymentManager)
-    manager.config = SimpleNamespace(lanes=lanes, policy=SimpleNamespace(drain_timeout_seconds=0.0))
+    manager.config = SimpleNamespace(lanes=lanes, policy=SimpleNamespace(drain_timeout_seconds=0.0, vram_admission=False, kill_busy_ports=False))
     manager.data_dir = tmp_path
     manager.store = FakeStore()
     manager.sampler = SimpleNamespace(latest=lambda: {})
@@ -137,7 +137,8 @@ def _lane_replace_manager(tmp_path, active_profile, handles_spec, new_model_name
             self.device = "fake"
             self.base_url = "http://127.0.0.1:1"
             self.pid = 1
-            self.proc = None
+            # A started lane has a live process; status() reports a lane whose process has exited as degraded.
+            self.proc = SimpleNamespace(poll=lambda: None)
             self.stopped = False
 
         def start(self):
@@ -158,7 +159,7 @@ def _lane_replace_manager(tmp_path, active_profile, handles_spec, new_model_name
         LaneConfig("9070xt", "9070 XT", "9070 XT", 16, 8082),
     ]
     manager = object.__new__(app.DeploymentManager)
-    manager.config = SimpleNamespace(lanes=lanes, policy=SimpleNamespace(drain_timeout_seconds=0.0))
+    manager.config = SimpleNamespace(lanes=lanes, policy=SimpleNamespace(drain_timeout_seconds=0.0, vram_admission=False, kill_busy_ports=False))
     manager.data_dir = tmp_path
     manager.store = FakeStore()
     manager.sampler = SimpleNamespace(latest=lambda: {})

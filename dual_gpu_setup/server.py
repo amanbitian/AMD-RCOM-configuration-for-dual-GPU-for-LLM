@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import socket
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, replace
 import json
@@ -12,58 +10,38 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
-from dual_gpu_setup.lmstudio import backend_env, resolve_device, resolve_model_path, runtime_dir, server_binary
+from dual_gpu_setup.hostos import get_host
+from dual_gpu_setup.lmstudio import (
+    RuntimeInfo,
+    backend_env,
+    multi_gpu_config,
+    resolve_device,
+    resolve_model_path,
+    runtime_dir,
+    runtime_info,
+    server_binary,
+)
 
-# Every helper process spawned in this module (netstat/tasklist/taskkill/powershell for
-# metrics, the llama-server process itself) is launched without an inherited console --
-# app.py normally runs detached (see launch_service.py), so a plain subprocess.run/Popen on
-# Windows would otherwise allocate and briefly show a brand-new console window for EACH call.
-# gpu_process_metrics_batch alone runs every ResourceSampler tick (every 2s, for the whole
-# life of the process -- see app.py's ResourceSampler), so without this flag that's a new
-# console window popping up every 2 seconds, forever.
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+# Flags llama.cpp renamed upstream. A configured `extra_args` value is rewritten only when the
+# running build lacks the old spelling and has the new one, so either build accepts the same config.
+RENAMED_FLAGS: dict[str, list[str]] = {"--no-mmap": ["--load-mode", "none"]}
+
+
+def compat_args(runtime: RuntimeInfo, args: list[str]) -> list[str]:
+    out: list[str] = []
+    for arg in args:
+        replacement = RENAMED_FLAGS.get(arg)
+        if replacement and runtime.flags and not runtime.supports(arg) and runtime.supports(replacement[0]):
+            out.extend(replacement)
+        else:
+            out.append(arg)
+    return out
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
         return sock.connect_ex((host, port)) != 0
-
-
-def _pid_listening_on(port: int) -> int | None:
-    try:
-        output = subprocess.run(
-            ["netstat", "-ano", "-p", "TCP"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            creationflags=_NO_WINDOW,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0] == "TCP" and parts[3].upper() == "LISTENING":
-            if parts[1].rsplit(":", 1)[-1] == str(port):
-                try:
-                    return int(parts[4])
-                except ValueError:
-                    return None
-    return None
-
-
-def _is_llama_server(pid: int) -> bool:
-    try:
-        output = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            creationflags=_NO_WINDOW,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "llama-server.exe" in output.lower()
 
 
 def _wait_port_free(port: int, timeout: float = 60.0) -> bool:
@@ -75,65 +53,8 @@ def _wait_port_free(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def gpu_process_metrics_batch(pids: list[int]) -> dict[int, dict[str, float]]:
-    """Read GPU dedicated/shared memory and utilization for several PIDs in one PowerShell
-    invocation. Get-Counter's PDH counter-set resolution is the dominant cost here (multiple
-    seconds cold), roughly halved by requesting all three counter paths in a single Get-Counter
-    call instead of three, and only paid once per tick by collapsing N per-server calls (the
-    resource sampler and every chat request's before/after capture) into one per sampling tick.
-
-    Instance names look like 'pid_1234_luid_...' -- the filter anchors on the trailing
-    underscore so pid 123 can't accidentally match an instance for pid 1234."""
-    unique_pids = sorted(set(pids))
-    if not unique_pids:
-        return {}
-    pid_array = ",".join(str(pid) for pid in unique_pids)
-    script = (
-        f"$targets=@({pid_array}); "
-        "$samples=(Get-Counter -Counter @("
-        "'\\GPU Process Memory(*)\\Dedicated Usage',"
-        "'\\GPU Process Memory(*)\\Shared Usage',"
-        "'\\GPU Engine(*)\\Utilization Percentage'"
-        ") -EA SilentlyContinue).CounterSamples; "
-        "$d=$samples | Where-Object {$_.Path -like '*dedicated usage'}; "
-        "$s=$samples | Where-Object {$_.Path -like '*shared usage'}; "
-        "$u=$samples | Where-Object {$_.Path -like '*utilization percentage'}; "
-        "foreach ($targetPid in $targets) { "
-        "$pattern=\"pid_${targetPid}_*\"; "
-        "$dd=($d | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
-        "$ss=($s | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
-        "$uu=($u | Where-Object {$_.InstanceName -like $pattern} | Measure-Object CookedValue -Sum).Sum; "
-        "Write-Output \"$targetPid $([double]$dd) $([double]$ss) $([double]$uu)\" }"
-    )
-    try:
-        output = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            creationflags=_NO_WINDOW,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    results: dict[int, dict[str, float]] = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) != 4:
-            continue
-        try:
-            pid, dedicated, shared, utilization = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
-        except ValueError:
-            continue
-        results[pid] = {
-            "dedicated_gb": dedicated / 1024**3,
-            "shared_gb": shared / 1024**3,
-            "utilization_pct": max(0.0, min(100.0, utilization)),
-        }
-    return results
-
-
 def gpu_process_metrics(pid: int) -> dict[str, float] | None:
-    return gpu_process_metrics_batch([pid]).get(pid)
+    return get_host().gpu.process_metrics([pid]).get(pid)
 
 
 def vram_placement(pid: int) -> tuple[float, float] | None:
@@ -170,6 +91,24 @@ def _get_json(url: str, timeout: float) -> dict:
     return json.loads(body)
 
 
+# A GPU-offloaded server must hold at least this share of its weight file in VRAM. llama-server
+# still reports healthy when it silently falls back to CPU (seen under host memory pressure), so
+# health alone cannot prove placement.
+PLACEMENT_MIN_VRAM_FRACTION = 0.5
+
+
+def placement_error(dedicated_gb: float, model_bytes: int, device: str) -> str | None:
+    """Return a failure message when a GPU-offloaded server is not resident on its device."""
+    expected_gb = model_bytes * PLACEMENT_MIN_VRAM_FRACTION / 1024**3
+    if dedicated_gb >= expected_gb:
+        return None
+    return (
+        f"placement check failed on {device}: process holds {dedicated_gb:.2f} GB in VRAM, "
+        f"expected at least {expected_gb:.2f} GB for a {model_bytes / 1024**3:.2f} GB model "
+        "(weights likely fell back to CPU)"
+    )
+
+
 @dataclass(slots=True)
 class LlamaServerProcess:
     config: AppConfig
@@ -186,6 +125,7 @@ class LlamaServerProcess:
     proc: subprocess.Popen | None = None
     log_path: Path | None = None
     _log_handle: object | None = None
+    _runtime: RuntimeInfo | None = None
 
     @property
     def base_url(self) -> str:
@@ -230,6 +170,7 @@ class LlamaServerProcess:
         ctx_size: int,
         run_dir: Path,
     ) -> "LlamaServerProcess":
+        config = multi_gpu_config(config)
         ordered = sorted(lanes, key=lambda item: item.vram_gb, reverse=True)
         backend = ordered[0].backend
         mismatched = [lane.key for lane in ordered if lane.backend != backend]
@@ -255,19 +196,42 @@ class LlamaServerProcess:
 
     @staticmethod
     def kill_orphan_on_port(port: int) -> None:
-        pid = _pid_listening_on(port)
+        control = get_host().control
+        pid = control.pid_listening_on(port)
         if pid is None:
             return
-        if not _is_llama_server(pid):
-            raise RuntimeError(f"Port {port} is held by PID {pid}, which is not llama-server.exe.")
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True, timeout=30,
-                        creationflags=_NO_WINDOW)
+        if not control.is_llama_server(pid):
+            raise RuntimeError(f"Port {port} is held by PID {pid}, which is not {control.server_binary_name}.")
+        control.terminate_tree(pid)
         _wait_port_free(port, timeout=30)
+
+    def runtime(self) -> RuntimeInfo:
+        """The llama-server build this process runs (probed once, then reused)."""
+        if self._runtime is None:
+            self._runtime = runtime_info(self.config, self.backend, server_binary(self.config, self.backend))
+        return self._runtime
+
+    def warm_slot(self) -> int | None:
+        """Slot id reserved for residency warm-ups, or None.
+
+        With one serving slot, the server runs a second slot over a unified KV pool (no extra KV
+        VRAM; each slot keeps the full context). Real requests are pinned to slot 0, so a warm-up
+        on slot 1 can never overwrite a conversation's cached prompt (measured: a warm-up on the
+        only slot forced the next turn to reprocess 2,510 tokens; on slot 1, 10 tokens)."""
+        policy = self.config.policy
+        explicit = {"-np", "--parallel", "-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"}
+        if (not policy.residency_guard or (self.model.parallel or policy.parallel) != 1
+                or explicit & set([*(self.lane_extra_args or []), *self.model.extra_args])
+                or not self.runtime().supports("--kv-unified")):
+            return None
+        return 1
 
     def build_command(self) -> list[str]:
         policy = self.config.policy
+        runtime = self.runtime()
+        warm_slot = self.warm_slot()
         args = [
-            str(server_binary(self.config, self.backend)),
+            runtime.binary,
             "--model",
             str(self.model_path),
             "--alias",
@@ -279,7 +243,8 @@ class LlamaServerProcess:
             "--ctx-size",
             str(self.ctx_size),
             "--parallel",
-            str(self.model.parallel or policy.parallel),
+            str(2 if warm_slot is not None else self.model.parallel or policy.parallel),
+            *(["--kv-unified"] if warm_slot is not None else []),
             "--host",
             self.host,
             "--port",
@@ -306,8 +271,29 @@ class LlamaServerProcess:
         if self.model.threads:
             args.extend(["--threads", str(self.model.threads), "--threads-batch", str(self.model.threads)])
         args.extend(self._draft_args(policy))
-        args.extend(self.lane_extra_args or [])
-        args.extend(self.model.extra_args)
+        extra = compat_args(runtime, [*(self.lane_extra_args or []), *self.model.extra_args])
+        if runtime.supports("--fit") and not {"--fit", "-fit"} & set(extra):
+            # Newer builds re-size any setting left unset to fit free memory. This repo sizes
+            # context and offload itself (capacity check + placement verification), so keep it off.
+            args.extend(["--fit", "off"])
+        args.extend(self._host_memory_args(runtime, extra))
+        args.extend(extra)
+        return args
+
+    def _host_memory_args(self, runtime: RuntimeInfo, extra: list[str]) -> list[str]:
+        """Keep host RAM to what llama.cpp needs: no resident copy of the weights, and the
+        prompt cache capped (measured: default flags hold ~1x the model in RAM after load and
+        grow ~4 GB per 20 distinct prompts; these hold ~0.6 GB flat at the same decode speed).
+        Flags a model's extra_args already set win; builds that lack a flag get nothing."""
+        policy = self.config.policy
+        args: list[str] = []
+        if policy.load_mode != "auto" and not {"--load-mode", "-lm", "--no-mmap", "--mmap"} & set(extra):
+            if runtime.supports("--load-mode"):
+                args.extend(["--load-mode", policy.load_mode])
+            elif policy.load_mode == "none" and runtime.supports("--no-mmap"):
+                args.append("--no-mmap")
+        if runtime.supports("--cache-ram") and not {"--cache-ram", "-cram"} & set(extra):
+            args.extend(["--cache-ram", str(policy.cache_ram_mib)])
         return args
 
     def _draft_args(self, policy: "PolicyConfig") -> list[str]:
@@ -351,22 +337,51 @@ class LlamaServerProcess:
             stderr=subprocess.STDOUT,
             env=backend_env(self.config, self.backend),
             cwd=str(runtime_dir(self.config, self.backend)),
-            creationflags=_NO_WINDOW,
+            **get_host().control.spawn_kwargs(),
         )
 
         deadline = time.time() + self.config.project.start_timeout_seconds
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(f"llama-server exited during startup with code {self.proc.returncode}: {self.log_path}")
+                tail = self._log_tail()
+                raise RuntimeError(
+                    f"llama-server exited during startup with code {self.proc.returncode}"
+                    f"{f' ({tail})' if tail else ''}: {self.log_path}"
+                )
             try:
                 payload = _get_json(f"{self.base_url}/health", timeout=3)
                 if payload.get("status") == "ok":
+                    self._verify_placement()
                     return
             except (urlerror.URLError, TimeoutError, ValueError, OSError):
                 pass
             time.sleep(self.config.policy.health_poll_seconds)
         self.stop()
         raise RuntimeError(f"llama-server did not become healthy within {self.config.project.start_timeout_seconds}s: {self.log_path}")
+
+    def _log_tail(self, lines: int = 2) -> str:
+        """Last lines this launch wrote, e.g. `error: invalid argument: --foo`, for the start error."""
+        try:
+            text = self.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        launch = text.rsplit("\n=== ", 1)[-1].splitlines()[1:]  # drop this launch's command header
+        return " | ".join([line.strip() for line in launch if line.strip()][-lines:])[-400:]
+
+    def _verify_placement(self) -> None:
+        """Fail the start (and stop the server) unless the weights are resident on the target GPU."""
+        policy_layers = self.model.gpu_layers if self.model.gpu_layers is not None else self.config.policy.gpu_layers
+        if policy_layers <= 0:
+            return
+        try:
+            metrics = get_host().gpu.process_metrics([self.proc.pid]).get(self.proc.pid, {})
+        except Exception as exc:  # fail closed: an unverifiable placement is not a ready lane
+            self.stop()
+            raise RuntimeError(f"placement check could not read GPU memory for {self.model.name}: {exc}") from exc
+        error = placement_error(float(metrics.get("dedicated_gb", 0.0)), self.model_path.stat().st_size, self.device)
+        if error:
+            self.stop()
+            raise RuntimeError(f"{self.model.name}: {error}: {self.log_path}")
 
     def actual_ctx(self) -> int:
         try:
@@ -391,13 +406,7 @@ class LlamaServerProcess:
             try:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    creationflags=_NO_WINDOW,
-                )
+                get_host().control.terminate_tree(self.proc.pid)
                 try:
                     self.proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:

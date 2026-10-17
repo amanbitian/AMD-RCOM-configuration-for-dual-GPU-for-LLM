@@ -98,6 +98,11 @@ Recommended loop:
 Avoid giving both agents write access to the same working tree. GPU parallelism is safe; concurrent
 filesystem edits to one checkout are not.
 
+When the session is over, release the GPUs: the dashboard's **Service** page (Unload per GPU), or
+`POST /api/unload {"lane": "<lane>", "model": "<model>"}` for each lane you loaded. The service does
+not unload a model by itself. See
+[API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when-a-task-is-done).
+
 ## Gateway metadata and routes
 
 The gateway supports:
@@ -109,6 +114,12 @@ POST /v1/<lane>/<agent-role>/chat/completions
 GET  /v1/models
 GET  /v1/<lane>/<agent-role>/models
 ```
+
+Set the client's model to a catalog model name (as listed by `GET /v1/models`) and the gateway
+loads it on demand, GPU only, closing the least recently used idle model when the GPUs are full.
+Two agents asking for different models get one GPU each; a third model replaces whichever is idle
+longest. Use `dgpu:<lane>` instead to talk to whatever is already loaded on a lane. See
+[API_CONTRACT.md](API_CONTRACT.md#openai-compatible-coding-agent-gateway).
 
 Optional headers for clients that support custom headers:
 

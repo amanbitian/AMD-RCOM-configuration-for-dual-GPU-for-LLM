@@ -1,5 +1,9 @@
 # Dual GPU Setup
 
+> **Start with [app_overview.md](app_overview.md).** It is the source of truth for what this app is, what it
+> can do, what to expect from it (with measured numbers), and its limits. This README covers setup and
+> walkthroughs.
+
 `Dual_gpu_setup` is a reusable dual-GPU orchestration layer for local `llama-server` workloads on Windows. It was designed so eval projects and future local-model apps can share one GPU management system instead of each repo reimplementing:
 
 - GPU discovery
@@ -40,7 +44,7 @@ This project does not evaluate models by itself.
 It is an orchestrator that:
 
 1. Reads a TOML config.
-2. Discovers your LM Studio runtime and GPUs.
+2. Discovers your `llama-server` runtime (an official llama.cpp build or LM Studio's) and GPUs.
 3. Creates one serving lane per GPU.
 4. Loads models onto the correct GPU or across both GPUs.
 5. Starts a local OpenAI-compatible `llama-server` endpoint.
@@ -103,12 +107,48 @@ Use this path for unattended benchmark or eval sweeps where you just want every 
 
 Use this path when you want to interactively load models, compare them head to head, and watch GPU behavior as it happens.
 
+### Controlling the service from the UI
+
+The **Service** page runs everything that would otherwise need a terminal:
+
+- **Restart service** stops the models, starts a fresh process on the same port, and (optionally)
+  loads the same models again. The page reconnects by itself. **Stop service** stops everything; start
+  it again with `python launch_service.py`.
+- **Loaded models** lists each GPU's model with its llama.cpp build, how much of it is in VRAM and how many
+  requests it is answering, and unloads one GPU while the other keeps running. **Unload everything** frees
+  both GPUs. A model that is mid-answer gets up to 30 s to finish; a bar at the top of every page says so
+  and offers **Stop now**, which ends the wait and stops the model at once. Errors show in the same bar.
+- A **banner** appears on every page when a llama-server is running that this service does not manage
+  (for example left over after the service was killed). **Stop them** frees its VRAM and RAM, and loading a
+  model stops such a leftover on its own port automatically.
+- **Settings** edits the loading, memory and residency options in `[policy]`; changes are saved into the
+  config file (a `.bak` copy of the original is kept) and say whether they apply now or at the next model load.
+
+The same controls are available over HTTP (see [API_CONTRACT.md](API_CONTRACT.md#service-control)).
+
+### 3. Shared GPU service for other apps
+
+Other applications use the same running `app.py` through its OpenAI-compatible gateway
+(`/v1/chat/completions`, `/v1/completions`, `/v1/models`; see [API_CONTRACT.md](API_CONTRACT.md) and
+[CODING_AGENTS.md](CODING_AGENTS.md)). The service keeps every model on the GPUs:
+
+1. A client sets `model` to any name listed by `GET /v1/models`. If it is loaded, it is used.
+2. If not, it is loaded on a GPU where it fits, preferring an empty one. When both GPUs are
+   occupied it replaces the least recently used **idle** model; a model too big for one GPU spans
+   both.
+3. It starts only if its weights and KV cache fit the VRAM actually free on the GPU. Otherwise the
+   caller gets a `503` with the shortfall, and nothing is evicted.
+4. A model that is serving a request is never stopped. If every candidate stays busy, the caller
+   gets a `503` and retries.
+5. Servers keep host RAM near 0.6 GB each, and a residency guard pages a model back into VRAM if
+   Windows moves it into system RAM while idle (`[policy]` settings above).
+
 ## Architecture
 
 The repo is split into small modules:
 
 - [dual_gpu_setup/config.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/config.py): loads and validates TOML config
-- [dual_gpu_setup/lmstudio.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/lmstudio.py): finds LM Studio runtimes, models, and GPU device ids
+- [dual_gpu_setup/lmstudio.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/lmstudio.py): resolves the `llama-server` runtime (configured llama.cpp build or LM Studio's), its version and flags, models, and GPU device ids
 - [dual_gpu_setup/server.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/server.py): starts and stops `llama-server`, checks health, and warns on VRAM spill
 - [dual_gpu_setup/orchestrator.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/orchestrator.py): manages the dual-lane queue and the multi-GPU phase
 - [dual_gpu_setup/tasks.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/tasks.py): runs external tasks against each loaded model
@@ -124,10 +164,11 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
-37 tests cover the GGUF reader, the KV-cache estimator and context-window sizing logic, the
+367 tests cover the GGUF reader, the KV-cache estimator and context-window sizing logic, the
 config loader, `RunStore` (migrations, client registration, dashboard aggregation, pruning),
-and the deploy-time capacity check across all three deployment modes. The capacity-check tests
-use synthetic GGUF fixtures ([tests/conftest.py](F:/Projects/Dual_gpu_setup/tests/conftest.py)),
+the deploy-time capacity check across all three deployment modes, runtime and flag selection, the
+on-demand model manager and residency guard, the coding gateway, and the training telemetry
+features. The capacity-check tests use synthetic GGUF fixtures ([tests/conftest.py](F:/Projects/Dual_gpu_setup/tests/conftest.py)),
 not real model files, so the suite runs the same anywhere.
 
 ## Chatbot Layer Design
@@ -138,6 +179,7 @@ A detailed design is available for adding a persistent chatbot, live monitoring,
 - [Telemetry, token accounting, and storage schema](F:/Projects/Dual_gpu_setup/docs/TELEMETRY_AND_STORAGE.md)
 - [Chat, deployment, monitoring, and history UI](F:/Projects/Dual_gpu_setup/docs/UI_SPECIFICATION.md)
 - [Implementation phases and validation plan](F:/Projects/Dual_gpu_setup/docs/IMPLEMENTATION_PLAN.md)
+- [Training telemetry, reliability, and checkpoint evaluation](docs/TRAINING_TELEMETRY.md) (implemented: **Training** and **Hardware** tabs, GPU leases, tracker client, evaluation pipeline)
 
 These files were the original design proposal for that layer. [app.py](app.py) now implements most of it — the local API, browser UI, SQLite run database, and live resource telemetry described in these documents are working today; see [How It Works](#how-it-works) above for the current mechanics. Token-by-token streaming, cancellation, and richer per-physical-GPU charts remain future work (see [Current Limitations](#current-limitations)).
 
@@ -166,15 +208,16 @@ Everything else stays in this repo.
 Before running this project, make sure you have:
 
 1. Windows machine with 2 GPUs
-2. LM Studio installed
-3. At least one LM Studio `llama.cpp` runtime installed
-4. Models downloaded locally through LM Studio or stored in a known model directory
-5. Python 3.11 or newer
+2. A `llama-server` build: an official [llama.cpp release](https://github.com/ggml-org/llama.cpp/releases)
+   (the "Windows x64 (ROCm)" zip bundles its own HIP DLLs) set in `discovery.backend_server_binaries`,
+   or LM Studio with at least one `llama.cpp` runtime installed
+3. Models downloaded locally through LM Studio or stored in a known model directory
+4. Python 3.11 or newer
 
 This version is optimized for:
 
 - Windows
-- LM Studio
+- official llama.cpp builds, with LM Studio's bundled runtime as the fallback
 - `llama-server.exe`
 - local GGUF models
 
@@ -225,7 +268,8 @@ Dual GPU Studio is running
   Windows local: http://127.0.0.1:8090
 ```
 
-The Windows browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`:
+The Windows browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`.
+(`launch_service.py` starts the same service in the background and opens the browser when you run it from a terminal; a program launching it gets no browser.)
 
 ```powershell
 python .\app.py --config .\example.dual_gpu.toml --port 8095 --no-browser
@@ -524,14 +568,29 @@ Example:
 [discovery]
 lmstudio_home = "C:/Users/user/.lmstudio"
 models_dir = "D:/LLM models"
+backend_server_binaries = { rocm = "F:/llama.cpp/b11699-rocm/llama-server.exe" }
+multi_gpu_runtime = "lmstudio"
 ```
 
 Fields:
 
 - `lmstudio_home`: LM Studio home directory
 - `models_dir`: root folder where your GGUF models live
+- `backend_server_binaries`: the `llama-server` to run per backend. Without an entry, the newest
+  LM Studio runtime for that backend is used. Keep the build number in the folder name. Each run
+  records the build it used (`runtime` in `load.json`, `/api/status` servers and each run's
+  configuration), so results stay comparable across upgrades.
+- `multi_gpu_runtime`: `"configured"` (default) or `"lmstudio"`. With `"lmstudio"`, a model split
+  across both lanes runs on LM Studio's runtime, while single-lane servers keep the configured
+  build. Use it when a build serves each card correctly but corrupts output on a split. The
+  official b11699 ROCm build does this on R9700 + 9070 XT (see [CHANGELOG.md](CHANGELOG.md)).
+- `backend_runtime_overrides` / `backend_vendor_bin_overrides`: pin a specific LM Studio runtime
+  folder or GPU vendor DLL folder.
 
-You can also extend this section with backend runtime overrides if needed.
+Flags that llama.cpp renamed in `extra_args` are translated for builds that dropped the old
+spelling (`--no-mmap` becomes `--load-mode none`). Builds that support `--fit` get `--fit off`,
+because this repo sizes context and offload itself. `dual-gpu inspect` shows the runtime and build
+for each backend.
 
 ### `[policy]`
 
@@ -550,6 +609,13 @@ cache_reuse = 256
 flash_attn = "auto"
 gpu_layers = 999
 parallel = 1
+load_mode = "none"
+cache_ram_mib = 0
+vram_admission = true
+vram_headroom_gb = 1.0
+auto_load_models = true
+residency_guard = true
+residency_check_seconds = 15
 ```
 
 Important fields:
@@ -565,6 +631,25 @@ Important fields:
 - `flash_attn`: flash attention mode
 - `gpu_layers`: default layers to offload
 - `parallel`: default server slot count
+
+Host RAM and GPU-only placement (see [CHANGELOG.md](CHANGELOG.md), 2026-10-17, for the measurements):
+
+- `load_mode`: `"none"` (default), `"mmap"` or `"auto"` (llama.cpp's own default). `"none"` keeps the
+  weights from staying resident in RAM after they are uploaded to the GPU.
+- `cache_ram_mib`: cap on llama.cpp's prompt cache in system RAM. `0` (default) turns it off.
+  llama.cpp's own default is 8192 MiB per server, growing with every new prompt. Raise it only if
+  several conversations take turns on one model. A conversation's own follow-up turns still reuse
+  its context from the GPU cache.
+- `vram_admission`, `vram_headroom_gb`: start a server only if its weights + estimated KV cache +
+  headroom fit the VRAM actually free on its GPU(s), counting every process on the card. Otherwise
+  the deploy fails with `Not enough free VRAM...` instead of the model spilling into system RAM.
+- `auto_load_models`: an OpenAI-gateway request whose `model` names a catalog model loads it on
+  demand, replacing the least recently used idle model when the GPUs are full. A model that is
+  answering a request is never stopped.
+- `residency_guard`, `residency_check_seconds`: on Windows an idle model's VRAM can be moved into
+  system RAM, and its next request then pays a multi-second page-in. The guard pages such models
+  back into VRAM with a 1-token request on a reserved slot (servers start with `--parallel 2
+  --kv-unified`; real requests stay on slot 0). Set `residency_guard = false` for one plain slot.
 
 ### `[[lanes]]`
 
@@ -937,6 +1022,9 @@ For most teams, the best pattern is:
 1. keep this repo responsible for model serving and GPU scheduling
 2. keep application repos responsible for business logic and eval logic
 3. connect them through the task interface and the local OpenAI-compatible HTTP endpoint
+4. release the GPUs when the work is done: a client that loaded a model unloads it
+   (`POST /api/unload {"lane": ..., "model": ...}`), because the service never unloads on its own; see
+   [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when-a-task-is-done)
 
 That separation will keep future projects much easier to maintain.
 
@@ -966,6 +1054,10 @@ Look for the VRAM spill warning and the server log.
 
 If `cleanup_ports_on_start = true`, the orchestrator tries to clean orphan `llama-server` processes on lane ports.
 
+The web service does the same when it loads a model (`policy.kill_busy_ports`), and reports a leftover
+`llama-server` it does not manage as an orange banner on every dashboard page and as `orphans` in
+`GET /api/status`. **Stop them** (or **Unload everything** on the Service page) removes it.
+
 If some other application owns that port, change the lane ports in config.
 
 ### Task command fails
@@ -990,7 +1082,7 @@ Check:
 
 - expects exactly 2 lanes
 - currently optimized for Windows
-- current backend support is focused on LM Studio `rocm` and `vulkan`
+- current backend support is focused on `rocm` and `vulkan` (official llama.cpp builds or LM Studio's)
 - one active deployment at a time — a new deploy always replaces whatever was previously
   loaded, whether triggered from the dashboard or the [Client Integration API](CLIENT_API.md)
 - no authentication — the HTTP API (`app.py`) is a local-trust-boundary service; don't bind

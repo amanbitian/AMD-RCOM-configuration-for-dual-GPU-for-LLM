@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import ipaddress
 import json
 import os
@@ -10,6 +9,8 @@ import queue
 import signal
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -27,10 +28,23 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig, load_config
-from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
+from dual_gpu_setup import settings as service_settings
+from dual_gpu_setup.lmstudio import lane_free_vram_gb, model_size_gb, resolve_model_path
+from dual_gpu_setup.lmstudio_gpus import GpuSelectionError, get_selection, release, set_selection
 from dual_gpu_setup.orchestrator import ctx_for, estimate_kv_cache_gb, lane_capacity_gb, resolve_context_window
-from dual_gpu_setup.server import LlamaServerProcess, gpu_process_metrics_batch
+from dual_gpu_setup.hostos import get_host
+from dual_gpu_setup.scheduling.leases import LeaseError, LeaseStore
+from dual_gpu_setup.server import PLACEMENT_MIN_VRAM_FRACTION, LlamaServerProcess
 from dual_gpu_setup.reasoning import coding_request, model_reasoning
+from dual_gpu_setup.training.amd_smi import AmdSmiReader
+from dual_gpu_setup.training.benchmarks import BenchmarkRunner
+from dual_gpu_setup.training.evaluation import (
+    AdapterServerManager, EvalQueue, EvalWorker, EvaluationPipeline,
+)
+from dual_gpu_setup.training.hardware import HardwareSampler, KernelFaultWatcher
+from dual_gpu_setup.training.selection import select_best
+from dual_gpu_setup.training.service import FileResponse, TrainingService
+from dual_gpu_setup.training.store import TrainingError, TrainingStore
 
 
 APP_VERSION = "0.1.0"
@@ -124,44 +138,8 @@ def local_network_addresses() -> list[str]:
     return sorted(addresses, key=lambda value: tuple(int(part) for part in value.split(".")))
 
 
-class _FileTime(ctypes.Structure):
-    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
-
-    def value(self) -> int:
-        return (self.high << 32) | self.low
-
-
-class _MemoryStatus(ctypes.Structure):
-    _fields_ = [
-        ("length", ctypes.c_uint32),
-        ("memory_load", ctypes.c_uint32),
-        ("total_physical", ctypes.c_uint64),
-        ("available_physical", ctypes.c_uint64),
-        ("total_page_file", ctypes.c_uint64),
-        ("available_page_file", ctypes.c_uint64),
-        ("total_virtual", ctypes.c_uint64),
-        ("available_virtual", ctypes.c_uint64),
-        ("available_extended_virtual", ctypes.c_uint64),
-    ]
-
-
-class _ProcessMemoryCounters(ctypes.Structure):
-    _fields_ = [
-        ("cb", ctypes.c_uint32),
-        ("page_fault_count", ctypes.c_uint32),
-        ("peak_working_set_size", ctypes.c_size_t),
-        ("working_set_size", ctypes.c_size_t),
-        ("quota_peak_paged_pool_usage", ctypes.c_size_t),
-        ("quota_paged_pool_usage", ctypes.c_size_t),
-        ("quota_peak_non_paged_pool_usage", ctypes.c_size_t),
-        ("quota_non_paged_pool_usage", ctypes.c_size_t),
-        ("pagefile_usage", ctypes.c_size_t),
-        ("peak_pagefile_usage", ctypes.c_size_t),
-    ]
-
-
 class ResourceSampler:
-    """Collect lightweight Windows process/system metrics and GPU memory counters."""
+    """Collect lightweight process/system metrics and GPU memory counters via the host-OS layer."""
 
     def __init__(self, manager: "DeploymentManager", interval_seconds: float = 2.0):
         self.manager = manager
@@ -170,8 +148,6 @@ class ResourceSampler:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
-        self._last_process_times: dict[int, tuple[int, float]] = {}
-        self._last_system_times: tuple[int, int, int] | None = None
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -215,10 +191,9 @@ class ResourceSampler:
         with self.manager.lock:
             handles = list(self.manager.handles.items())
         live = [(target, handle) for target, handle in handles if handle.process.proc is not None]
-        # One PowerShell call for every active server's PID instead of one per server: the
-        # process spawn + Get-Counter cost is what makes this loop expensive, not the counter
-        # lookup itself, so batching is the win regardless of how many servers are active.
-        gpu_by_pid = gpu_process_metrics_batch([handle.process.pid for _, handle in live])
+        # One batched GPU-metrics call for every active server's PID instead of one per
+        # server (on Windows the PowerShell spawn + Get-Counter cost dominates this loop).
+        gpu_by_pid = get_host().gpu.process_metrics([handle.process.pid for _, handle in live])
         servers = []
         for target, handle in live:
             process = handle.process
@@ -251,73 +226,10 @@ class ResourceSampler:
         }
 
     def _process_metrics(self, pid: int, now: float) -> dict[str, Any]:
-        if os.name != "nt":
-            return {}
-        kernel32 = ctypes.windll.kernel32
-        psapi = ctypes.windll.psapi
-        process_query = 0x1000
-        handle = kernel32.OpenProcess(process_query, False, pid)
-        if not handle:
-            return {}
-        try:
-            created, exited, kernel, user = _FileTime(), _FileTime(), _FileTime(), _FileTime()
-            total_100ns: int | None = None
-            if kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(created),
-                ctypes.byref(exited),
-                ctypes.byref(kernel),
-                ctypes.byref(user),
-            ):
-                total_100ns = kernel.value() + user.value()
-            counters = _ProcessMemoryCounters()
-            counters.cb = ctypes.sizeof(counters)
-            memory_ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
-            cpu_pct = None
-            previous = self._last_process_times.get(pid)
-            if total_100ns is not None and previous:
-                delta_cpu_seconds = (total_100ns - previous[0]) / 10_000_000
-                delta_wall = max(now - previous[1], 0.001)
-                cpu_pct = max(0.0, min(100.0, delta_cpu_seconds / delta_wall / (os.cpu_count() or 1) * 100.0))
-            if total_100ns is not None:
-                self._last_process_times[pid] = (total_100ns, now)
-            return {
-                "cpu_pct": round(cpu_pct, 2) if cpu_pct is not None else None,
-                "rss_bytes": int(counters.working_set_size) if memory_ok else None,
-                "private_bytes": int(counters.pagefile_usage) if memory_ok else None,
-                "peak_rss_bytes": int(counters.peak_working_set_size) if memory_ok else None,
-                "peak_private_bytes": int(counters.peak_pagefile_usage) if memory_ok else None,
-                "page_fault_count": int(counters.page_fault_count) if memory_ok else None,
-            }
-        finally:
-            kernel32.CloseHandle(handle)
+        return get_host().process.metrics(pid, now)
 
     def _system_metrics(self) -> dict[str, Any]:
-        if os.name != "nt":
-            return {}
-        kernel32 = ctypes.windll.kernel32
-        idle, kernel, user = _FileTime(), _FileTime(), _FileTime()
-        cpu_pct = None
-        if kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
-            current = (idle.value(), kernel.value(), user.value())
-            if self._last_system_times:
-                idle_delta = current[0] - self._last_system_times[0]
-                total_delta = (current[1] - self._last_system_times[1]) + (current[2] - self._last_system_times[2])
-                if total_delta > 0:
-                    cpu_pct = max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
-            self._last_system_times = current
-        memory = _MemoryStatus()
-        memory.length = ctypes.sizeof(memory)
-        memory_ok = kernel32.GlobalMemoryStatusEx(ctypes.byref(memory))
-        return {
-            "cpu_pct": round(cpu_pct, 2) if cpu_pct is not None else None,
-            "ram_total_bytes": int(memory.total_physical) if memory_ok else None,
-            "ram_available_bytes": int(memory.available_physical) if memory_ok else None,
-            "ram_used_bytes": int(memory.total_physical - memory.available_physical) if memory_ok else None,
-            "ram_used_pct": float(memory.memory_load) if memory_ok else None,
-            "pagefile_used_bytes": int(memory.total_page_file - memory.available_page_file) if memory_ok else None,
-            "pagefile_total_bytes": int(memory.total_page_file) if memory_ok else None,
-        }
+        return get_host().system.metrics()
 
 
 class RunStore:
@@ -1311,6 +1223,141 @@ class ChatHistoryStore:
         return result
 
 
+class UsageLedger:
+    """Per-project, per-connection-type usage rollup in its own SQLite file.
+
+    Records requests and token totals for EVERY connection -- coding agents, model inference,
+    inline autocomplete, and any client that self-tags via X-DGPU-Connection-Type (e.g. a
+    training/data pipeline). To keep it optimised and bloat-free it is a DAILY ROLLUP, not a
+    per-request row: counts accumulate in memory and a background worker flushes them, so even
+    high-frequency autocomplete adds no DB write on the request path and the table stays small
+    (one row per project x connection-type x day).
+    """
+
+    def __init__(self, path: Path, enabled: bool = True, flush_interval: float = 5.0):
+        self.path = path
+        self.enabled = enabled
+        self._pending: dict[tuple[str, str, str], dict[str, int]] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._flush_interval = flush_interval
+        self._worker: threading.Thread | None = None
+        if not enabled:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+        self._worker = threading.Thread(target=self._run, name="usage-ledger", daemon=True)
+        self._worker.start()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    def _initialize(self) -> None:
+        with self.connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS project_usage (
+                    project_id TEXT NOT NULL,
+                    connection_type TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    requests INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, connection_type, usage_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_project_usage_date ON project_usage(usage_date DESC);
+                """
+            )
+
+    def record(self, project_id: str | None, connection_type: str,
+               input_tokens: int | None = 0, output_tokens: int | None = 0, requests: int = 1) -> None:
+        # Hot path: an O(1) in-memory accumulate under a short lock. No DB touch here.
+        if not self.enabled:
+            return
+        key = (project_id or "", connection_type or "unknown", utc_now()[:10])
+        with self._lock:
+            slot = self._pending.setdefault(key, {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+            slot["requests"] += requests
+            slot["input_tokens"] += int(input_tokens or 0)
+            slot["output_tokens"] += int(output_tokens or 0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._flush_interval):
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            pending, self._pending = self._pending, {}
+        if not pending:
+            return
+        now = utc_now()
+        rows = [(p, c, d, v["requests"], v["input_tokens"], v["output_tokens"], now)
+                for (p, c, d), v in pending.items()]
+        try:
+            with self.connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO project_usage
+                        (project_id, connection_type, usage_date, requests, input_tokens, output_tokens, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, connection_type, usage_date) DO UPDATE SET
+                        requests = requests + excluded.requests,
+                        input_tokens = input_tokens + excluded.input_tokens,
+                        output_tokens = output_tokens + excluded.output_tokens,
+                        updated_at = excluded.updated_at
+                    """,
+                    rows,
+                )
+        except sqlite3.Error:
+            # Never lose counts over a transient write error: fold them back in.
+            with self._lock:
+                for (p, c, d), v in pending.items():
+                    slot = self._pending.setdefault((p, c, d), {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+                    for field, value in v.items():
+                        slot[field] += value
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._worker is not None:
+            self._worker.join(timeout=5)
+        self.flush()
+
+    def query(self, project_id: str | None = None, connection_type: str | None = None,
+              start_date: str | None = None, end_date: str | None = None) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        self.flush()  # include not-yet-flushed counts so reads are current
+        conditions: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if connection_type:
+            conditions.append("connection_type = ?")
+            params.append(connection_type)
+        if start_date:
+            conditions.append("usage_date >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("usage_date <= ?")  # usage_date is date-only; end is inclusive
+            params.append(end_date)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT project_id, connection_type, usage_date, requests, input_tokens, output_tokens, updated_at
+                    FROM project_usage{where}
+                    ORDER BY usage_date DESC, project_id, connection_type""",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
 class AppError(RuntimeError):
     def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST):
         super().__init__(message)
@@ -1318,37 +1365,89 @@ class AppError(RuntimeError):
 
 
 class ServerHandle:
-    def __init__(self, target: str, model: ModelConfig, lanes: list[LaneConfig], process: LlamaServerProcess):
+    # A gateway request claims its handle when it is routed and converts the claim when it
+    # starts serving; a claim that is never converted (the request failed in between) stops
+    # protecting the handle from eviction after this long.
+    CLAIM_TTL_SECONDS = 60.0
+
+    def __init__(self, target: str, model: ModelConfig, lanes: list[LaneConfig], process: LlamaServerProcess,
+                 workload_kind: str | None = None):
         self.target = target
         self.model = model
         self.lanes = lanes
         self.process = process
+        self.workload_kind = workload_kind  # "coding_agent" when loaded for the gateway; kept so a reload matches
         self._reasoning_capabilities: dict[str, Any] | None = None
         self._inflight = 0
+        self._claims: list[float] = []
         self._inflight_lock = threading.Lock()
+        self.last_used = time.monotonic()
+        # Residency guard bookkeeping (Windows can page an idle server's VRAM out to RAM).
+        self.resident_gb: float | None = None
+        self.evictions = 0
+        self.rewarmed_at: str | None = None
+
+    def warm_slot(self) -> int | None:
+        probe = getattr(self.process, "warm_slot", None)
+        return probe() if callable(probe) else None
+
+    def pin_serving_slot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Real traffic always runs on slot 0 when the server reserves a warm-up slot: a warm-up
+        can then never overwrite a conversation's cached prompt, and requests still queue one at a
+        time exactly as with a single slot."""
+        if self.warm_slot() is not None:
+            payload["id_slot"] = 0
+        return payload
+
+    def claim(self) -> None:
+        """Reserve this server for a request that has been routed but not yet sent, so a
+        concurrent on-demand load cannot evict it in between."""
+        with self._inflight_lock:
+            self._claims.append(time.monotonic())
+            self.last_used = time.monotonic()
 
     @contextmanager
-    def serving(self):
+    def serving(self, claimed: bool = False):
         """Count an in-flight request so a deployment change can drain before stopping this
-        server, instead of killing another client's request mid-generation."""
+        server, instead of killing another client's request mid-generation. `claimed`: the
+        request claimed this handle when it was routed, so convert that claim."""
         with self._inflight_lock:
+            if claimed and self._claims:
+                self._claims.pop(0)
             self._inflight += 1
+            self.last_used = time.monotonic()
         try:
             yield
         finally:
             with self._inflight_lock:
                 self._inflight = max(0, self._inflight - 1)
+                self.last_used = time.monotonic()
 
     @property
     def inflight(self) -> int:
         with self._inflight_lock:
             return self._inflight
 
-    def drain(self, timeout: float) -> bool:
-        """Wait up to `timeout` seconds for in-flight requests to finish. Returns True if the
-        server went idle, False if it timed out (the caller stops it anyway to avoid hanging)."""
+    @property
+    def busy(self) -> bool:
+        """In flight, or routed and about to be (an unexpired claim)."""
+        with self._inflight_lock:
+            cutoff = time.monotonic() - self.CLAIM_TTL_SECONDS
+            self._claims = [stamp for stamp in self._claims if stamp >= cutoff]
+            return self._inflight > 0 or bool(self._claims)
+
+    def wait_idle(self, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
-        while self.inflight > 0 and time.monotonic() < deadline:
+        while self.busy and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return not self.busy
+
+    def drain(self, timeout: float, abort: threading.Event | None = None) -> bool:
+        """Wait up to `timeout` seconds for in-flight requests to finish. Returns True if the
+        server went idle, False if it timed out or `abort` was set ("Stop now"); the caller
+        stops it anyway to avoid hanging."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.inflight > 0 and time.monotonic() < deadline and not (abort is not None and abort.is_set()):
             time.sleep(0.05)
         return self.inflight == 0
 
@@ -1361,6 +1460,11 @@ class ServerHandle:
             path = Path(resolved) if resolved is not None else resolve_model_path(config, self.model)
             self._reasoning_capabilities = model_reasoning(path)
         return self._reasoning_capabilities
+
+    def runtime(self) -> dict[str, Any] | None:
+        """The llama-server build serving this handle (probed when the server started)."""
+        probe = getattr(self.process, "runtime", None)
+        return probe().public() if callable(probe) else None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -1376,11 +1480,19 @@ class ServerHandle:
             "reasoning_mode": self.model.reasoning_mode,
             "reasoning_effort": self.model.reasoning_effort,
             "draft_model": self.model.draft_model or None,
+            "runtime": self.runtime(),
+            "inflight": self.inflight,  # requests being answered right now (Unload waits for them)
+            "resident_gb": self.resident_gb,
+            "evictions": self.evictions,
+            "rewarmed_at": self.rewarmed_at,
         }
 
 
 class DeploymentManager:
     VALID_MODES = {"single_large_model", "parallel_models", "single_gpu"}
+    # Called with the lane keys a deployment would occupy; raises AppError(409) when a lane is
+    # leased (e.g. by a training run). Installed by ApplicationState.
+    lease_guard: Any = None
 
     def __init__(self, config: AppConfig, data_dir: Path, store: RunStore):
         self.config = config
@@ -1400,6 +1512,10 @@ class DeploymentManager:
         self.refresh_models()
         self.sampler = ResourceSampler(self)
         self.sampler.start()
+        self._guard_stop = threading.Event()
+        self._abort_drain = threading.Event()  # set by "Stop now": ends the wait for running requests
+        # Always running: the loop reads policy.residency_guard each tick, so the UI can switch it live.
+        threading.Thread(target=self._residency_loop, name="residency-guard", daemon=True).start()
 
     def _candidate_model_roots(self) -> list[Path]:
         candidates: list[Path] = []
@@ -1577,8 +1693,31 @@ class DeploymentManager:
             "reasoning_presets": DEFAULT_REASONING_PRESETS,
         }
 
+    def busy_lane_keys(self) -> set[str]:
+        with self.lock:
+            return {lane.key for handle in self.handles.values() for lane in handle.lanes}
+
+    def _check_leases(self, specs: list[dict[str, Any]]) -> None:
+        if self.lease_guard is not None:
+            self.lease_guard({lane.key for spec in specs for lane in spec["lanes"]})
+
+    def _mark_dead_lanes(self) -> None:
+        """Caller holds self.lock. A deployment whose lane server has exited is not ready, whatever
+        the last successful deploy reported; without this, status and chat routing keep trusting it."""
+        if self.state != "ready":
+            return
+        dead = sorted(
+            key
+            for key, handle in self.handles.items()
+            if handle.process.proc is None or handle.process.proc.poll() is not None
+        )
+        if dead:
+            self.state = "degraded"
+            self.error = f"llama-server exited on lane(s) {', '.join(dead)}; load the deployment again."
+
     def status(self) -> dict[str, Any]:
         with self.lock:
+            self._mark_dead_lanes()
             return {
                 "state": self.state,
                 "mode": self.mode,
@@ -1597,6 +1736,9 @@ class DeploymentManager:
             if mode not in self.VALID_MODES:
                 raise AppError(f"Unsupported mode: {mode}")
             specs = self._validate_profile(mode, profile)
+            self._check_leases(specs)
+            if "_abort_drain" in self.__dict__:
+                self._abort_drain.clear()
             with self.lock:
                 self.state = "switching"
                 self.error = None
@@ -1612,9 +1754,10 @@ class DeploymentManager:
 
             def start_one(spec: dict[str, Any]) -> None:
                 try:
+                    self._admit_vram(spec)
                     process = self._make_process(spec, run_dir)
                     process.start()
-                    handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process)
+                    handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process, spec.get("workload_kind"))
                     with self.lock:
                         started[spec["target"]] = handle
                 except BaseException as exc:  # include SystemExit raised by discovery helpers
@@ -1655,13 +1798,41 @@ class DeploymentManager:
         finally:
             self.transition_lock.release()
 
-    def unload(self) -> dict[str, Any]:
+    def unload(self, lane: str | None = None, orphans_only: bool = False, force: bool = False,
+               model: str | None = None) -> dict[str, Any]:
+        """Free GPU memory. No arguments: stop every model this service runs and any leftover
+        llama-server holding a lane port. `lane`: only that lane. `orphans_only`: only the
+        leftovers this service does not manage.
+
+        Running requests get `drain_timeout_seconds` to finish first. `force` ends that wait: when an
+        unload or load is already waiting it is told to stop waiting (and this returns at once);
+        otherwise it stops the models immediately, cutting any request in progress.
+
+        A lane-scoped unload reports `released`: whether a model was stopped. With `model` (the name
+        or catalog id the caller loaded) it unloads only if that is still what serves the lane, so a
+        client releasing "its" model cannot stop one another client has loaded there since."""
+        abort = self.__dict__.get("_abort_drain")
         if not self.transition_lock.acquire(blocking=False):
+            if force and abort is not None:
+                abort.set()
+                return self.status()
             raise AppError("Another deployment change is already in progress.", HTTPStatus.CONFLICT)
+        if abort is not None:
+            abort.set() if force else abort.clear()
         try:
+            if orphans_only:
+                self.reap_orphans()
+                return self.status()
+            if lane is not None:
+                target = self._lane(lane)
+                if model is not None and not self._lane_serves(target, model):
+                    return {**self.status(), "released": False}
+                released = self._unload_lane(target)
+                return {**self.status(), "released": released}
             with self.lock:
                 self.state = "switching"
             self._stop_all()
+            self._reap_orphans_safely()
             with self.lock:
                 self.state = "idle"
                 self.mode = "idle"
@@ -1670,18 +1841,150 @@ class DeploymentManager:
                 self.deployment_id = None
             return self.status()
         finally:
+            if abort is not None:
+                abort.clear()
             self.transition_lock.release()
 
+    def _lane_serves(self, lane: LaneConfig, model: str) -> bool:
+        """Is `model` (its resolved name, or the string the caller originally asked for) what serves `lane`?"""
+        with self.lock:
+            requested = self._requested_names_locked()
+            return any(model in {handle.model.name, requested.get(handle.target)}
+                       for handle in self.handles.values() if lane.key in {item.key for item in handle.lanes})
+
+    def _unload_lane(self, lane: LaneConfig) -> bool:
+        """Stop whatever serves `lane` (a split model also frees its other GPU) and keep the rest.
+        Returns whether a model was stopped."""
+        with self.lock:
+            requested = self._requested_names_locked()
+            victims = [handle for handle in self.handles.values() if lane.key in {item.key for item in handle.lanes}]
+            for victim in victims:
+                del self.handles[victim.target]
+                requested.pop(victim.target, None)
+        for victim in victims:
+            self._stop_handle(victim)
+        self._reap_orphans_safely([lane])
+        with self.lock:
+            self._refresh_profile_locked(requested)
+            self.state = "ready" if self.handles else "idle"
+            self.error = None
+            if not self.handles:
+                self.deployment_id = None
+        return bool(victims)
+
+    _orphan_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+    def lane_orphans(self, lanes: list[LaneConfig] | None = None) -> list[dict[str, Any]]:
+        """llama-server processes listening on a lane port that this service does not manage, e.g.
+        left behind when a previous instance was killed. They keep holding VRAM and RAM."""
+        control = get_host().control
+        with self.lock:
+            managed = {handle.process.proc.pid for handle in self.handles.values() if handle.process.proc is not None}
+        found: list[dict[str, Any]] = []
+        for lane in self.config.lanes if lanes is None else lanes:
+            pid = control.pid_listening_on(lane.port)
+            if pid is not None and pid not in managed and control.is_llama_server(pid):
+                found.append({"lane": lane.key, "port": lane.port, "pid": pid})
+        return found
+
+    def orphans_cached(self, ttl: float = 10.0) -> list[dict[str, Any]]:
+        """lane_orphans for the status poll: a port scan every 2 s would cost a netstat per lane."""
+        cached = self._orphan_cache
+        if cached is not None and time.monotonic() - cached[0] < ttl:
+            return cached[1]
+        try:
+            found = self.lane_orphans()
+        except Exception:  # noqa: BLE001 -- a failed scan must not break status
+            found = []
+        self._orphan_cache = (time.monotonic(), found)
+        return found
+
+    def reap_orphans(self, lanes: list[LaneConfig] | None = None) -> list[dict[str, Any]]:
+        control = get_host().control
+        reaped = self.lane_orphans(lanes)
+        for orphan in reaped:
+            print(f"[manager] stopping orphaned llama-server pid {orphan['pid']} on port {orphan['port']}", flush=True)
+            control.terminate_tree(orphan["pid"])
+        self._orphan_cache = None
+        return reaped
+
+    def _reap_orphans_safely(self, lanes: list[LaneConfig] | None = None) -> None:
+        try:
+            self.reap_orphans(lanes)
+        except Exception as exc:  # noqa: BLE001 -- freeing leftovers is best effort
+            print(f"[manager] could not stop orphaned servers: {exc}", flush=True)
+
     def shutdown(self) -> None:
+        self._guard_stop.set()
         self.sampler.stop()
         self._stop_all()
 
+    def _residency_loop(self) -> None:
+        while not self._guard_stop.wait(max(5.0, self.config.policy.residency_check_seconds)):
+            if not self.config.policy.residency_guard:
+                continue
+            try:
+                self.check_residency()
+            except Exception as exc:  # noqa: BLE001 -- the guard must never take the service down
+                print(f"[residency] check failed: {exc}", flush=True)
+
+    def check_residency(self) -> list[str]:
+        """Keep loaded models in VRAM. Windows can move an idle server's VRAM into system RAM
+        (measured: a 16.85 GB model at 0 GB resident; its next request took 10 s to page back in,
+        and RAM held the 16.85 GB meanwhile). Each idle server whose weights are no longer resident
+        gets a 1-token request on its reserved warm-up slot, which pages them back in now instead
+        of during the next real request. Returns the targets re-warmed."""
+        with self.lock:
+            candidates = [
+                handle for handle in self.handles.values()
+                if not handle.busy and handle.warm_slot() is not None
+                and handle.process.proc is not None and handle.process.proc.poll() is None
+            ]
+        if not candidates:
+            return []
+        gpu = get_host().gpu
+        adapters = gpu.adapter_memory()
+        luid_by_lane = {}
+        for lane in self.config.lanes:
+            luid_by_lane[lane.key] = next(
+                (adapter["luid"] for adapter in adapters if lane.match.lower() in adapter["name"].lower()), None)
+        usage = gpu.process_adapter_memory([handle.process.pid for handle in candidates])
+        warmed: list[str] = []
+        for handle in candidates:
+            per_adapter = usage.get(handle.process.pid)
+            luids = [luid_by_lane.get(lane.key) for lane in handle.lanes]
+            if per_adapter is None or None in luids:
+                continue  # the OS does not report it (Linux, or an unmatched adapter)
+            resident = sum(per_adapter.get(luid, 0.0) for luid in luids)
+            handle.resident_gb = round(resident, 2)
+            expected = model_size_gb(self.config, handle.model) * PLACEMENT_MIN_VRAM_FRACTION
+            if resident >= expected or handle.busy:
+                continue
+            handle.evictions += 1
+            print(f"[residency] {handle.model.name} on {handle.target} is {resident:.2f} GB resident "
+                  f"(weights {expected / PLACEMENT_MIN_VRAM_FRACTION:.2f} GB): paging it back into VRAM", flush=True)
+            try:
+                request = urlrequest.Request(
+                    f"{handle.process.base_url}/completion",
+                    data=json.dumps({"prompt": "ok", "n_predict": 1, "cache_prompt": False,
+                                     "id_slot": handle.warm_slot()}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
+                    method="POST",
+                )
+                with handle.serving(), urlrequest.urlopen(request, timeout=120) as response:
+                    response.read()
+                handle.rewarmed_at = utc_now()
+                warmed.append(handle.target)
+            except (urlerror.URLError, TimeoutError, OSError) as exc:
+                print(f"[residency] warm-up of {handle.target} failed: {exc}", flush=True)
+        return warmed
+
     def _stop_handle(self, handle: ServerHandle) -> None:
         # Let in-flight requests finish (bounded) before killing the server, so a deployment
-        # change never drops another client's request mid-generation.
-        if not handle.drain(self.config.policy.drain_timeout_seconds):
-            print(f"[{handle.target}] {handle.inflight} request(s) still in flight after "
-                  f"{self.config.policy.drain_timeout_seconds:.0f}s drain; stopping anyway.")
+        # change never drops another client's request mid-generation. "Stop now" cuts the wait.
+        abort = self.__dict__.get("_abort_drain")
+        if not handle.drain(self.config.policy.drain_timeout_seconds, abort):
+            print(f"[{handle.target}] {handle.inflight} request(s) still in flight; stopping anyway.", flush=True)
         handle.process.stop()
 
     def _stop_all(self) -> None:
@@ -1805,14 +2108,14 @@ class DeploymentManager:
             if len(backends) != 1:
                 raise AppError("Both lanes must use the same backend for multi-GPU mode.")
             self._validate_capacity(model, list(self.config.lanes))
-            return [{"target": "primary", "model": model, "lanes": list(self.config.lanes), "context": context, "multi": True}]
+            return [{"target": "primary", "model": model, "lanes": list(self.config.lanes), "context": context, "multi": True, "workload_kind": raw.get("workload_kind")}]
 
         if mode == "single_gpu":
             raw = profile.get("model") or {}
             lane = self._lane(str(raw.get("lane", "")))
             model, context = self._configured_model(raw, lane.vram_gb)
             self._validate_capacity(model, [lane])
-            return [{"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False}]
+            return [{"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False, "workload_kind": raw.get("workload_kind")}]
 
         raw_models = profile.get("models") or []
         if len(raw_models) != 2:
@@ -1826,7 +2129,7 @@ class DeploymentManager:
             seen_lanes.add(lane.key)
             model, context = self._configured_model(raw, lane.vram_gb)
             self._validate_capacity(model, [lane])
-            specs.append({"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False})
+            specs.append({"target": lane.key, "model": model, "lanes": [lane], "context": context, "multi": False, "workload_kind": raw.get("workload_kind")})
         return specs
 
     def _validate_capacity(self, model: ModelConfig, lanes: list[LaneConfig]) -> None:
@@ -2029,10 +2332,13 @@ class DeploymentManager:
             raw["max_output_tokens"] = max_output_tokens
         profile = {"mode": "single_gpu", "model": raw}
         spec = self._validate_profile("single_gpu", profile)[0]
+        self._check_leases([spec])
 
         # Blocking is intentional: two lane workers can finish together, and the
         # second should wait for the first model load instead of failing with 409.
         self.transition_lock.acquire()
+        if "_abort_drain" in self.__dict__:
+            self._abort_drain.clear()
         with self.lock:
             requested_by_lane = self._requested_model_names_by_lane()
         requested_by_lane[lane.key] = model_name
@@ -2050,9 +2356,10 @@ class DeploymentManager:
             run_dir = self.data_dir / "deployments" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             run_dir.mkdir(parents=True, exist_ok=True)
             try:
+                self._admit_vram(spec)
                 process = self._make_process(spec, run_dir)
                 process.start()
-                handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process)
+                handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process, spec.get("workload_kind"))
             except BaseException as exc:
                 message = f"{lane.key}: {exc}"
                 with self.lock:
@@ -2087,6 +2394,260 @@ class DeploymentManager:
         finally:
             self.transition_lock.release()
 
+    def _vram_need_gb(self, spec: dict[str, Any]) -> dict[str, float]:
+        """VRAM a spec takes per lane: weights (+ draft) + estimated KV cache + headroom. A
+        multi-GPU spec is split in --tensor-split proportion (else by lane VRAM), in the same
+        largest-lane-first device order LlamaServerProcess.for_multi_gpu launches with."""
+        model = spec["model"]
+        kv_gb, _note = estimate_kv_cache_gb(resolve_model_path(self.config, model), spec["context"])
+        total = (model_size_gb(self.config, model) + self._draft_footprint_gb(model)
+                 + (kv_gb or 0.0) + self.config.policy.vram_headroom_gb)
+        lanes = sorted(spec["lanes"], key=lambda lane: lane.vram_gb, reverse=True) if spec["multi"] else spec["lanes"]
+        try:
+            shares = [float(part) for part in model.tensor_split.split(",")] if spec["multi"] and model.tensor_split else []
+        except ValueError:
+            shares = []
+        if len(shares) != len(lanes) or sum(shares) <= 0:
+            shares = [lane.vram_gb for lane in lanes]
+        return {lane.key: total * share / sum(shares) for lane, share in zip(lanes, shares)}
+
+    def _admit_vram(self, spec: dict[str, Any], wait_seconds: float = 20.0) -> None:
+        """GPU-only placement. On Windows a GPU that runs out of VRAM silently backs the rest
+        with system RAM, so a server is started only when every lane it uses reports enough
+        free VRAM. Waits briefly first, because a just-stopped server's VRAM is released
+        asynchronously. A lane whose free VRAM cannot be read is not blocked.
+
+        A leftover llama-server on one of the lanes' ports (a previous instance that was killed) is
+        stopped first, as `kill_busy_ports` would do when the new server starts: its VRAM is not
+        usable by this load, and would otherwise make the free-VRAM check refuse it."""
+        if self.config.policy.kill_busy_ports:
+            self._reap_orphans_safely(spec["lanes"])
+        if not self.config.policy.vram_admission:
+            return
+        need = self._vram_need_gb(spec)
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                free = lane_free_vram_gb(self.config, spec["lanes"])
+            except (Exception, SystemExit):  # noqa: BLE001 -- an unreadable probe must not block loading
+                return
+            short = {key: (gb, free[key]) for key, gb in need.items() if key in free and free[key] < gb}
+            if not short:
+                return
+            if time.monotonic() >= deadline:
+                detail = ", ".join(f"{key} needs {gb:.1f} GB, {avail:.1f} GB free" for key, (gb, avail) in short.items())
+                raise AppError(
+                    f"Not enough free VRAM to keep {spec['model'].name} on the GPU ({detail}). Unload a model, "
+                    "lower its context window, or close other GPU applications.",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            time.sleep(1.0)
+
+    def knows_model(self, name: str) -> bool:
+        try:
+            self._model(name)
+        except AppError:
+            return False
+        return True
+
+    def _claim_loaded(self, source: ModelConfig, lane_key: str | None) -> tuple[str, ServerHandle] | None:
+        with self.lock:
+            for target, handle in self.handles.items():
+                if handle.model.name != source.name or handle.model.path != source.path:
+                    continue
+                if lane_key and lane_key not in {lane.key for lane in handle.lanes}:
+                    continue
+                if handle.process.proc is None or handle.process.proc.poll() is not None:
+                    continue  # exited; the planner will replace it
+                handle.claim()
+                return target, handle
+        return None
+
+    def _occupants(self, lanes: list[LaneConfig]) -> list[ServerHandle]:
+        keys = {lane.key for lane in lanes}
+        return [handle for handle in self.handles.values() if keys & {lane.key for lane in handle.lanes}]
+
+    def _plan_auto_load(self, requested: str, lane_key: str | None) -> tuple[dict[str, Any], list[ServerHandle]]:
+        """Choose where `requested` goes and which loaded servers must stop for it.
+
+        Candidates are the lanes it fits at its default context (smallest first), or -- only
+        when no single GPU can hold it -- every lane together. Preference: a free lane, then a
+        lane whose occupants are idle, least recently used first. Leased lanes are skipped."""
+        raw = {"model": requested, "workload_kind": "coding_agent"}
+        lanes = [self._lane(lane_key)] if lane_key else sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        options: list[dict[str, Any]] = []
+        reasons: list[str] = []
+        for lane in lanes:
+            try:
+                spec = self._validate_profile("single_gpu", {"mode": "single_gpu", "model": {**raw, "lane": lane.key}})[0]
+                self._check_leases([spec])
+                options.append(spec)
+            except AppError as exc:
+                reasons.append(f"{lane.key}: {exc}")
+        if not options and lane_key is None and len(self.config.lanes) > 1:
+            try:
+                spec = self._validate_profile("single_large_model", {"mode": "single_large_model", "model": raw})[0]
+                self._check_leases([spec])
+                options.append(spec)
+            except AppError as exc:
+                reasons.append(f"all GPUs: {exc}")
+        if not options:
+            raise AppError(f"{requested} cannot be placed on the GPUs. " + " ".join(reasons))
+        shortfall = self._vram_shortfall(options)
+        if shortfall is not None and all(shortfall[id(spec)] for spec in options):
+            detail = "; ".join(shortfall[id(spec)] for spec in options)
+            raise AppError(f"Not enough free VRAM to keep {requested} on the GPU even after unloading idle "
+                           f"models ({detail}). Close other GPU applications or use a smaller model.",
+                           HTTPStatus.SERVICE_UNAVAILABLE)
+        with self.lock:
+            def rank(spec: dict[str, Any]) -> tuple[bool, bool, bool, float]:
+                occupants = self._occupants(spec["lanes"])
+                return (bool(shortfall and shortfall[id(spec)]), bool(occupants),
+                        any(handle.busy for handle in occupants),
+                        max((handle.last_used for handle in occupants), default=0.0))
+
+            best = min(options, key=rank)  # min() keeps the first (smallest-lane) option on ties
+            return best, self._occupants(best["lanes"])
+
+    def _vram_shortfall(self, options: list[dict[str, Any]]) -> dict[int, str] | None:
+        """Per option: "" when it fits the VRAM free now plus what evicting our own servers on
+        its lanes would release, else a description of the shortfall. None when VRAM admission
+        is off or free VRAM cannot be read (the per-start check stays the final word)."""
+        if not self.config.policy.vram_admission:
+            return None
+        try:
+            free = lane_free_vram_gb(self.config, list(self.config.lanes))
+        except (Exception, SystemExit):  # noqa: BLE001
+            return None
+        if not free:
+            return None
+        with self.lock:
+            released: dict[str, float] = {}
+            for handle in self.handles.values():
+                held = {"target": handle.target, "model": handle.model, "lanes": handle.lanes,
+                        "context": handle.process.ctx_size, "multi": len(handle.lanes) > 1}
+                for key, gb in self._vram_need_gb(held).items():
+                    released[key] = released.get(key, 0.0) + gb
+        result: dict[int, str] = {}
+        for spec in options:
+            short = [f"{key} needs {gb:.1f} GB, {free[key] + released.get(key, 0.0):.1f} GB obtainable"
+                     for key, gb in self._vram_need_gb(spec).items()
+                     if key in free and free[key] + released.get(key, 0.0) < gb]
+            result[id(spec)] = ", ".join(short)
+        return result
+
+    def _requested_names_locked(self) -> dict[str, str]:
+        requested = self._requested_model_names_by_lane()
+        profile = self.active_profile or {}
+        if profile.get("mode") == "single_large_model" and isinstance(profile.get("model"), dict):
+            requested["primary"] = str(profile["model"].get("model") or "")
+        return requested
+
+    def _refresh_profile_locked(self, requested: dict[str, str]) -> None:
+        """Rebuild mode/active_profile from the handles actually loaded (caller holds self.lock)."""
+        def kind(handle: ServerHandle) -> dict[str, str]:
+            return {"workload_kind": handle.workload_kind} if handle.workload_kind else {}
+
+        if "primary" in self.handles:
+            handle = self.handles["primary"]
+            self.mode = "single_large_model"
+            self.active_profile = {"mode": self.mode, "model": {
+                "model": requested.get("primary") or handle.model.name, "context_window": handle.process.ctx_size,
+                **kind(handle)}}
+        elif self.handles:
+            self.mode = "parallel_models" if len(self.handles) > 1 else "single_gpu"
+            self.active_profile = {"mode": self.mode, "models": [
+                {"model": requested.get(target) or handle.model.name, "lane": target,
+                 "context_window": handle.process.ctx_size, **kind(handle)}
+                for target, handle in self.handles.items()]}
+        else:
+            self.mode = "idle"
+            self.active_profile = None
+
+    def ensure_model(self, requested: str, lane_key: str | None = None) -> tuple[str, ServerHandle]:
+        """Serve `requested` from the GPUs for an OpenAI-gateway request, loading it on demand.
+
+        Already loaded (on `lane_key`, when given): returned as is. Otherwise it is placed per
+        _plan_auto_load, evicting the least recently used idle model(s) it displaces, and only
+        started when its weights + KV cache fit the VRAM the GPU reports free (_admit_vram), so
+        it never lands in system RAM. A model that is serving is never stopped mid-request: if
+        it stays busy past the drain timeout the caller gets 503 and should retry. The returned
+        handle is already claimed for the caller's request."""
+        source = self._model(requested)
+        found = self._claim_loaded(source, lane_key)
+        if found:
+            return found
+        if not self.transition_lock.acquire(timeout=self.config.project.start_timeout_seconds):
+            raise AppError("Another model is still loading; retry shortly.", HTTPStatus.SERVICE_UNAVAILABLE)
+        if "_abort_drain" in self.__dict__:
+            self._abort_drain.clear()  # a stale "Stop now" must not cut this swap's wait short
+        try:
+            found = self._claim_loaded(source, lane_key)
+            if found:
+                return found
+            if self.config.policy.kill_busy_ports:
+                # A leftover llama-server on a lane port holds VRAM no plan can use; stop it first
+                # (kill_busy_ports would do so at start anyway) so the free-VRAM check sees the truth.
+                self._reap_orphans_safely()
+            spec, victims = self._plan_auto_load(requested, lane_key)
+            for victim in victims:
+                victim.wait_idle(self.config.policy.drain_timeout_seconds)
+            with self.lock:
+                busy = [victim for victim in victims if victim.busy]
+                if busy:
+                    raise AppError(
+                        f"Cannot load {source.name}: {', '.join(f'{v.model.name} on {v.target}' for v in busy)} "
+                        "is still serving a request; retry shortly.",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                requested_names = self._requested_names_locked()
+                for victim in victims:
+                    if self.handles.get(victim.target) is victim:
+                        del self.handles[victim.target]
+                    requested_names.pop(victim.target, None)
+                self._refresh_profile_locked(requested_names)
+                self.state = "switching" if not self.handles else self.state
+                self.error = None
+            for victim in victims:
+                print(f"[manager] evicting {victim.model.name} from {victim.target} to load {source.name}", flush=True)
+                victim.process.stop()
+
+            profile = {"mode": "single_large_model" if spec["multi"] else "single_gpu", "workload_kind": "coding_agent",
+                       "model": {"model": requested, **({} if spec["multi"] else {"lane": spec["target"]})}}
+            deployment_id = str(uuid.uuid4())
+            self.store.begin_deployment(deployment_id, "auto_load", profile)
+            run_dir = self.data_dir / "deployments" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self._admit_vram(spec)
+                process = self._make_process(spec, run_dir)
+                process.start()
+            except BaseException as exc:
+                message = f"{spec['target']}: {exc}"
+                with self.lock:
+                    self.state = "ready" if self.handles else "error"
+                    self.error = message
+                self.store.update_deployment(deployment_id, "failed", error=message)
+                if isinstance(exc, AppError):
+                    raise
+                raise AppError(message, HTTPStatus.INTERNAL_SERVER_ERROR) from exc
+
+            handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process, "coding_agent")
+            handle.claim()
+            with self.lock:
+                self.handles[spec["target"]] = handle
+                requested_names[spec["target"]] = requested
+                self._refresh_profile_locked(requested_names)
+                self.deployment_id = deployment_id
+                self.state = "ready"
+                self.error = None
+                servers = [active.public() for active in self.handles.values()]
+            self.store.update_deployment(deployment_id, "ready", servers=servers)
+            print(f"[manager] loaded {source.name} on {spec['target']}", flush=True)
+            return spec["target"], handle
+        finally:
+            self.transition_lock.release()
+
     def _make_process(self, spec: dict[str, Any], run_dir: Path) -> LlamaServerProcess:
         model = spec["model"]
         path = resolve_model_path(self.config, model)
@@ -2101,10 +2662,11 @@ class DeploymentManager:
 
 class ChatService:
     def __init__(self, manager: DeploymentManager, store: RunStore,
-                 history: "ChatHistoryStore | None" = None):
+                 history: "ChatHistoryStore | None" = None, usage: "UsageLedger | None" = None):
         self.manager = manager
         self.store = store
         self.history = history or ChatHistoryStore(Path(), enabled=False)
+        self.usage = usage or UsageLedger(Path(), enabled=False)
         self._client_output_lock = threading.Lock()
 
     def _coding_request(self, handle: ServerHandle, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2190,6 +2752,9 @@ class ChatService:
                 self.store.link_client_project(client["id"], project_id)
         if project_id and self.store.get_project(project_id) is None:
             raise AppError(f"Unknown project_id: {project_id}", HTTPStatus.NOT_FOUND)
+        if not project_id:
+            # Watertight: an unattributed call still lands in the default project.
+            project_id = self.store.upsert_project(self.manager.config.project.default_project)["id"]
         workload_kind = str(payload.get("workload_kind") or "evaluation").strip().lower()
         if workload_kind not in {"evaluation", "coding_agent"}:
             raise AppError("workload_kind must be 'evaluation' or 'coding_agent'.")
@@ -2201,6 +2766,7 @@ class ChatService:
         # land in the same dashboard category instead of silently fragmenting into two.
         task_label = str(task_label).strip().lower() or None if task_label else None
         with self.manager.lock:
+            self.manager._mark_dead_lanes()
             if self.manager.state != "ready" or not self.manager.handles:
                 raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
             requested_targets = payload.get("targets")
@@ -2321,6 +2887,7 @@ class ChatService:
             ),
             "lanes": [asdict(lane) for lane in handle.lanes],
             "server_command": handle.process.build_command(),
+            "runtime": handle.runtime(),
             "reasoning": reasoning_settings,
         }
         self.store.begin_run(
@@ -2354,7 +2921,7 @@ class ChatService:
             with handle.serving():  # drained before a deployment change stops this server
                 backend = self._post_json(
                     f"{handle.process.base_url}/v1/chat/completions",
-                    request_payload,
+                    handle.pin_serving_slot(dict(request_payload)),
                     timeout=float(payload.get("timeout_seconds", 900)),
                 )
             elapsed = time.monotonic() - started
@@ -2393,6 +2960,8 @@ class ChatService:
                     "messages": messages, "tools": payload.get("tools"), "output_text": output,
                     "reasoning_text": reasoning, "tool_calls": message.get("tool_calls"),
                 })
+            self.usage.record(project_id, str(payload.get("connection_type") or workload_kind),
+                              usage.get("input_tokens"), usage.get("output_tokens"))
             delivery = self._deliver_to_client(client, run_id, target, handle, final)
             result = {"run_id": run_id, "model": handle.model.name, **final, "backend_response": None}
             if delivery is not None:
@@ -2650,6 +3219,7 @@ class ApplicationState:
     def __init__(self, config_path: Path, data_dir: Path):
         self.config_path = config_path
         self.config = load_config(config_path)
+        self.control: ServiceControl | None = None  # set by main(); the UI's restart/stop need it
         self.data_dir = data_dir
         self.store = RunStore(data_dir / "chatbot.sqlite3")
         history_path = (
@@ -2658,8 +3228,114 @@ class ApplicationState:
             else data_dir / "chat_history.sqlite3"
         )
         self.history = ChatHistoryStore(history_path, enabled=self.config.project.store_chat_history)
+        self.usage = UsageLedger(data_dir / "project_usage.sqlite3")
         self.manager = DeploymentManager(self.config, data_dir, self.store)
-        self.chat = ChatService(self.manager, self.store, self.history)
+        self.chat = ChatService(self.manager, self.store, self.history, self.usage)
+        training_db = data_dir / "training.sqlite3"
+        self.training = TrainingStore(training_db)
+        self.leases = LeaseStore(training_db)
+        self.manager.lease_guard = self._lease_guard
+        self.hardware = HardwareSampler(
+            self.config.lanes, on_samples=self._persist_hardware_samples, on_system=self._persist_system_sample,
+            smi=AmdSmiReader() if sys.platform.startswith("linux") else None,
+        )
+        self.kernel_faults = KernelFaultWatcher(self._record_kernel_fault)
+        self.eval_queue = EvalQueue(training_db, capacity=self.config.evaluation.queue_capacity)
+        self.benchmarks = BenchmarkRunner(
+            training_db, self.training, "http://127.0.0.1:8090",
+            on_trial_end=lambda run_id: self.service.cleanup_trial(run_id),
+        )
+        self.service = TrainingService(
+            self.config, self.training, self.leases, self.eval_queue, self.benchmarks, self.hardware,
+            data_dir / "artifacts", self.manager.busy_lane_keys, self.manager.unload,
+        )
+        self.eval_worker = self._build_eval_worker() if self.config.evaluation.enabled else None
+
+    def _eval_server_factory(self, base: Path, adapter: Path) -> LlamaServerProcess:
+        settings = self.config.evaluation
+        model = ModelConfig(name=f"eval-{base.stem}", path=str(base), ctx_size=settings.ctx_size, parallel=1,
+                            extra_args=["--lora", str(adapter)])
+        return LlamaServerProcess.for_single_lane(
+            self.config, self.manager._lane(settings.lane), model, base, settings.ctx_size,
+            self.data_dir / "eval_servers",
+        )
+
+    def _build_eval_worker(self) -> EvalWorker:
+        settings = self.config.evaluation
+        holder = "evaluation:worker"
+        pipeline = EvaluationPipeline(settings, self.training, AdapterServerManager(self._eval_server_factory),
+                                      workdir=self.data_dir / "eval_work")
+        return EvalWorker(
+            self.eval_queue, pipeline,
+            lane_ready=lambda: settings.lane not in self.manager.busy_lane_keys()
+            and not self.leases.conflicts([settings.lane], ignore_holder=holder),
+            acquire_lane=lambda: self.leases.acquire(holder, [settings.lane], kind="evaluation",
+                                                     ttl_s=float(settings.timeout_s) * 3),
+            release_lane=lambda _lease: self.leases.release_holder(holder),
+            on_done=lambda job, _outcomes: select_best(self.training, job["run_id"], settings, apply=True),
+        )
+
+    def _lease_guard(self, lanes: set[str]) -> None:
+        conflicts = self.leases.conflicts(lanes)
+        if conflicts:
+            detail = "; ".join(f"{c['lane']} is leased by {c['holder']}" for c in conflicts)
+            raise AppError(f"GPU lane unavailable: {detail}. Finish or release that job first.", HTTPStatus.CONFLICT)
+
+    def inference_leases(self) -> list[dict[str, Any]]:
+        """Loaded inference servers shown as pseudo-leases (derived, not stored)."""
+        with self.manager.lock:
+            return [{"id": f"inference:{target}", "holder": f"inference:{target}", "kind": "inference",
+                     "state": "active", "lanes": [lane.key for lane in handle.lanes],
+                     "model": handle.model.name, "expires_at": None}
+                    for target, handle in self.manager.handles.items()]
+
+    def lane_holders(self) -> dict[str, dict[str, Any]]:
+        holders = self.leases.lane_holders()
+        for lease in self.inference_leases():
+            for lane in lease["lanes"]:
+                holders.setdefault(lane, {"holder": lease["holder"], "kind": "inference",
+                                          "lease_id": lease["id"], "expires_at": None})
+        return holders
+
+    def _persist_hardware_samples(self, samples: list[dict[str, Any]]) -> None:
+        # Samples are kept in SQLite only while a training run is live; the idle dashboard
+        # keeps just the in-memory ring buffer so it adds no write load.
+        if self.training.has_active_runs():
+            self.training.add_hardware_samples(samples)
+
+    def _persist_system_sample(self, sample: dict[str, Any]) -> None:
+        if self.training.has_active_runs():
+            self.training.add_system_sample(sample["ts"], sample["cpu_pct"], sample["ram_used_pct"], sample["swap_used_bytes"])
+
+    def _record_kernel_fault(self, kind: str, severity: str, payload: dict[str, Any]) -> None:
+        self.training.add_event_to_active_runs(kind, severity, payload)
+
+    def start_telemetry(self) -> None:
+        self.training.prune_hardware(older_than_days=30)
+        self.hardware.start()
+        self.kernel_faults.start()
+        if self.eval_worker is not None:
+            self.eval_worker.start()
+
+    def close(self) -> None:
+        """Flush and stop the background usage/history writers (connections + threads)."""
+        self.usage.close()
+        self.history.close()
+
+    def stop_telemetry(self) -> None:
+        self.hardware.stop()
+        self.kernel_faults.stop()
+        if self.eval_worker is not None:
+            self.eval_worker.stop()
+        for benchmark in self.benchmarks.list():
+            self.benchmarks.cancel(benchmark["id"])
+
+    def training_overview(self) -> dict[str, Any]:
+        return {
+            "hardware": self.hardware.snapshot(),
+            "lane_holders": self.lane_holders(),
+            "kernel_faults": {"active": self.kernel_faults.active, "reason": self.kernel_faults.inactive_reason},
+        }
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -2731,6 +3407,150 @@ class ApplicationState:
         return self.store.record_tool_event(payload)
 
 
+def deployable_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """The current deployment as a request `deploy()` accepts. After an on-demand load or a lane
+    replacement the profile lists `models` even for a single GPU, while deploy() wants `model`."""
+    models = profile.get("models")
+    if profile.get("mode") == "single_gpu" and "model" not in profile and isinstance(models, list) and len(models) == 1:
+        return {**{key: value for key, value in profile.items() if key != "models"}, "model": models[0]}
+    return profile
+
+
+def wait_for_exit(pid: int, timeout: float = 90.0) -> bool:
+    """Block until process `pid` has exited (a restarting predecessor releasing its port)."""
+    host = get_host()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if host.process.identity(pid) is None:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+class ServiceControl:
+    """Restart or stop this service from the UI and API.
+
+    A restart stops every model server first (and any leftover one on a lane port), starts a
+    replacement process that waits for this one to exit before binding the port (`--replace-pid`),
+    then shuts this one down. With `reload_models` the loaded deployment is saved and the
+    replacement loads it again.
+    """
+
+    RESTORE_FILE = "restart_state.json"
+    RESTORE_MAX_AGE_SECONDS = 600.0
+
+    def __init__(self, state: "ApplicationState", args: argparse.Namespace):
+        self.state = state
+        self.args = args
+        self.server: Any = None  # the listening HTTP server; set by main() once it is up
+        self.started_at = utc_now()
+        self._started = time.monotonic()
+        self._lock = threading.Lock()
+        self.pending: str | None = None
+
+    @property
+    def restore_path(self) -> Path:
+        return self.state.data_dir / self.RESTORE_FILE
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "uptime_seconds": round(time.monotonic() - self._started),
+            "host": self.args.host,
+            "port": self.args.port,
+            "config_path": str(self.state.config_path),
+            "data_dir": str(self.state.data_dir),
+            "app_version": APP_VERSION,
+            "python": sys.executable,
+            "can_restart": self.server is not None,
+            "pending": self.pending,
+            "restore_pending": self.restore_path.exists(),
+        }
+
+    def request(self, action: str, reload_models: bool = False) -> dict[str, Any]:
+        if action not in {"restart", "stop"}:
+            raise AppError(f"Unknown service action: {action}")
+        if self.server is None:
+            raise AppError("This process cannot restart itself (it was not started by app.py).", HTTPStatus.CONFLICT)
+        with self._lock:
+            if self.pending:
+                raise AppError(f"A service {self.pending} is already in progress.", HTTPStatus.CONFLICT)
+            self.pending = action
+        manager = self.state.manager
+        profile = manager.active_profile if reload_models and action == "restart" else None
+        try:
+            if profile:
+                self.restore_path.write_text(json.dumps({"created": time.time(), "profile": profile}), encoding="utf-8")
+            else:
+                self.restore_path.unlink(missing_ok=True)
+            manager.unload()  # models stop before the reply, so a busy deployment is reported to the caller
+        except BaseException:
+            with self._lock:
+                self.pending = None
+            self.restore_path.unlink(missing_ok=True)
+            raise
+        threading.Thread(target=self._finish, args=(action,), name="service-control", daemon=True).start()
+        return {"ok": True, "action": action, "reload_models": bool(profile), "pid": os.getpid()}
+
+    def _finish(self, action: str) -> None:
+        time.sleep(0.5)  # let the HTTP reply reach the browser before the listener goes away
+        try:
+            if action == "restart":
+                self._spawn_replacement()
+        except Exception as exc:  # noqa: BLE001 -- keep serving rather than leave no service at all
+            print(f"[service] restart failed, still running: {exc}", flush=True)
+            with self._lock:
+                self.pending = None
+            self.restore_path.unlink(missing_ok=True)
+            return
+        self.server.shutdown()
+
+    def replacement_command(self) -> list[str]:
+        return [sys.executable, str(Path(__file__).resolve()), "--config", str(self.state.config_path),
+                "--host", self.args.host, "--port", str(self.args.port), "--data-dir", str(self.state.data_dir),
+                "--no-browser", "--replace-pid", str(os.getpid())]
+
+    def _spawn_replacement(self) -> None:
+        command = self.replacement_command()
+        flags = 0
+        if sys.platform == "win32":
+            # Detached from this process's console and process group, so it outlives this process.
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        with open(self.state.data_dir / "launcher.log", "a", encoding="utf-8", errors="replace") as log:
+            log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} :: restart from the UI :: {' '.join(command)} ===\n")
+            log.flush()
+            subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             creationflags=flags, close_fds=True)
+
+    def restore_after_restart(self) -> bool:
+        """On startup: reload the deployment a restart with `reload_models` saved, if it is fresh."""
+        try:
+            raw = self.restore_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        self.restore_path.unlink(missing_ok=True)  # one shot: a crash must not replay it on a later start
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return False
+        profile = payload.get("profile") if isinstance(payload, dict) else None
+        fresh = isinstance(payload, dict) and time.time() - float(payload.get("created", 0)) <= self.RESTORE_MAX_AGE_SECONDS
+        if not isinstance(profile, dict) or not fresh:
+            return False
+        profile = deployable_profile(profile)
+
+        def reload() -> None:
+            try:
+                self.state.manager.deploy(profile)
+                print("[service] reloaded the models that were loaded before the restart", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[service] could not reload the previous models: {exc}", flush=True)
+
+        threading.Thread(target=reload, name="restore-models", daemon=True).start()
+        return True
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     server: ChatbotHTTPServer
     protocol_version = "HTTP/1.1"
@@ -2749,7 +3569,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, self.server.app_state.bootstrap())
             return
         if path == "/api/status":
-            self._send_json(HTTPStatus.OK, self.server.app_state.manager.status())
+            manager = self.server.app_state.manager
+            self._send_json(HTTPStatus.OK, {**manager.status(), "orphans": manager.orphans_cached()})
+            return
+        if path == "/api/service":
+            try:
+                self._send_json(HTTPStatus.OK, self._service_control().info())
+            except AppError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+            return
+        if path == "/api/settings":
+            self._send_json(HTTPStatus.OK, self._settings_payload())
             return
         if path == "/api/dashboard":
             project_id = (query.get("project_id") or [None])[0]
@@ -2768,6 +3598,28 @@ class RequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 self.server.app_state.store.dashboard(project_id, workload_kind, start_date, end_date),
             )
+            return
+        if path == "/api/usage":
+            start_date = (query.get("start_date") or [None])[0]
+            end_date = (query.get("end_date") or [None])[0]
+            try:
+                for value in (start_date, end_date):
+                    if value:
+                        datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST,
+                                {"error": "start_date and end_date must be YYYY-MM-DD."})
+                return
+            rows = self.server.app_state.usage.query(
+                (query.get("project_id") or [None])[0], (query.get("connection_type") or [None])[0],
+                start_date, end_date)
+            totals: dict[str, dict[str, int]] = {}
+            for row in rows:
+                bucket = totals.setdefault(row["connection_type"],
+                                           {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+                for field in bucket:
+                    bucket[field] += row[field]
+            self._send_json(HTTPStatus.OK, {"rows": rows, "by_connection_type": totals})
             return
         if path == "/api/runs":
             try:
@@ -2822,17 +3674,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"projects": self.server.app_state.store.projects()})
             return
         if path == "/v1/models" or (path.startswith("/v1/") and path.endswith("/models")):
-            servers = self.server.app_state.manager.status().get("servers", [])
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "object": "list",
-                    "data": [
-                        {"id": server["target"], "object": "model", "owned_by": "dual-gpu-studio"}
-                        for server in servers
-                    ],
-                },
-            )
+            manager = self.server.app_state.manager
+            servers = manager.status().get("servers", [])
+            data = [{"id": server["target"], "object": "model", "owned_by": "dual-gpu-studio"} for server in servers]
+            if manager.config.policy.auto_load_models:
+                # Every catalog model is requestable by name; it loads on demand (GPU only).
+                with manager.lock:
+                    records = [record for record in manager.model_records if record.get("exists")]
+                names = [record["name"] for record in records]
+                loaded = {server["model"] for server in servers}
+                data += [
+                    {"id": record["name"] if names.count(record["name"]) == 1 else record["id"], "object": "model",
+                     "owned_by": "dual-gpu-studio", "loaded": record["name"] in loaded}
+                    for record in records
+                ]
+            self._send_json(HTTPStatus.OK, {"object": "list", "data": data})
             return
         if path.startswith("/api/runs/"):
             run_id = path.rsplit("/", 1)[-1]
@@ -2844,6 +3700,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/clients/schema":
             self._send_json(HTTPStatus.OK, CLIENT_METRICS_SCHEMA)
+            return
+        if path == "/api/lmstudio/gpus":
+            try:
+                self._send_json(HTTPStatus.OK, get_selection(
+                    self.server.app_state.config, (query.get("backend") or ["rocm"])[0]))
+            except GpuSelectionError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+            return
+        if path == "/api/leases":
+            try:
+                self._send_json(HTTPStatus.OK, self._leases_api("GET", path, query, {}))
+            except AppError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+            return
+        if path == "/api/hardware" or path.startswith("/api/training/"):
+            try:
+                result = self._training_get(path, query)
+                if isinstance(result, FileResponse):
+                    self._send_file(result)
+                else:
+                    self._send_json(HTTPStatus.OK, result)
+            except TrainingError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid query parameter."})
             return
         if path.startswith("/api/clients/") and path.endswith("/runs"):
             client_id = path.split("/")[3]
@@ -2873,7 +3754,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.server.app_state.manager.refresh_models()
                 result = {"catalog": self.server.app_state.manager.catalog()}
             elif path == "/api/unload":
-                result = self.server.app_state.manager.unload()
+                lane = payload.get("lane")
+                expected = payload.get("model")
+                if expected and not lane:
+                    raise AppError("`model` only applies together with `lane`: it makes the unload conditional "
+                                   "on that model still serving the lane.")
+                result = self.server.app_state.manager.unload(
+                    lane=str(lane) if lane else None, orphans_only=payload.get("orphans_only") is True,
+                    force=payload.get("force") is True, model=str(expected) if expected else None)
+            elif path in ("/api/service/restart", "/api/service/stop"):
+                self._require_json_content_type()
+                action = path.rsplit("/", 1)[-1]
+                result = self._service_control().request(action, reload_models=payload.get("reload_models") is True)
+            elif path == "/api/settings":
+                self._require_json_content_type()
+                result = self._apply_settings(payload)
             elif path == "/api/chat":
                 result = self.server.app_state.chat.chat(payload)
             elif path == "/api/clients/register":
@@ -2929,30 +3824,129 @@ class RequestHandler(BaseHTTPRequestHandler):
                     int(input_tokens) if input_tokens is not None else None,
                     int(max_output_tokens) if max_output_tokens is not None else None,
                 )
+            elif path in ("/api/lmstudio/gpus", "/api/lmstudio/release"):
+                # These edit LM Studio's config / unload its models. Requiring a JSON content type
+                # forces a CORS preflight, so a web page cannot trigger them with a blind form POST.
+                if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                    raise AppError("Content-Type must be application/json.", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                config = self.server.app_state.config
+                try:
+                    if path == "/api/lmstudio/gpus":
+                        result = set_selection(config, payload.get("gpus"), str(payload.get("backend") or "rocm"))
+                    else:
+                        result = release(config, force=payload.get("force") is True,
+                                         stop_server=payload.get("stop_server") is True)
+                except GpuSelectionError as exc:
+                    raise AppError(str(exc), exc.status) from exc
+            elif path.startswith("/api/leases"):
+                result = self._leases_api("POST", path, {}, payload)
+            elif path.startswith("/api/training/"):
+                result = self._training_post(path, payload)
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
             self._send_json(HTTPStatus.OK, result)
         except AppError as exc:
             self._send_json(exc.status, {"error": str(exc)})
+        except TrainingError as exc:
+            self._send_json(exc.status, {"error": str(exc)})
         except json.JSONDecodeError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
         except Exception as exc:  # noqa: BLE001
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        try:
+            if not parsed.path.startswith("/api/leases/"):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                return
+            self._send_json(HTTPStatus.OK, self._leases_api("DELETE", parsed.path, parse_qs(parsed.query), {}))
+        except AppError as exc:
+            self._send_json(exc.status, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+    def _leases_api(self, method: str, path: str, query: dict[str, list[str]], payload: dict[str, Any]) -> dict[str, Any]:
+        """GET /api/leases | POST /api/leases | POST /api/leases/{id}/renew|preempt | DELETE /api/leases/{id}.
+        Renew and release need the token returned at acquire (body `token`, `?token=`, or X-Lease-Token)."""
+        state = self.server.app_state
+        parts = [part for part in path.split("/") if part]
+        token = payload.get("token") or (query.get("token") or [None])[0] or self.headers.get("X-Lease-Token")
+        try:
+            if method == "GET" and len(parts) == 2:
+                return {"leases": state.leases.list_active() + state.inference_leases(),
+                        "lane_holders": state.lane_holders()}
+            if method == "POST" and len(parts) == 2:
+                lanes = [str(lane) for lane in payload.get("lanes") or []]
+                known = {lane.key for lane in state.config.lanes}
+                if not set(lanes) <= known:
+                    raise AppError(f"Unknown lane(s): {', '.join(sorted(set(lanes) - known))}.")
+                busy = sorted(set(lanes) & state.manager.busy_lane_keys())
+                if busy:
+                    raise AppError(f"Inference is loaded on lane(s) {', '.join(busy)}.", HTTPStatus.CONFLICT)
+                return state.leases.acquire(
+                    str(payload.get("holder") or ""), lanes, kind=str(payload.get("kind") or "training"),
+                    ttl_s=float(payload.get("ttl_s") or 120.0),
+                    pid=int(payload["pid"]) if payload.get("pid") else None,
+                )
+            if len(parts) == 4 and method == "POST" and parts[3] == "renew":
+                ttl = payload.get("ttl_s")
+                return state.leases.renew(parts[2], token, float(ttl) if ttl else None)
+            if len(parts) == 4 and method == "POST" and parts[3] == "preempt":
+                return state.leases.terminate_holder(parts[2])
+            if len(parts) == 3 and method == "DELETE":
+                return state.leases.release(parts[2], token)
+        except LeaseError as exc:
+            raise AppError(str(exc), exc.status) from exc
+        raise AppError("Not found.", HTTPStatus.NOT_FOUND)
+
+    def _training_get(self, path: str, query: dict[str, list[str]]) -> Any:
+        state = self.server.app_state
+        if path == "/api/hardware":
+            return state.training_overview()
+        return state.service.get(path, query)
+
+    def _training_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.server.app_state.service.post(path, payload)
+
+    def _send_file(self, response: FileResponse) -> None:
+        size = response.path.stat().st_size
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", response.content_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'attachment; filename="{response.filename}"')
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        with open(response.path, "rb") as handle:
+            while chunk := handle.read(1 << 20):
+                self.wfile.write(chunk)
+
     def _resolve_lane_handle(self, path: str, payload: dict[str, Any]) -> tuple[str, "ServerHandle"]:
         """Pick the active lane for an OpenAI-compatible request. Base URLs: /v1 (model selects
         a lane), /v1/<lane>, /v1/<lane>/<role>. Shared by the chat and completions proxies so
-        lane routing is identical for agent and autocomplete traffic."""
+        lane routing is identical for agent and autocomplete traffic.
+
+        A `model` naming a catalog model (name or id) is served by that model: loaded on demand
+        onto the GPUs when it is not already, evicting idle models (see ensure_model). `dgpu:<lane>`
+        and unknown model names keep plain lane routing. The returned handle is claimed; the
+        caller must enter `handle.serving(claimed=True)`."""
         state = self.server.app_state
+        manager = state.manager
         path_parts = [part for part in path.split("/") if part]
         path_target = path_parts[1] if len(path_parts) >= 4 else None
         target_hint = self.headers.get("X-DGPU-Target") or path_target
         requested_model = str(payload.get("model") or "")
-        with state.manager.lock:
-            if state.manager.state != "ready" or not state.manager.handles:
+        if (manager.config.policy.auto_load_models and requested_model
+                and not requested_model.startswith("dgpu:") and manager.knows_model(requested_model)):
+            if target_hint and target_hint not in {lane.key for lane in manager.config.lanes}:
+                raise AppError(f"Unknown GPU lane '{target_hint}'.")
+            return manager.ensure_model(requested_model, lane_key=target_hint)
+        with manager.lock:
+            manager._mark_dead_lanes()
+            if manager.state != "ready" or not manager.handles:
                 raise AppError("Load a deployment before sending a message.", HTTPStatus.CONFLICT)
-            handles = dict(state.manager.handles)
+            handles = dict(manager.handles)
             if target_hint and target_hint not in handles:
                 raise AppError(f"GPU lane '{target_hint}' is not loaded.", HTTPStatus.CONFLICT)
             target = target_hint if target_hint in handles else None
@@ -2968,30 +3962,68 @@ class RequestHandler(BaseHTTPRequestHandler):
                 target = next(iter(handles))
             if target is None:
                 raise AppError("Select a GPU lane with model='dgpu:<lane>' or a /v1/<lane> base URL.")
+            handles[target].claim()
             return target, handles[target]
+
+    def _resolve_project(self) -> tuple[str, dict[str, Any] | None]:
+        """Watertight, zero-config project attribution -- no API key, no pre-registration.
+
+        Every request maps to a real project id, in this order:
+          1. Bearer is a registered client_id -> that client's project.
+          2. Otherwise a project name/id from the X-DGPU-Project header, else the Bearer key
+             itself -> created on first use (so a tool with only an API-key field just sets a
+             project name there and is tracked).
+          3. Nothing identifying -> the configured default project.
+        Returns (project_id, client_or_None). Never raises for an unknown key and never leaves
+        a request unattributed.
+        """
+        state = self.server.app_state
+        authorization = self.headers.get("Authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        client = state.store.get_client(token) if token and token != "local" else None
+        if client is not None:
+            project_id = client.get("project_id")
+            if not project_id:
+                project = state.store.upsert_project(client["project_name"], git_remote=client.get("github_repo"))
+                project_id = project["id"]
+                state.store.link_client_project(client["id"], project_id)
+            return project_id, client
+        name = (self.headers.get("X-DGPU-Project") or (token if token and token != "local" else "")).strip()
+        if not name:
+            name = state.config.project.default_project
+        project = state.store.get_project(name) or state.store.upsert_project(name)
+        return project["id"], None
+
+    def _request_project_id(self) -> str | None:
+        return self._resolve_project()[0]
 
     def _proxy_openai_completions(self, path: str, payload: dict[str, Any], infill: bool = False) -> None:
         """Thin passthrough for inline autocomplete (FIM `/v1/completions` and `/infill`).
 
-        Deliberately minimal: autocomplete fires on nearly every typing pause, so this does
-        NO per-request run recording, GPU sampling, or history logging -- that overhead and
-        DB growth would hurt, which is exactly what we must avoid. It still routes through a
-        loaded lane (so autocomplete uses the dual-GPU setup from this codebase) and counts
-        the request in-flight so a deployment change drains it instead of killing it.
+        Deliberately minimal: autocomplete fires on nearly every typing pause, so this does NO
+        per-request run row, GPU sampling, or history logging. It DOES record lightweight
+        project usage (request count, and tokens for non-streamed responses) into the daily
+        rollup ledger, which is an O(1) in-memory accumulate -- so every connection's usage is
+        tracked without the per-request overhead or DB bloat a full run row would add. It routes
+        through a loaded lane (dual-GPU) and counts in-flight so a deploy change drains it.
         """
+        state = self.server.app_state
         _target, handle = self._resolve_lane_handle(path, payload)
+        connection_type = self.headers.get("X-DGPU-Connection-Type") or "autocomplete"
+        project_id = self._request_project_id()
         suffix = "/infill" if infill else "/v1/completions"
         request_payload = dict(payload)
         request_payload["model"] = handle.model.name
         stream = bool(request_payload.get("stream"))
-        request = urlrequest.Request(
-            f"{handle.process.base_url}{suffix}",
-            data=json.dumps(request_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
-            method="POST",
-        )
+        input_tokens = output_tokens = 0
         try:
-            with handle.serving(), urlrequest.urlopen(request, timeout=120) as response:
+            request = urlrequest.Request(
+                f"{handle.process.base_url}{suffix}",
+                data=json.dumps(handle.pin_serving_slot(request_payload)).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
+                method="POST",
+            )
+            with handle.serving(claimed=True), urlrequest.urlopen(request, timeout=120) as response:
                 if stream:
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -3017,9 +4049,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                    try:  # best-effort token counts; usage (OpenAI) or tokens_* (llama infill)
+                        parsed = json.loads(body)
+                        usage = parsed.get("usage") or {}
+                        input_tokens = usage.get("prompt_tokens") or parsed.get("tokens_evaluated") or 0
+                        output_tokens = usage.get("completion_tokens") or parsed.get("tokens_predicted") or 0
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
         except urlerror.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
+        finally:
+            state.chat.usage.record(project_id, connection_type, input_tokens, output_tokens)
 
     def _proxy_openai_chat(self, path: str, payload: dict[str, Any]) -> None:
         """Stream an OpenAI-compatible coding-agent request through an active GPU lane.
@@ -3034,18 +4075,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         path_role = path_parts[2] if len(path_parts) >= 5 else None
         target, handle = self._resolve_lane_handle(path, payload)
 
-        authorization = self.headers.get("Authorization", "")
-        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
-        client = state.store.get_client(token) if token and token != "local" else None
-        if token and token != "local" and client is None:
-            raise AppError("The API key is not a registered Dual GPU Studio client_id.", HTTPStatus.UNAUTHORIZED)
-        project_ref = self.headers.get("X-DGPU-Project")
-        project = state.store.get_project(project_ref) if project_ref else None
-        project_id = (client or {}).get("project_id") or (project or {}).get("id")
-        if client and not project_id:
-            project = state.store.upsert_project(client["project_name"], git_remote=client.get("github_repo"))
-            project_id = project["id"]
-            state.store.link_client_project(client["id"], project_id)
+        # Zero-config, watertight attribution: auto-provision the project from the caller's
+        # Bearer key or X-DGPU-Project header (or the default), never 401 on an unknown key.
+        project_id, client = self._resolve_project()
         agent_role = (
             self.headers.get("X-DGPU-Agent-Role")
             or path_role
@@ -3054,6 +4086,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         session_id = self.headers.get("X-DGPU-Session") or None
         coding_task_id = self.headers.get("X-DGPU-Task") or None
         task_label = self.headers.get("X-DGPU-Task-Label") or None
+        connection_type = self.headers.get("X-DGPU-Connection-Type") or "coding_agent"
 
         request_payload = dict(payload)
         request_payload["model"] = handle.model.name
@@ -3106,6 +4139,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "endpoint": handle.process.base_url,
                     "device": handle.process.device,
                     "lanes": [asdict(lane) for lane in handle.lanes],
+                    "runtime": handle.runtime(),
                     "reasoning": reasoning_settings,
                 },
                 "client_id": client["id"] if client else None,
@@ -3134,12 +4168,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             request = urlrequest.Request(
                 f"{handle.process.base_url}/v1/chat/completions",
-                data=json.dumps(request_payload).encode("utf-8"),
+                data=json.dumps(handle.pin_serving_slot(dict(request_payload))).encode("utf-8"),
                 headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
                 method="POST",
             )
             # serving() marks the lane busy so a deployment change drains before stopping it.
-            with handle.serving(), urlrequest.urlopen(request, timeout=900) as response:
+            with handle.serving(claimed=True), urlrequest.urlopen(request, timeout=900) as response:
                 if not stream:
                     backend_payload = json.loads(response.read().decode("utf-8", errors="replace"))
                 else:
@@ -3273,6 +4307,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "output_text": "".join(output_parts) or None,
                     "reasoning_text": "".join(reasoning_parts) or None, "tool_calls": tool_calls,
                 })
+            state.chat.usage.record(project_id, connection_type,
+                                    usage.get("input_tokens"), usage.get("output_tokens"))
             state.chat._deliver_to_client(client, run_id, target, handle, final)
             if not stream:
                 backend_payload["dgpu_run_id"] = run_id
@@ -3314,6 +4350,40 @@ class RequestHandler(BaseHTTPRequestHandler):
             state.store.save_samples(run_id, samples, started)
         except Exception:  # noqa: BLE001
             pass
+
+    def _require_json_content_type(self) -> None:
+        """State-changing control endpoints need a JSON content type, which forces a CORS preflight,
+        so a web page cannot trigger them with a blind form POST."""
+        if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+            raise AppError("Content-Type must be application/json.", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+
+    def _service_control(self) -> "ServiceControl":
+        control = getattr(self.server.app_state, "control", None)
+        if control is None:
+            raise AppError("Service control is not available in this process.", HTTPStatus.NOT_IMPLEMENTED)
+        return control
+
+    def _settings_payload(self) -> dict[str, Any]:
+        state = self.server.app_state
+        return {"settings": service_settings.describe(state.config.policy), "config_path": str(state.config_path)}
+
+    def _apply_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate, apply to the running config, and save into the config file's [policy] table."""
+        state = self.server.app_state
+        try:
+            values = service_settings.validate(payload.get("values", payload))
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+        changed = {key: value for key, value in values.items() if getattr(state.config.policy, key) != value}
+        if changed:
+            try:
+                service_settings.write_policy(state.config_path, changed)
+            except (OSError, ValueError) as exc:
+                raise AppError(f"Settings were not changed: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from exc
+            for key, value in changed.items():
+                setattr(state.config.policy, key, value)
+        return {**self._settings_payload(), "changed": sorted(changed),
+                "next_load": sorted(key for key in changed if service_settings.BY_KEY[key]["apply"] == "next_load")}
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -3461,6 +4531,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-browser", action="store_true", help="Do not open the UI in the default browser.")
     parser.add_argument("--check", action="store_true", help="Validate configuration and storage, then exit.")
     parser.add_argument(
+        "--replace-pid",
+        type=int,
+        default=None,
+        help="Internal: wait for this process to exit before starting (used when the UI restarts the service).",
+    )
+    parser.add_argument(
         "--prune-older-than-days",
         type=int,
         default=None,
@@ -3476,6 +4552,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.replace_pid is not None and not wait_for_exit(args.replace_pid):
+        print(f"WARNING: process {args.replace_pid} is still running; starting anyway.")
     config_path = Path(args.config).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser()
     if not data_dir.is_absolute():
@@ -3491,12 +4569,16 @@ def main() -> int:
         print(json.dumps({"status": "ok", "config": str(config_path), "data_dir": str(data_dir)}, indent=2))
         state.manager.shutdown()
         state.history.close()
+        state.usage.close()
         return 0
 
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         print("WARNING: This app has no authentication. Binding outside localhost exposes prompts and model controls.")
     server = ChatbotHTTPServer((args.host, args.port), state)
+    state.control = ServiceControl(state, args)
+    state.control.server = server
     local_url = f"http://127.0.0.1:{args.port}"
+    state.benchmarks.server_url = local_url
     is_lan_enabled = args.host not in {"127.0.0.1", "localhost", "::1"}
     lan_urls = [f"http://{address}:{args.port}" for address in local_network_addresses()] if is_lan_enabled else []
     print("Dual GPU Studio is running")
@@ -3527,11 +4609,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_server)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, stop_server)
+    state.start_telemetry()
+    state.control.restore_after_restart()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        state.stop_telemetry()
         state.manager.shutdown()
         state.history.close()  # flush any queued conversation records
+        state.usage.close()
         server.server_close()
     return 0
 
