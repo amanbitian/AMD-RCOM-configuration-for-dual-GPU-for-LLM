@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _new_connection(path: Path) -> sqlite3.Connection:

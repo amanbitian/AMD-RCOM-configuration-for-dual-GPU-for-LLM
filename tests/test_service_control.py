@@ -284,6 +284,7 @@ def test_info_reports_the_running_process(tmp_path):
     info = control.info()
     assert info["pid"] == os.getpid() and info["port"] == 8090 and info["config_path"] == str(state.config_path)
     assert info["can_restart"] is True and info["pending"] is None and info["restore_pending"] is False
+    assert info["host_os"]["system"]
 
 
 def test_restore_reloads_a_fresh_saved_deployment_once(tmp_path):

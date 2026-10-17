@@ -91,6 +91,7 @@ def test_old_database_is_upgraded_and_backfilled(tmp_path):
     connection.close()
     run = TrainingStore(path).get_run("old")
     assert run["tokens"]["nonpad"] == 900 and run["world_size"] == 1 and run["windows"] == 1
+    assert run["host_os"] is None
 
 
 # ----------------------------------------------------------------- ranks/stall

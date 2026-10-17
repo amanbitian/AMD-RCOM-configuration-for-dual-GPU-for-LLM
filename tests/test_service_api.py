@@ -205,7 +205,16 @@ def test_unknown_routes_and_run_ids_return_404(live_app):
 
 def test_create_run_attaches_server_hardware_and_gpu_map(live_app):
     live = live_app()
-    payload = {"name": "gpu-map", "env": {"torch": {"devices": [{"index": 0, "name": "gfx", "total_memory": 32 * 1024**3}]}}}
+    tracker_os = {"system": "Linux", "distribution_id": "ubuntu"}
+    payload = {"name": "gpu-map", "env": {"os": tracker_os, "torch": {"devices": [{"index": 0, "name": "gfx", "total_memory": 32 * 1024**3}]}}}
     run = live.post("/api/training/runs", payload)[1]
     detail = live.get(f"/api/training/runs/{run['id']}")[1]["run"]
     assert "server_hardware" in detail["env"] and detail["env"]["gpu_map"][0]["torch_index"] == 0
+    assert detail["host_os"] == tracker_os and detail["env"]["server_host_os"]["system"]
+
+
+def test_create_run_records_server_os_when_tracker_environment_is_disabled(live_app):
+    live = live_app()
+    run = live.post("/api/training/runs", {"name": "server-os"})[1]
+    listed = live.get("/api/training/runs")[1]["runs"][0]
+    assert run["host_os"]["system"] and listed["host_os"] == run["host_os"]

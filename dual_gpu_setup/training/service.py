@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dual_gpu_setup.config import AppConfig
+from dual_gpu_setup.host_info import os_info
 from dual_gpu_setup.scheduling.leases import LeaseError, LeaseStore
 
 from . import analysis, memory_forecast, selection
@@ -83,12 +84,17 @@ class TrainingService:
             except LeaseError as exc:
                 raise TrainingError(str(exc), exc.status) from exc
         env = dict(payload.get("env") or {})
+        server_host_os = os_info()
+        training_host_os = env.get("os") or payload.get("host_os") or server_host_os
+        if not isinstance(training_host_os, dict):
+            training_host_os = server_host_os
+        env["server_host_os"] = server_host_os
         env["server_hardware"] = self.hardware.hardware_environment()
         torch_devices = (env.get("torch") or {}).get("devices") or []
         if torch_devices:
             env["gpu_map"] = map_torch_devices(torch_devices, self.hardware.gpus)
         try:
-            run = self.store.create_run({**payload, "id": run_id, "env": env})
+            run = self.store.create_run({**payload, "id": run_id, "env": env, "host_os": training_host_os})
         except Exception:
             if lease:
                 self.leases.release_holder(f"training:{run_id}")

@@ -33,6 +33,7 @@ from dual_gpu_setup.lmstudio import lane_free_vram_gb, model_size_gb, resolve_mo
 from dual_gpu_setup.lmstudio_gpus import GpuSelectionError, get_selection, release, set_selection
 from dual_gpu_setup.orchestrator import ctx_for, estimate_kv_cache_gb, lane_capacity_gb, resolve_context_window
 from dual_gpu_setup.hostos import get_host
+from dual_gpu_setup.host_info import default_config_name, detached_process_kwargs, os_info, os_log_line
 from dual_gpu_setup.scheduling.leases import LeaseError, LeaseStore
 from dual_gpu_setup.server import PLACEMENT_MIN_VRAM_FRACTION, LlamaServerProcess
 from dual_gpu_setup.reasoning import coding_request, model_reasoning
@@ -286,6 +287,7 @@ class RunStore:
                     resources_json TEXT,
                     error_text TEXT,
                     backend_response_json TEXT,
+                    host_os_json TEXT,
                     FOREIGN KEY (deployment_id) REFERENCES deployments(id)
                 );
                 CREATE TABLE IF NOT EXISTS metric_samples (
@@ -374,6 +376,7 @@ class RunStore:
                 "coding_task_id": "TEXT",
                 "agent_role": "TEXT",
                 "workload_kind": "TEXT NOT NULL DEFAULT 'evaluation'",
+                "host_os_json": "TEXT",
             }
             for name, data_type in migrations.items():
                 if name not in columns:
@@ -435,8 +438,9 @@ class RunStore:
                     id, comparison_id, deployment_id, created_at, status, mode, target,
                     model_name, model_path, lane_keys_json, device_json, context_window,
                     reasoning_budget, request_json, configuration_json, client_id, task_label,
-                    project_id, agent_session_id, coding_task_id, agent_role, workload_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    project_id, agent_session_id, coding_task_id, agent_role, workload_kind,
+                    host_os_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -461,6 +465,7 @@ class RunStore:
                     record.get("coding_task_id"),
                     record.get("agent_role"),
                     record.get("workload_kind", "evaluation"),
+                    json.dumps(record.get("host_os") or os_info(), ensure_ascii=False),
                 ),
             )
 
@@ -774,7 +779,7 @@ class RunStore:
             rows = connection.execute(f"""
                 SELECT id, created_at, status, mode, target, model_name, lane_keys_json,
                     context_window, reasoning_budget, project_id, agent_role, task_label,
-                    workload_kind, usage_json, timing_json, resources_json,
+                    workload_kind, usage_json, timing_json, resources_json, host_os_json,
                     json_object('reasoning', json_extract(configuration_json, '$.reasoning')) AS configuration_json
                 FROM runs{where} ORDER BY created_at DESC
             """, params).fetchall()
@@ -1030,6 +1035,7 @@ class RunStore:
             "timing_json",
             "resources_json",
             "backend_response_json",
+            "host_os_json",
         ):
             raw = item.pop(key, None)
             output_key = key.removesuffix("_json")
@@ -1433,7 +1439,7 @@ class ServerHandle:
         """In flight, or routed and about to be (an unexpired claim)."""
         with self._inflight_lock:
             cutoff = time.monotonic() - self.CLAIM_TTL_SECONDS
-            self._claims = [stamp for stamp in self._claims if stamp >= cutoff]
+            self._claims = [stamp for stamp in self._claims if stamp > cutoff]
             return self._inflight > 0 or bool(self._claims)
 
     def wait_idle(self, timeout: float) -> bool:
@@ -2888,6 +2894,7 @@ class ChatService:
             "lanes": [asdict(lane) for lane in handle.lanes],
             "server_command": handle.process.build_command(),
             "runtime": handle.runtime(),
+            "host_os": os_info(),
             "reasoning": reasoning_settings,
         }
         self.store.begin_run(
@@ -2913,6 +2920,7 @@ class ChatService:
                 "coding_task_id": coding_task_id,
                 "agent_role": agent_role,
                 "workload_kind": workload_kind,
+                "host_os": os_info(),
             }
         )
         baseline = self.manager.sampler.latest() if workload_kind == "coding_agent" else self.manager.sampler.capture()
@@ -3020,6 +3028,7 @@ class ChatService:
             "resources": final.get("resources"),
             "reasoning": final.get("reasoning"),
             "error_text": final.get("error_text"),
+            "host_os": os_info(),
         }
         output_path = Path(client["output_path"]).expanduser()
         try:
@@ -3463,6 +3472,7 @@ class ServiceControl:
             "data_dir": str(self.state.data_dir),
             "app_version": APP_VERSION,
             "python": sys.executable,
+            "host_os": os_info(),
             "can_restart": self.server is not None,
             "pending": self.pending,
             "restore_pending": self.restore_path.exists(),
@@ -3513,15 +3523,12 @@ class ServiceControl:
 
     def _spawn_replacement(self) -> None:
         command = self.replacement_command()
-        flags = 0
-        if sys.platform == "win32":
-            # Detached from this process's console and process group, so it outlives this process.
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         with open(self.state.data_dir / "launcher.log", "a", encoding="utf-8", errors="replace") as log:
             log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} :: restart from the UI :: {' '.join(command)} ===\n")
+            log.write(f"host_os={os_log_line()}\n")
             log.flush()
             subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                             creationflags=flags, close_fds=True)
+                             **detached_process_kwargs())
 
     def restore_after_restart(self) -> bool:
         """On startup: reload the deployment a restart with `reload_models` saved, if it is fresh."""
@@ -4518,7 +4525,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local dual-GPU chatbot web application.")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).with_name("example.dual_gpu.toml")),
+        default=str(Path(__file__).with_name(default_config_name())),
         help="Path to the dual-GPU TOML configuration.",
     )
     parser.add_argument(
@@ -4582,14 +4589,14 @@ def main() -> int:
     is_lan_enabled = args.host not in {"127.0.0.1", "localhost", "::1"}
     lan_urls = [f"http://{address}:{args.port}" for address in local_network_addresses()] if is_lan_enabled else []
     print("Dual GPU Studio is running")
-    print(f"  Windows local: {local_url}")
+    print(f"  Local: {local_url}")
     if lan_urls:
         for lan_url in lan_urls:
             print(f"  Local network: {lan_url}")
-        print("  Open a Local network URL on your Mac.")
+        print("  Open a Local network URL on another device.")
     elif is_lan_enabled:
         print(f"  Listening on: http://{args.host}:{args.port}")
-        print("  No private IPv4 address was detected; run ipconfig to find the Windows address.")
+        print("  No private IPv4 address was detected; check the host's network configuration.")
     else:
         print("  Local network access is disabled by the selected --host value.")
     print(f"Configuration: {config_path}")

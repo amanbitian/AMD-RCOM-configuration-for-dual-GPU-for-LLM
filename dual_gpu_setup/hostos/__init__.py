@@ -19,8 +19,12 @@ def get_host() -> HostOS:
         if _host is None:
             if sys.platform == "win32":
                 from . import windows as impl
-            else:
+            elif sys.platform.startswith("linux"):
                 from . import linux as impl
+            else:
+                raise RuntimeError(
+                    f"Unsupported host platform {sys.platform!r}; Dual GPU Studio supports Windows and Linux."
+                )
             _host = impl.build()
         return _host
 

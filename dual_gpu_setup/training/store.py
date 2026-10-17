@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS training_runs (
     lanes_json TEXT,
     config_json TEXT,
     env_json TEXT,
+    host_os_json TEXT,
     dataset_json TEXT,
     git_commit TEXT,
     seed INTEGER,
@@ -108,9 +109,13 @@ CREATE TABLE IF NOT EXISTS hardware_samples (
     mclk_mhz REAL,
     fan_rpm REAL,
     pcie_speed TEXT,
-    pcie_width INTEGER
+    pcie_width INTEGER,
+    throttle_status INTEGER,
+    telemetry_sources_json TEXT,
+    unavailable_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_hardware_samples ON hardware_samples(pci_bus, ts);
+CREATE INDEX IF NOT EXISTS idx_hardware_samples_ts ON hardware_samples(ts);
 CREATE TABLE IF NOT EXISTS system_samples (
     ts REAL PRIMARY KEY,
     cpu_pct REAL,
@@ -197,6 +202,7 @@ CREATE TABLE IF NOT EXISTS hardware_profiles (
 
 ADDITIONS = {
     "training_runs": {
+        "host_os_json": "TEXT",
         "world_size": "INTEGER NOT NULL DEFAULT 1",
         "tags_json": "TEXT",
         "agg_windows": "INTEGER NOT NULL DEFAULT 0",
@@ -225,6 +231,11 @@ ADDITIONS = {
         "best": "INTEGER NOT NULL DEFAULT 0",
         "designated": "INTEGER NOT NULL DEFAULT 0",
     },
+    "hardware_samples": {
+        "throttle_status": "INTEGER",
+        "telemetry_sources_json": "TEXT",
+        "unavailable_json": "TEXT",
+    },
 }
 
 STATUS_RUNNING = "running"
@@ -234,6 +245,7 @@ HARDWARE_FIELDS = (
     "temp_junction_c", "temp_memory_c", "power_w", "sclk_mhz", "mclk_mhz", "fan_rpm",
     "pcie_speed", "pcie_width",
 )
+HARDWARE_EXTRA_FIELDS = ("throttle_status", "telemetry_sources_json", "unavailable_json")
 STEP_NUMERIC = ("loss", "lr", "grad_norm", "step_time_ms", "excluded_ms", "data_wait_ms", "fwd_ms", "bwd_ms", "opt_ms", "comm_ms")
 STEP_INT = (
     "processed_tokens", "nonpad_tokens", "supervised_tokens", "mem_alloc_bytes",
@@ -326,15 +338,16 @@ class TrainingStore(Database):
                 connection.execute(
                     """INSERT INTO training_runs
                     (id, name, status, parent_run_id, created_at, started_at, last_heartbeat_at,
-                     lanes_json, config_json, env_json, dataset_json, git_commit, seed, max_steps,
-                     world_size, tags_json)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     lanes_json, config_json, env_json, host_os_json, dataset_json, git_commit, seed,
+                     max_steps, world_size, tags_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         run_id, name[:200], STATUS_RUNNING, _text(payload.get("parent_run_id"), 100),
                         now, _num(payload.get("started_at")) or now, now,
                         _dump(payload.get("lanes") or []),
                         _dump(sanitize(payload.get("config"), drop_content_keys=False, max_string=4000)),
                         _dump(payload.get("env")),
+                        _dump(payload.get("host_os")),
                         _dump(sanitize(payload.get("dataset"), drop_content_keys=False, max_string=4000)),
                         _text(payload.get("git_commit"), 100), _int(payload.get("seed")),
                         _int(payload.get("max_steps")), max(1, _int(payload.get("world_size")) or 1),
@@ -483,6 +496,7 @@ class TrainingStore(Database):
             "elapsed_s": max(0.0, end - row["started_at"]),
             "lanes": _load(row["lanes_json"]) or [], "git_commit": row["git_commit"], "seed": row["seed"],
             "world_size": row["world_size"], "tags": _load(row["tags_json"]) or {},
+            "host_os": _load(row["host_os_json"]),
             "max_steps": max_steps, "last_step": row["last_step"], "last_step_at": row["last_step_at"],
             "last_heartbeat_at": row["last_heartbeat_at"],
             "seconds_since_step": None if not row["last_step_at"] else max(0.0, now - row["last_step_at"]),
@@ -933,11 +947,14 @@ class TrainingStore(Database):
     def add_hardware_samples(self, samples: list[dict[str, Any]]) -> int:
         if not samples:
             return 0
-        rows = [(s["ts"], s["pci_bus"], s.get("lane"), *(s.get(field) for field in HARDWARE_FIELDS)) for s in samples]
-        columns = ", ".join(("ts", "pci_bus", "lane") + HARDWARE_FIELDS)
+        rows = [(
+            s["ts"], s["pci_bus"], s.get("lane"), *(s.get(field) for field in HARDWARE_FIELDS),
+            _int(s.get("throttle_status")), _dump(s.get("amd_smi_fields")), _dump(s.get("unavailable")),
+        ) for s in samples]
+        columns = ", ".join(("ts", "pci_bus", "lane") + HARDWARE_FIELDS + HARDWARE_EXTRA_FIELDS)
         with self.connect() as connection:
             connection.executemany(
-                f"INSERT INTO hardware_samples ({columns}) VALUES ({placeholders(3 + len(HARDWARE_FIELDS))})", rows)
+                f"INSERT INTO hardware_samples ({columns}) VALUES ({placeholders(3 + len(HARDWARE_FIELDS) + len(HARDWARE_EXTRA_FIELDS))})", rows)
         return len(rows)
 
     def add_system_sample(self, ts: float, cpu_pct: float | None, ram_used_pct: float | None,
@@ -989,7 +1006,12 @@ class TrainingStore(Database):
                 ).fetchall()
                 gpus[bus] = {
                     "lane": rows[-1]["lane"] if rows else None, "stride": stride,
-                    "points": [{"ts": r["ts"], **{f: r[f] for f in HARDWARE_FIELDS}} for r in rows],
+                    "points": [{
+                        "ts": r["ts"], **{f: r[f] for f in HARDWARE_FIELDS},
+                        "throttle_status": r["throttle_status"],
+                        "telemetry_sources": _load(r["telemetry_sources_json"]),
+                        "unavailable": _load(r["unavailable_json"]),
+                    } for r in rows],
                 }
         return {"gpus": gpus}
 
@@ -1006,6 +1028,8 @@ class TrainingStore(Database):
                           MAX(temp_edge_c) AS max_edge, MAX(temp_junction_c) AS max_junction,
                           MAX(temp_memory_c) AS max_memory, AVG(power_w) AS avg_power,
                           MAX(power_w) AS max_power, MIN(pcie_width) AS min_pcie_width,
+                          SUM(CASE WHEN throttle_status IS NOT NULL THEN 1 ELSE 0 END) AS throttle_reported,
+                          SUM(CASE WHEN throttle_status IS NOT NULL AND throttle_status != 0 THEN 1 ELSE 0 END) AS throttle_active,
                           SUM(CASE WHEN temp_memory_c >= ? THEN 1 ELSE 0 END) AS mem_over,
                           SUM(CASE WHEN temp_junction_c >= ? THEN 1 ELSE 0 END) AS junction_over,
                           SUM(power_w) AS power_sum
@@ -1020,6 +1044,7 @@ class TrainingStore(Database):
                 "max_temp_junction_c": r["max_junction"], "max_temp_memory_c": r["max_memory"],
                 "avg_power_w": r["avg_power"], "max_power_w": r["max_power"],
                 "min_pcie_width": r["min_pcie_width"],
+                "seconds_throttled": None if not r["throttle_reported"] else r["throttle_active"] * interval,
                 "seconds_memory_over_alert": None if r["max_memory"] is None else r["mem_over"] * interval,
                 "seconds_junction_over_alert": None if r["max_junction"] is None else r["junction_over"] * interval,
                 "energy_wh": None if r["power_sum"] is None else r["power_sum"] * interval / 3600.0,

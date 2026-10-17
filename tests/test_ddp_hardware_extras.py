@@ -15,6 +15,7 @@ from dual_gpu_setup.training.amd_smi import AmdSmiReader  # noqa: E402
 from dual_gpu_setup.training.hardware import (  # noqa: E402
     GpuDevice, HardwareSampler, map_torch_devices, sample_gpu, torch_pci_address,
 )
+from dual_gpu_setup.training.environment import rocm_installation  # noqa: E402
 from dual_gpu_setup.training.tracker import TrainingTracker, resolve_run_id  # noqa: E402
 from test_training import build_sysfs  # noqa: E402
 
@@ -151,6 +152,19 @@ def test_hardware_environment_records_link_state_and_visibility(tmp_path, monkey
     environment = sampler.hardware_environment()
     assert [g["pci_bus"] for g in environment["gpus"]] == ["0000:03:00.0", "0000:08:00.0"]
     assert environment["gpus"][0]["pcie_width"] == "8" and environment["visibility"] == {"HIP_VISIBLE_DEVICES": "1,0"}
+    assert environment["os"]["system"] and "rocm" in environment
+
+
+def test_rocm_installation_records_all_available_component_versions(tmp_path):
+    info = tmp_path / ".info"
+    info.mkdir()
+    (info / "version").write_text("7.0.0\n", encoding="utf-8")
+    (info / "version-hip-runtime").write_text("7.0.12345\n", encoding="utf-8")
+    result = rocm_installation(tmp_path)
+    assert result == {
+        "path": str(tmp_path), "available": True, "version": "7.0.0",
+        "components": {"version": "7.0.0", "version-hip-runtime": "7.0.12345"},
+    }
 
 
 def test_sampler_collects_system_samples_and_amd_smi_fills_only_gaps(tmp_path):

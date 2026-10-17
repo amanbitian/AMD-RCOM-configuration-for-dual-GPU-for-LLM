@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-17 - Ubuntu support and OS-attributed logs
+
+- Background launch and UI restart now create a new POSIX session on Linux, so the service survives
+  the launching terminal/process. Windows keeps its detached-process flags.
+- Shell-enabled task lists use POSIX quoting on Linux instead of Windows `cmd.exe` quoting. Native
+  Linux `llama-server` paths are checked for execute permission with an actionable error.
+- Host selection now rejects unsupported platforms instead of silently treating every non-Windows
+  system as Linux.
+- Launcher, server and task logs, CLI summaries, request rows/client JSONL, service information and
+  training environment snapshots now record host OS metadata. Existing run databases migrate with a
+  nullable `host_os_json` column; new runs populate it automatically.
+- Added `example.dual_gpu.ubuntu.toml` and Ubuntu setup instructions.
+- Linux now defaults to that Ubuntu example when `--config` is omitted. Discovery paths expand
+  `~`/environment variables and resolve relative to the config file; relative task working directories
+  do the same. Device discovery accepts llama.cpp builds that log `--list-devices` to stderr.
+- Ubuntu training runs now persist top-level OS attribution even when tracker environment capture is
+  disabled, distinguish tracker and dashboard hosts, fingerprint ROCm component versions and relevant
+  accelerator environment, and retain AMD SMI throttle/source/unavailable metadata in SQLite and the UI.
+- Added a timestamp-first hardware-sample index for run-window queries.
+
 ## 2026-10-17 — Measured: where the context cache lives
 
 Documentation only; no code changed. With Qwen3-8B at a 262,144-token context on the R9700 (a 36.9 GB cache on

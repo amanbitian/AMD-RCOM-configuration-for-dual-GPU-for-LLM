@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dual_gpu_setup import gguf
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
+from dual_gpu_setup.host_info import os_info
 from dual_gpu_setup.lmstudio import model_size_gb, resolve_model_path
 from dual_gpu_setup.server import LlamaServerProcess, warn_if_spilling
 from dual_gpu_setup.tasks import TaskFailure, run_tasks_for_model
@@ -195,6 +196,7 @@ class DualGPUOrchestrator:
             "suite_id": suite_id(self.config),
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "project": self.config.project.name,
+            "host_os": os_info(),
             "dry_run": dry_run,
             "completed": [],
             "failed_loads": [],

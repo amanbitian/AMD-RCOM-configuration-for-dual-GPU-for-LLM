@@ -6,7 +6,7 @@ disagreement is a bug to fix. For exact request and response shapes, [API_CONTRA
 the authority. When behaviour changes, update this file in the same change (see
 [Keeping this document true](#16-keeping-this-document-true)).
 
-Last checked against the code: **2026-10-17** (378 automated tests passing, 1 skipped).
+Last checked against the code: **2026-10-17** (390 automated tests passing, 1 skipped).
 
 ## Contents
 
@@ -31,7 +31,7 @@ Last checked against the code: **2026-10-17** (378 automated tests passing, 1 sk
 
 ## 1. What the app is, and is not
 
-**It is** a local service that runs `llama-server` (llama.cpp) on **two GPUs** of one Windows machine and
+**It is** a local service that runs `llama-server` (llama.cpp) on **two GPUs** of one Windows or Linux machine and
 lets people and other applications use them without each project re-implementing GPU handling. It does five
 jobs:
 
@@ -83,7 +83,7 @@ jobs:
 | Service restart, stop, settings, orphan handling, unload and Stop now | Verified on hardware (spare ports) |
 | Dashboard pages | Page logic run against a fake DOM in Node; **not opened in a real browser after the latest changes** |
 | Residency guard re-warming a model | Tested with fakes. **Not yet seen to trigger live** |
-| Linux support (`/proc`, sysfs, AMD SMI, DRM fdinfo) | Not verified; code exists |
+| Ubuntu/Linux support (`/proc`, sysfs, AMD SMI, DRM fdinfo, POSIX process control) | Tested with fakes; **not yet verified on the real two-GPU Linux machine** |
 | Vulkan backend | Code path exists; not benchmarked or verified here |
 | Training tracker, leases, evaluation pipeline | Tested with fakes and real subprocess/HTTP runs; the LoRA-to-GGUF conversion, real `llama-server` changeover during evaluation, Linux GPU sensors and the DDP numerical check are **not verified** |
 
@@ -381,7 +381,8 @@ Full design and status: [docs/TRAINING_TELEMETRY.md](docs/TRAINING_TELEMETRY.md)
 |---|---|
 | Tracker client | `TrainingTracker` (standard library only) and a Hugging Face `Trainer` callback stream loss, learning rate, gradient norm, token counts, step time, GPU phase timing and memory. Metrics are per window, never per micro-batch, and the client never blocks or fails training (spool to disk and replay if the dashboard is down). |
 | Run reliability | `stalled` is judged on step progress, rank loss in DDP is detected, a checkpoint counts only once its manifest is committed, and a resume continuity report checks optimizer, scheduler and RNG state. |
-| Hardware telemetry | A 1 Hz sampler reports utilization, VRAM, temperatures, power, clocks and PCIe link; sensors that cannot be read are `null`, never `0`; amdgpu resets and page faults are captured from the kernel log. |
+| Hardware telemetry | A 1 Hz sampler reports utilization, VRAM/GTT, temperatures, power, clocks, PCIe link and AMD SMI throttle status; sensor source and unavailable reasons are persisted, and missing values are `null`, never `0`; amdgpu resets and page faults are captured from the kernel log. |
+| Reproducibility | Every run has top-level host OS attribution even when tracker-side environment capture is disabled. Full snapshots distinguish the training-process OS from the dashboard host and include kernel, ROCm component versions, amdgpu, PyTorch/HIP, relevant ROCm environment variables and physical GPU mapping. |
 | Evaluation pipeline | Checkpoints queue for evaluation on a spare lane (native, GGUF F16 and quantized GGUF), best checkpoint is chosen on the deployed score, regressions are flagged. Needs `[evaluation]` configured. |
 | Experiments | Equal-token-budget comparison with seed-noise gating, benchmark sweeps (batch, context, LoRA, checkpointing, precision) that only recommend, a memory forecast, energy per million tokens, MFU estimate, DDP straggler and scaling analysis. |
 | Privacy | Free-form payloads are scrubbed (content-bearing keys dropped, long strings truncated, e-mail and phone-like text redacted) before storage. |
@@ -416,9 +417,10 @@ listed in `summary.json`.
 `{model_size_gb}`, `{suite_id}`, `{run_dir}`, `{actual_ctx}`, `{lane_key}`, `{lane_display}`, `{backend}`,
 `{device}`, `{host}`, `{port}`, `{project_name}`, `{config_dir}`) and the environment variables
 `DGPU_SUITE_ID`, `DGPU_BASE_URL`, `DGPU_MODEL_NAME`, `DGPU_LANE_KEY`, `DGPU_LANE_DISPLAY`, `DGPU_BACKEND`,
-`DGPU_DEVICE`, `DGPU_ACTUAL_CTX`, `DGPU_RUN_DIR`.
+`DGPU_DEVICE`, `DGPU_ACTUAL_CTX`, `DGPU_RUN_DIR`, `DGPU_HOST_OS`, `DGPU_HOST_OS_JSON`.
 
 **Output** under `log_dir`: `summary.json`, `server_logs/`, one folder per model with `load.json` and task logs.
+The summary and every plain-text launch/task log include host OS metadata.
 
 ## 6. HTTP API map
 
@@ -440,7 +442,9 @@ not JSON where required, `500`, `501` not available, `503` cannot serve now (ret
 
 ## 7. Configuration reference
 
-One TOML file, passed with `--config` (default `example.dual_gpu.toml`). Unknown keys are ignored.
+One TOML file, passed with `--config` (default `example.dual_gpu.ubuntu.toml` on Linux and
+`example.dual_gpu.toml` on Windows). Unknown keys are ignored. Relative discovery paths are resolved
+from the config file's directory, and `~`/environment variables are expanded.
 
 **`[project]`**
 
@@ -502,12 +506,12 @@ internal `--replace-pid` is used by the restart.
 
 | File | Contents |
 |---|---|
-| `<data-dir>/chatbot.sqlite3` | Runs, deployments, resource samples, projects, sessions, coding tasks, tool events, clients |
+| `<data-dir>/chatbot.sqlite3` | Runs (including host OS), deployments, resource samples, projects, sessions, coding tasks, tool events, clients |
 | `<data-dir>/chat_history.sqlite3` | Full conversations (only if `store_chat_history`) |
 | `<data-dir>/project_usage.sqlite3` | Daily usage per project |
 | `<data-dir>/training.sqlite3` | Training runs, steps, checkpoints, hardware samples, evaluation queue, leases, benchmarks |
-| `<data-dir>/deployments/<time>/server_logs/*.log` | Each `llama-server`'s output, with its exact command line at the top of each launch |
-| `<data-dir>/launcher.log` | Output of the background service and of restarts |
+| `<data-dir>/deployments/<time>/server_logs/*.log` | Each `llama-server`'s output, with its exact command line and host OS at the top of each launch |
+| `<data-dir>/launcher.log` | Output of the background service and of restarts, with host OS in each launch header |
 | `<data-dir>/restart_state.json` | Present only between a restart with "reload models" and the new process starting |
 | `<data-dir>/artifacts/` | Training artifacts |
 | `<config>.bak` | A copy of the config, made once, before the first settings save |
@@ -611,7 +615,8 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
 **Scope limits**
 
 - Exactly **two lanes**.
-- **Windows-first.** Linux code exists and is unverified.
+- **Ubuntu/Linux hardware is unverified.** The code path and fake `/proc`/DRM tests exist, but the
+  reference two-GPU machine is Windows.
 - **One machine**, one service.
 - The deployment APIs keep **one deployment at a time**. A whole-deployment call replaces everything;
   `deploy_lane` and the gateway's on-demand loading manage lanes individually.
@@ -663,7 +668,7 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
 
 ## 13. Testing and verification status
 
-- **378 automated tests** (`py -m pytest`) pass, 1 skipped (a DDP numerical check that needs `torch`). They
+- **390 automated tests** (`py -m pytest`) pass, 1 skipped (a DDP numerical check that needs `torch`). They
   cover the GGUF reader, KV estimator, config, run store, capacity checks, runtime and flag selection,
   the model manager (placement, eviction, admission, orphans, unload, Stop now, release), service control,
   settings saving, the gateway, leases and the training layer.
@@ -691,6 +696,16 @@ py app.py --check
 
 # Tests
 py -m pytest
+```
+
+Ubuntu equivalents use the edited Linux config and native llama.cpp binary:
+
+```bash
+python3 launch_service.py --config ./dual_gpu.toml
+python3 app.py --config ./dual_gpu.toml --check
+dual-gpu --config ./dual_gpu.toml inspect
+dual-gpu --config ./dual_gpu.toml plan
+python3 -m pytest
 ```
 
 | I want to | Do this |

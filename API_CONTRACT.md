@@ -21,6 +21,8 @@ it never itself stays resident. See [CLIENT_API.md](CLIENT_API.md#0-make-sure-th
 for the full example. Run from a terminal it also opens the UI in your browser (a program
 calling it gets no browser; `--open-browser` / `--no-browser` override). Once running, the service
 can be restarted or stopped over HTTP (see [Service control](#service-control)).
+When `--config` is omitted, Windows uses `example.dual_gpu.toml` and Linux uses
+`example.dual_gpu.ubuntu.toml`; production clients should normally pass their edited config explicitly.
 
 ## Conventions
 
@@ -41,6 +43,9 @@ can be restarted or stopped over HTTP (see [Service control](#service-control)).
   [Releasing the GPUs when a task is done](#releasing-the-gpus-when-a-task-is-done).
 - Fields marked **required** cause a `400` with a descriptive message if missing or invalid.
   Fields marked **optional** have the stated default when omitted.
+- New runs are attributed to the host OS. `host_os` always contains `system`, `release`,
+  `version`, and `machine`; Linux also supplies `distribution`, `distribution_id`, and
+  `distribution_version` when `/etc/os-release` is available.
 
 ---
 
@@ -52,7 +57,7 @@ Full snapshot used to render the dashboard on load. No input.
 ```jsonc
 {
   "app_version": "0.1.0",
-  "config_path": "F:/Projects/Dual_gpu_setup/example.dual_gpu.toml",
+  "config_path": "/path/to/dual_gpu.toml",
   "catalog": { /* see GET /api/models/refresh below for shape */ },
   "status": { /* see GET /api/status below for shape */ },
   "runs": [ /* up to 20 most recent runs, see GET /api/runs for row shape */ ]
@@ -222,7 +227,7 @@ day in range rather than the default last 14. The applied range echoes back as `
   "lane_keys": ["..."], "device": "string | null",
   "context_window": "int | null", "reasoning_budget": "int | null",
   "request": { /* the exact chat-completions payload sent to llama-server */ },
-  "configuration": { /* full server/runtime configuration snapshot for this run */ },
+  "configuration": { /* full server/runtime configuration snapshot; includes host_os */ },
   "output_text": "string | null", "reasoning_text": "string | null",
   "finish_reason": "string | null",
   "usage": { /* see GET /api/clients/schema */ },
@@ -234,7 +239,13 @@ day in range rather than the default last 14. The applied range echoes back as `
   "task_label": "string | null (set only if this run was made via /api/chat with task_label)",
   "project_id": "uuid | null", "agent_session_id": "uuid | null",
   "coding_task_id": "uuid | null", "agent_role": "string | null",
-  "workload_kind": "evaluation | coding_agent"
+  "workload_kind": "evaluation | coding_agent",
+  "host_os": {
+    "system": "Windows | Linux", "release": "...", "version": "...", "machine": "...",
+    "distribution": "Ubuntu 24.04 LTS (Linux only, when available)",
+    "distribution_id": "ubuntu (Linux only, when available)",
+    "distribution_version": "24.04 (Linux only, when available)"
+  }
 }
 ```
 
@@ -445,7 +456,9 @@ CORS preflight so a web page cannot trigger them with a blind form POST (`415` o
 ### GET `/api/service`
 
 **Shares:** `{"pid", "started_at", "uptime_seconds", "host", "port", "config_path", "data_dir",
-"app_version", "python", "can_restart": bool, "pending": "restart | stop | null", "restore_pending": bool}`.
+"app_version", "python", "host_os": {"system", "release", "version", "machine",
+"distribution"?, "distribution_id"?, "distribution_version"?},
+"can_restart": bool, "pending": "restart | stop | null", "restore_pending": bool}`.
 `pid` changes when the service restarts, which is how a client knows the new process is the one
 answering. `501` if this process has no service control (it was not started through `app.py`).
 
@@ -565,6 +578,11 @@ Run a prompt against the currently loaded deployment.
 **Errors:** `409` no deployment is loaded; `400` unknown/inactive target(s), no
 `messages`/`prompt` given, or unknown `client_id`.
 
+When `client_id` is supplied, the JSONL record appended to the registered `output_path` contains
+run/client/project identity, target/model/device/context, status, metrics, reasoning, error, and the
+same `host_os` object described under `GET /api/runs`. The HTTP chat result itself does not duplicate
+`host_os`; use its `run_id` with `GET /api/runs/{run_id}` when that attribution is needed.
+
 ---
 
 ## OpenAI-compatible coding-agent gateway
@@ -582,7 +600,8 @@ surface. Lane- and role-pinned variants are also supported:
   that lane.
 - GPU only: the server starts only if its weights + estimated KV cache + `policy.vram_headroom_gb`
   fit the VRAM actually free on the GPU, counting every process (`policy.vram_admission`; on Windows
-  from the OS's accounting, not HIP's per-process figure). Placement prefers a GPU where it fits
+  from the OS's accounting, not HIP's per-process figure; on Linux from the native llama.cpp device
+  listing). Placement prefers a GPU where it fits
   now, counting VRAM that evicting our own idle model there would release; when it fits nowhere
   the request gets **503** with the shortfall and nothing is evicted. The same check guards
   `/api/deploy` and the `/api/clients/deploy*` endpoints, which report it in their `500` message.
@@ -710,6 +729,54 @@ inclusive; 400 on bad format).
 ```
 Token counts are exact for chat/inference and best-effort for autocomplete (counted for
 non-streamed completions; streamed autocomplete records the request without token totals).
+
+## Training and ROCm telemetry
+
+Training runs are independent of inference runs and live in `training.sqlite3`. The training
+process sends metrics through `TrainingTracker`; `app.py` samples host/GPU telemetry and owns lane
+leases. A missing sensor is returned as `null` with an unavailable reason, never as zero.
+
+### GET `/api/hardware`
+
+Shares `{"hardware", "lane_holders", "kernel_faults"}`. `hardware` contains availability,
+sampling interval, AMD GPU identities, latest/history samples, system load, AMD SMI status and
+sampler overhead/errors. Linux samples may include VRAM/GTT, temperatures, power, clocks, PCIe,
+`throttle_status`, `amd_smi_fields`, and `unavailable` reasons.
+
+### POST and GET `/api/training/runs`
+
+`POST` requires `name`; optional fields include `id`, `lanes`, `config`, `dataset`, `env`, `seed`,
+`max_steps`, `parent_run_id`, `tags`, `pid`, `world_size`, `unload_inference`, and `lease_ttl_s`.
+Configured lanes are leased atomically; inference conflicts return `409` unless explicitly unloaded.
+
+The created run and every row returned by `GET` include top-level:
+
+```jsonc
+{
+  "id": "string", "name": "string", "status": "running | stalled | lost | completed | failed | cancelled",
+  "host_os": {"system": "Linux", "distribution_id": "ubuntu", "release": "...", "machine": "..."},
+  "lanes": ["lane-key"], "world_size": 1, "last_step": 0, "progress": null,
+  "tokens": {}, "throughput": {}, "latest": null, "peak_mem_bytes": null
+}
+```
+
+The detail response `GET /api/training/runs/{id}` adds `env`, `config`, `dataset`, `summary`, events,
+checkpoints, hardware summary, artifacts, notes and alerts. `env.os` identifies the training process;
+`env.server_host_os` identifies the dashboard host; `env.server_hardware` contains physical GPU/PCIe,
+kernel, amdgpu and ROCm details. Top-level `host_os` prefers the training-process identity and always
+falls back to the server identity when tracker-side capture is disabled.
+
+### Training run subresources
+
+- `POST /api/training/runs/{id}/metrics`, `/events`, `/checkpoints`, `/finish`, `/evals`, `/notes`,
+  `/examples`, `/select`, and `/artifacts` ingest the corresponding tracker or experiment records.
+- `GET /api/training/runs/{id}/series` returns downsampled step and persisted GPU series. GPU points
+  include `throttle_status`, `telemetry_sources`, and `unavailable` metadata.
+- `GET /api/training/runs/{id}/analysis`, `/alerts`, `/evals`, `/resume-report`, `/hard-examples`,
+  `/ranks`, and `/artifacts` expose derived analysis and saved state.
+- `GET /api/training/alerts`, `/compare`, `/scaling`, `/eval-queue`, `/benchmarks`, `/profiles`, and
+  `/notes` expose cross-run views. Matching POST endpoints submit evaluations, forecasts, benchmarks
+  and notes; benchmark cancellation and checkpoint designate/promote/demote routes are also supported.
 
 ## Project and agent telemetry endpoints
 

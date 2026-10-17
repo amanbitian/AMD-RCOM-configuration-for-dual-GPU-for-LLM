@@ -11,6 +11,7 @@ from urllib import request as urlrequest
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
 from dual_gpu_setup.hostos import get_host
+from dual_gpu_setup.host_info import os_log_line
 from dual_gpu_setup.lmstudio import (
     RuntimeInfo,
     backend_env,
@@ -330,6 +331,7 @@ class LlamaServerProcess:
         args = self.build_command()
         self._log_handle = open(self.log_path, "a", encoding="utf-8", errors="replace")
         self._log_handle.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} :: {' '.join(args)} ===\n")
+        self._log_handle.write(f"host_os={os_log_line()}\n")
         self._log_handle.flush()
         self.proc = subprocess.Popen(
             args,
@@ -366,7 +368,8 @@ class LlamaServerProcess:
         except OSError:
             return ""
         launch = text.rsplit("\n=== ", 1)[-1].splitlines()[1:]  # drop this launch's command header
-        return " | ".join([line.strip() for line in launch if line.strip()][-lines:])[-400:]
+        output = [line.strip() for line in launch if line.strip() and not line.startswith("host_os=")]
+        return " | ".join(output[-lines:])[-400:]
 
     def _verify_placement(self) -> None:
         """Fail the start (and stop the server) unless the weights are resident on the target GPU."""

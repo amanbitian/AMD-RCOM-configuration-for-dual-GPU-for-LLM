@@ -47,11 +47,20 @@ def test_migrations_create_expected_schema(tmp_path: Path):
     assert "task_label" in columns
     assert "project_id" in columns
     assert "workload_kind" in columns
+    assert "host_os_json" in columns
     assert "clients" in tables
     assert "projects" in tables
     assert "agent_sessions" in tables
     assert "coding_tasks" in tables
     assert "tool_events" in tables
+
+
+def test_run_records_host_os_by_default(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    make_run(store, "r1", "modelA", None, 60.0, 2000)
+    host_os = store.get("r1")["host_os"]
+    assert host_os["system"]
+    assert host_os["release"]
 
 
 def test_client_registration_round_trip(tmp_path: Path):

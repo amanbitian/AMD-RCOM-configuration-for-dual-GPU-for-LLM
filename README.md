@@ -4,7 +4,7 @@
 > can do, what to expect from it (with measured numbers), and its limits. This README covers setup and
 > walkthroughs.
 
-`Dual_gpu_setup` is a reusable dual-GPU orchestration layer for local `llama-server` workloads on Windows. It was designed so eval projects and future local-model apps can share one GPU management system instead of each repo reimplementing:
+`Dual_gpu_setup` is a reusable dual-GPU orchestration layer for local `llama-server` workloads on Windows and Ubuntu/Linux. It was designed so eval projects and future local-model apps can share one GPU management system instead of each repo reimplementing:
 
 - GPU discovery
 - lane scheduling
@@ -85,9 +85,9 @@ There are two ways to drive this repo. Both end up going through the same GPU-di
 ### 1. Batch orchestration (the `dual-gpu` CLI)
 
 1. [config.py](dual_gpu_setup/config.py) loads and validates your TOML file — lanes, models, tasks, and policy defaults (context sizes, VRAM safety fraction, flash attention, etc).
-2. [lmstudio.py](dual_gpu_setup/lmstudio.py) asks the LM Studio runtime for its device list and matches each configured lane (`match = "R9700"`, `match = "9070 XT"`) to a physical `ROCm` device id.
+2. [lmstudio.py](dual_gpu_setup/lmstudio.py) asks the configured native llama.cpp binary (or the LM Studio fallback) for its device list and matches each configured lane (`match = "R9700"`, `match = "9070 XT"`) to a physical `ROCm` device id.
 3. [orchestrator.py](dual_gpu_setup/orchestrator.py) sorts the model queue by size and drains it from both ends at once: the large GPU keeps pulling the biggest model that still fits while the small GPU keeps pulling the smallest, so neither card sits idle waiting on the other's long-running model (see [How Scheduling Works](#how-scheduling-works)).
-4. For each model, [server.py](dual_gpu_setup/server.py) launches `llama-server.exe` pinned to that GPU's device id, polls its health endpoint until it is ready, and watches memory to flag VRAM spill into shared/system memory.
+4. For each model, [server.py](dual_gpu_setup/server.py) launches `llama-server` (`llama-server.exe` on Windows) pinned to that GPU's device id, polls its health endpoint until it is ready, and watches memory to flag VRAM spill into shared/system memory.
 5. [tasks.py](dual_gpu_setup/tasks.py) runs your configured command(s) against that model's local OpenAI-compatible endpoint, substituting placeholders like `{base_url}` and `{model_name}` and injecting the `DGPU_*` environment variables.
 6. The server is stopped and the next model in the queue loads. Models marked `multi_gpu = true` are held back and run last, spanning both lanes in a single `llama-server` process.
 7. Everything lands in a run folder under `log_dir`: `summary.json`, per-model `load.json`, server logs, and task logs.
@@ -155,7 +155,8 @@ The repo is split into small modules:
 - [dual_gpu_setup/gguf.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/gguf.py): dependency-free GGUF metadata reader, used to estimate KV-cache VRAM cost at deploy time
 - [dual_gpu_setup/cli.py](F:/Projects/Dual_gpu_setup/dual_gpu_setup/cli.py): CLI entrypoint
 - [launch_service.py](F:/Projects/Dual_gpu_setup/launch_service.py): one-shot, on-demand launcher for `app.py` (see [CLIENT_API.md](CLIENT_API.md))
-- [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml): sample config
+- [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml): Windows sample config
+- [example.dual_gpu.ubuntu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.ubuntu.toml): Ubuntu sample using an explicit native llama.cpp binary
 
 ## Testing
 
@@ -164,7 +165,7 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
-367 tests cover the GGUF reader, the KV-cache estimator and context-window sizing logic, the
+390 passing tests cover the GGUF reader, the KV-cache estimator and context-window sizing logic, the
 config loader, `RunStore` (migrations, client registration, dashboard aggregation, pruning),
 the deploy-time capacity check across all three deployment modes, runtime and flag selection, the
 on-demand model manager and residency guard, the coding gateway, and the training telemetry
@@ -207,19 +208,15 @@ Everything else stays in this repo.
 
 Before running this project, make sure you have:
 
-1. Windows machine with 2 GPUs
-2. A `llama-server` build: an official [llama.cpp release](https://github.com/ggml-org/llama.cpp/releases)
-   (the "Windows x64 (ROCm)" zip bundles its own HIP DLLs) set in `discovery.backend_server_binaries`,
-   or LM Studio with at least one `llama.cpp` runtime installed
+1. A Windows or Ubuntu/Linux machine with 2 GPUs
+2. A `llama-server` build set in `discovery.backend_server_binaries`: an official Windows
+   [llama.cpp release](https://github.com/ggml-org/llama.cpp/releases), or a native Linux build
+   compiled for the installed ROCm/Vulkan stack. LM Studio's runtime remains a Windows-friendly fallback.
 3. Models downloaded locally through LM Studio or stored in a known model directory
 4. Python 3.11 or newer
 
-This version is optimized for:
-
-- Windows
-- official llama.cpp builds, with LM Studio's bundled runtime as the fallback
-- `llama-server.exe`
-- local GGUF models
+The host layer supports Windows and Linux process, memory, GPU, port, and process-tree controls.
+On Ubuntu, use the native `llama-server` binary and ensure it has execute permission.
 
 ## Installation
 
@@ -236,6 +233,32 @@ C:\path\to\python.exe -m pip install -e .
 ```
 
 The editable install gives you the `dual-gpu` CLI command.
+
+On Ubuntu:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e '.[dev]'
+cp example.dual_gpu.ubuntu.toml dual_gpu.toml
+# Edit the llama-server path, model root, GPU match strings, and VRAM sizes.
+python3 app.py --config ./dual_gpu.toml --check
+```
+
+When `--config` is omitted, `app.py` and `launch_service.py` select
+`example.dual_gpu.ubuntu.toml` on Linux and `example.dual_gpu.toml` on Windows. For a real
+installation, keep passing your edited config explicitly so upgrades never replace local settings.
+
+### Training on Ubuntu with ROCm
+
+Inference continues to use the native llama.cpp `llama-server`; training is a separate PyTorch ROCm
+process that reports through `TrainingTracker`. Keep `app.py` running on the Ubuntu GPU host, configure
+stable `pci_bus` values for both lanes when possible, and create the tracker in the training script.
+Each run records the training-process OS, dashboard-host OS, kernel, ROCm component versions, amdgpu
+driver, PyTorch/HIP versions, visible devices, package versions, GPU mapping, PCIe link, utilization,
+VRAM/GTT, temperature, power, clocks, throttling, missing-sensor reasons, steps, loss, throughput,
+checkpoints, faults, and DDP rank telemetry. See
+[docs/TRAINING_TELEMETRY.md](F:/Projects/Dual_gpu_setup/docs/TRAINING_TELEMETRY.md).
 
 If you prefer not to install the script entrypoint, you can also run:
 
@@ -261,14 +284,14 @@ Then start the application:
 python .\app.py --config .\example.dual_gpu.toml
 ```
 
-The application listens on localhost by default, which is the recommended mode for coding agents. The terminal prints the Windows-local URL:
+The application listens on localhost by default, which is the recommended mode for coding agents. The terminal prints the local URL:
 
 ```text
 Dual GPU Studio is running
-  Windows local: http://127.0.0.1:8090
+  Local: http://127.0.0.1:8090
 ```
 
-The Windows browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`.
+The default browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`.
 (`launch_service.py` starts the same service in the background and opens the browser when you run it from a terminal; a program launching it gets no browser.)
 
 ```powershell
@@ -300,7 +323,9 @@ The app provides:
 - an Overview dashboard with token, throughput, latency, model, activity, and resource figures;
 - searchable run history with a complete run inspector for prompts, outputs, settings, native backend data, and samples.
 
-The configured model files and LM Studio runtime must exist before loading a deployment. Use the regular `inspect` command first if device mapping is uncertain.
+The configured model files and llama.cpp runtime must exist before loading a deployment. On Ubuntu,
+that is the native binary in `backend_server_binaries`; Windows can use either an explicit build or
+the LM Studio fallback. Use the regular `inspect` command first if device mapping is uncertain.
 
 The first runnable UI waits for the local model server to finish a response before displaying it. Token-by-token streaming, cancellation, temperature/power telemetry, and richer per-physical-GPU charts remain later implementation phases described in the design documents.
 
@@ -308,12 +333,13 @@ To access the application from a Mac or another device on the same trusted netwo
 
 ### 1. Review the example config
 
-Open [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml).
+Open [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml) on Windows or
+[example.dual_gpu.ubuntu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.ubuntu.toml) on Ubuntu.
 
 This file defines:
 
 - project metadata
-- LM Studio discovery paths
+- llama.cpp/LM Studio runtime discovery paths
 - global serving policy
 - 2 GPU lanes
 - model list
@@ -463,7 +489,7 @@ This is one of the most important upgrades carried over from the reference code.
 
 ## Architecture Example
 
-Both GPUs are utilized simultaneously by design. This is not two models sharing one GPU. It is two independent `llama-server.exe` processes, each pinned to a different physical GPU, running different models in parallel.
+Both GPUs are utilized simultaneously by design. This is not two models sharing one GPU. It is two independent `llama-server` processes, each pinned to a different physical GPU, running different models in parallel.
 
 ```text
                    ┌─────────────────────────────────┐
@@ -535,7 +561,8 @@ Important:
 
 The main config file is TOML.
 
-See [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml).
+See [example.dual_gpu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.toml) for Windows and
+[example.dual_gpu.ubuntu.toml](F:/Projects/Dual_gpu_setup/example.dual_gpu.ubuntu.toml) for Ubuntu.
 
 ### `[project]`
 
@@ -935,6 +962,12 @@ healthy:
 python launch_service.py --config .\example.dual_gpu.toml
 ```
 
+On Ubuntu, use your edited Linux config (or omit `--config` to select the Ubuntu example):
+
+```bash
+python3 launch_service.py --config ./dual_gpu.toml
+```
+
 ### Integration Option 7: Connect from curl or Postman
 
 ```powershell
@@ -1081,7 +1114,8 @@ Check:
 ## Current Limitations
 
 - expects exactly 2 lanes
-- currently optimized for Windows
+- Linux GPU telemetry requires amdgpu DRM `fdinfo` access; kernel fault monitoring also requires
+  permission to read the system journal
 - current backend support is focused on `rocm` and `vulkan` (official llama.cpp builds or LM Studio's)
 - one active deployment at a time — a new deploy always replaces whatever was previously
   loaded, whether triggered from the dashboard or the [Client Integration API](CLIENT_API.md)

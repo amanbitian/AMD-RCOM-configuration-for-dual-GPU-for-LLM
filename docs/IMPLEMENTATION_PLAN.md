@@ -1,5 +1,10 @@
 # Chatbot Layer Implementation and Validation Plan
 
+> Historical planning document. The chatbot, persistence, host abstraction, and dashboard described
+> here are now implemented. Use [app_overview.md](../app_overview.md) and
+> [API_CONTRACT.md](../API_CONTRACT.md) for current behavior. Current inference hosts are Windows and
+> Ubuntu/Linux, and new runs persist host OS attribution.
+
 ## Boundary with the current code
 
 The repository already has useful building blocks:
@@ -52,8 +57,8 @@ dual_gpu_setup/
 
 Keep the existing batch CLI operational. Add a command such as:
 
-```powershell
-dual-gpu --config .\example.dual_gpu.toml serve
+```text
+dual-gpu --config /path/to/dual_gpu.toml serve
 ```
 
 ## Work phases
@@ -149,7 +154,8 @@ Exit condition: the service recovers safely from process/application crashes wit
 
 ### Hardware tests
 
-Run on the actual two-GPU Windows host:
+Run on the actual two-GPU Windows host and repeat the platform-sensitive lifecycle, process,
+device-discovery, and telemetry cases on the Ubuntu host:
 
 1. Load one small model on GPU A and confirm GPU B remains unreserved.
 2. Repeat on GPU B.
@@ -161,6 +167,7 @@ Run on the actual two-GPU Windows host:
 8. Cancel during prefill and decode; verify partial output, final samples, and released request slots.
 9. Kill one server during compare mode and verify the other finishes.
 10. Restart the app during an active run and verify it is marked interrupted and processes are reconciled.
+11. Confirm each run, service response, launch log, and exported client JSONL record identifies the host OS.
 
 ### Performance tests
 

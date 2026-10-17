@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from dual_gpu_setup.hostos import get_host
+from dual_gpu_setup.host_info import os_info
+from dual_gpu_setup.training.environment import rocm_installation
 
 AMD_VENDOR = "0x1002"
 _CARD_RE = re.compile(r"^card\d+$")
@@ -335,8 +337,10 @@ class HardwareSampler:
             gpus.append({**gpu.identity(), "pcie_speed": _read(device / "current_link_speed"),
                          "pcie_width": _read(device / "current_link_width"), "pcie_max_speed": _read(device / "max_link_speed"),
                          "pcie_max_width": _read(device / "max_link_width"), "vbios_version": _read(device / "vbios_version")})
-        return {"gpus": gpus, "kernel": stdlib_platform.release(), "amdgpu_driver": text("/sys/module/amdgpu/version"),
-                "rocm_version": text("/opt/rocm/.info/version"), "unavailable_reason": self.unavailable_reason,
+        rocm = rocm_installation()
+        return {"gpus": gpus, "os": os_info(), "kernel": stdlib_platform.release(),
+                "amdgpu_driver": text("/sys/module/amdgpu/version"), "rocm": rocm,
+                "rocm_version": rocm["version"], "unavailable_reason": self.unavailable_reason,
                 "visibility": {k: os.environ.get(k) for k in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES") if os.environ.get(k)}}
 
     def start(self) -> None:
@@ -378,7 +382,8 @@ class HardwareSampler:
                     "latest": latest,
                     "history": [
                         {k: s.get(k) for k in ("ts", "gpu_busy_pct", "vram_used_bytes", "temp_junction_c",
-                                               "temp_memory_c", "temp_edge_c", "power_w")}
+                                               "temp_memory_c", "temp_edge_c", "power_w", "throttle_status",
+                                               "amd_smi_fields", "unavailable")}
                         for s in history
                     ],
                 })

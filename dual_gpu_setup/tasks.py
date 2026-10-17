@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig
+from dual_gpu_setup.host_info import os_info, os_log_line
 
 
 class TaskFailure(RuntimeError):
@@ -45,6 +48,11 @@ def _render(value: str, context: dict[str, str]) -> str:
     return value.format_map(context)
 
 
+def _shell_command(parts: list[str]) -> str:
+    """Render a list for the native shell, using POSIX quoting on Ubuntu."""
+    return subprocess.list2cmdline(parts) if sys.platform == "win32" else shlex.join(parts)
+
+
 def run_tasks_for_model(
     config: AppConfig,
     lane: LaneConfig,
@@ -59,7 +67,10 @@ def run_tasks_for_model(
     context = _context(config, lane, model, model_size_gb, base_url, suite_id, run_dir, actual_ctx, device)
     for task in config.tasks:
         log_path = run_dir / f"task-{task.name}.log"
-        task_cwd = Path(_render(task.cwd, context)).resolve() if task.cwd else config.base_dir
+        task_cwd = Path(_render(task.cwd, context)).expanduser() if task.cwd else config.base_dir
+        if not task_cwd.is_absolute():
+            task_cwd = config.base_dir / task_cwd
+        task_cwd = task_cwd.resolve()
         env = os.environ.copy()
         env.update({key: _render(value, context) for key, value in task.env.items()})
         env.update(
@@ -73,6 +84,8 @@ def run_tasks_for_model(
                 "DGPU_DEVICE": device,
                 "DGPU_ACTUAL_CTX": str(actual_ctx),
                 "DGPU_RUN_DIR": str(run_dir),
+                "DGPU_HOST_OS": os_info().get("system", sys.platform),
+                "DGPU_HOST_OS_JSON": os_log_line(),
             }
         )
 
@@ -81,10 +94,11 @@ def run_tasks_for_model(
         else:
             command = [_render(part, context) for part in task.command]
             if task.shell:
-                command = subprocess.list2cmdline(command)
+                command = _shell_command(command)
 
         with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
-            log_file.write(f"$ {command}\n\n")
+            display_command = command if isinstance(command, str) else _shell_command(command)
+            log_file.write(f"host_os={os_log_line()}\n$ {display_command}\n\n")
             log_file.flush()
             result = subprocess.run(
                 command,

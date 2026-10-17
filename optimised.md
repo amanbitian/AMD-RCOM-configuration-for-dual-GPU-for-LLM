@@ -1,5 +1,9 @@
 # Optimization & Bug-Fix Report — 2026-09-27
 
+> Historical Windows benchmark report. Its measurements and console-window investigation describe
+> the original Windows host. The current application also supports Ubuntu/Linux through a native
+> llama.cpp binary and records host OS metadata so results from different hosts are not mixed.
+
 This is the narrative version of what's in [CHANGELOG.md](CHANGELOG.md): not just what
 changed, but how each issue was actually found and confirmed before anything was fixed.
 Every claim below was checked against real evidence (real GGUF files, real `llama-server`
