@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-20 - Thinking tokens no longer shown as 0 when the backend doesn't count them; token columns in Analytics
+
+- llama.cpp never reports an exact `reasoning_tokens` count, so the Overview's token-accounting donut summed
+  nulls and showed **Thinking tokens 0** even for runs that reasoned (gpt-oss, gemma, Qwen with thinking on).
+  `/api/dashboard` `summary` now adds `thinking_tokens_reported_runs`, `thinking_tokens_estimated` (the
+  existing ~4 chars/token estimate, summed) and `thinking_tokens_estimated_runs`. `thinking_tokens` stays
+  exact-only.
+- The donut shows the exact count when the backend reports one, `~N est.` when only the estimate exists, and
+  `—` when no reasoning was observed; hovering shows how many runs each covers. The estimate is now counted
+  in the donut, so outputs of reasoning runs are no longer left out of it.
+- The Analytics category × model table gained **Input tokens** and **Output tokens** columns (total, with a
+  per-run average beneath). The data was already in `category_models`.
+- `API_CONTRACT.md` brought up to date with the code: `wall_clock_tokens_per_second` and
+  `avg_concurrent_requests` on the summary and every grouped list, the `backends` and `operating_systems`
+  lists, the `backend`/`os` run-row labels, the slimmed `recent_runs` rows, and the `/api/leases` endpoints.
+- README screenshots retaken from the live service for every tab (two models loaded, Windows GPU sensors
+  live), plus a new `analytics-categories.png` for the category × model table. The README's Hardware text
+  no longer says GPU sensors are unavailable on Windows.
+- Two empty-state messages (no training runs, no attachments) rendered as broken-up grid rows because their
+  inline `<span>` became its own grid cell; each is now one line. The run-detail GPU hint no longer says the
+  sampler needs Linux.
+
+## 2026-10-20 - No false "not managed by this service" banner during an unload
+
+- A graceful unload removes the model from the manager first and then waits (up to
+  `drain_timeout_seconds`) for running requests. The orphan scan ran in that window and listed the
+  service's own draining server as a leftover. The scan is now skipped while a load, swap or unload runs.
+- `GET /api/status` gained `transitioning`. The Service page shows a notice with **Stop now** while a change
+  is running, including one started from another tab or application.
+- A second Unload click during the wait returns a `409` that explains the wait and Stop now, and the page
+  shows it as an information notice instead of an error.
+
 ## 2026-10-17 - Ubuntu support and OS-attributed logs
 
 - Background launch and UI restart now create a new POSIX session on Linux, so the service survives
@@ -19,6 +51,31 @@
   disabled, distinguish tracker and dashboard hosts, fingerprint ROCm component versions and relevant
   accelerator environment, and retain AMD SMI throttle/source/unavailable metadata in SQLite and the UI.
 - Added a timestamp-first hardware-sample index for run-window queries.
+
+## 2026-10-19 — GPU hardware telemetry on Windows
+
+The Hardware tab was blank on Windows ("GPU sysfs telemetry requires Linux"). The sensor layer had been built for
+the Linux training machine and Windows was left out without that being said. It now works on Windows
+(`training/windows_gpu.py`):
+- **ADL, every second, in process:** busy %, edge / junction / memory temperature, board power, core and memory
+  clocks and fan, about 2 ms per tick.
+- **Windows counters, every 5 s:** VRAM used and shared memory used. **Device properties, every 60 s:** the
+  negotiated PCIe link and the driver version. Both run on a background thread, off the sampling path.
+- Anything unreadable is `null` with a reason, never zero. Throttle status, AMD SMI and the kernel-fault
+  follower stay Linux only.
+- The ADL sensor ids are not documented where they could be checked, so they were identified on the R9700 and
+  9070 XT by behaviour (edge matched Task Manager; junction followed every change in power within a second while
+  memory moved over tens of seconds). A cross-check caught a wrong guess: sensors 40 and 41 read 4 and 8 on both
+  cards while Windows reported PCIe Gen 5 x16, so they are not used.
+- `GET /api/hardware` is now documented in API_CONTRACT.md; it was missing.
+
+Found by the test suite once Windows GPUs were discovered: a finished training run's memory profile is stored under
+the GPU's discovered PCI address, but the forecast looked it up by lane key when the config had no `pci_bus`, so
+a measured forecast fell back to the estimate. The forecast now uses the same GPU identity. On Linux this would
+have appeared as soon as discovery succeeded without `pci_bus` in the config.
+
+Verified on the reference machine: both cards matched to their lanes, live values on `/api/hardware` through a
+running service, history filling, no dropped ticks. The page was not opened in a real browser.
 
 ## 2026-10-17 — Measured: where the context cache lives
 

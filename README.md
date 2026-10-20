@@ -23,19 +23,45 @@ and turning them into a cleaner, config-driven service layer.
 
 ## Screenshots
 
-The web app ([app.py](app.py)) gives you a full local console for loading, chatting with, and comparing models across both GPUs — see [How It Works](#how-it-works) below for what is happening behind each view.
+The web app ([app.py](app.py)) gives you a full local console for loading, chatting with, and comparing models across both GPUs — see [How It Works](#how-it-works) below for what is happening behind each view. The sidebar has one page per area, in this order.
 
-**Performance overview** — total runs, tokens processed, prompt-processing (prefill) vs. token-generation (decode) throughput per model, resource peaks, and 14-day activity, all aggregated live from every run's telemetry.
+**Overview** — the performance dashboard. Top cards show total runs, success rate, tokens processed, decode speed, latency, models tested, and spill warnings. Each GPU lane gets a card with average utilization, peak VRAM, prefill and decode speed, and the number of runs. Lower down, per-model prompt-processing and token-generation bars and a token-accounting donut (input, visible output, thinking). Thinking shows the backend's exact count when it reports one, a `~N est.` figure from the reasoning text when it doesn't (llama.cpp), and `—` when no run reasoned. Everything is aggregated live from the stored run telemetry.
 
-![Overview dashboard showing per-model prompt processing and token generation throughput](docs/screenshots/overview.png)
+![Overview dashboard with run totals, per-GPU lane cards, per-model throughput bars and token accounting](docs/screenshots/overview.png)
 
-**Chat / compare workspace** — deploy one model split across both GPUs, two independent models (one per GPU), or a single model on one GPU, then send a prompt and watch both answers, token counts, and speeds side by side.
+**Chat** — the inference workspace. The left panel chooses the deployment: an Evaluation or Coding-agent preset, the project and agent role that runs are attributed to, a task label, and one of three placements (*Both GPUs* for a single split model, *Two models* for one model per GPU, or *One GPU*). It also lists how many installed GGUF variants were found and which model and quantization to load. The middle panel is the conversation, with a response view that can show both models side by side. The right panel is live telemetry: system CPU, RAM pressure and use, and pagefile or commit, plus one card per running server with GPU utilization, process CPU and RAM, dedicated VRAM, and shared GPU memory.
 
-![Chat workspace running Qwen3.5-4B on the R9700 and gemma-3-270m on the 9070 XT at the same time](docs/screenshots/chat.png)
+![Chat workspace with the deployment panel, conversation area and live telemetry for both running servers](docs/screenshots/chat.png)
 
-**Run history** — every prompt, output, token count, timing, and VRAM/RAM sample is persisted to SQLite and searchable afterward.
+**Run history** — every call, one row each: start time, model and GPU lane (with project, agent role, runtime and host OS), status, mode, context and thinking budget, input and output tokens (with cached tokens), prefill and decode speed, time to first token, latency, and peak VRAM and RAM. Filters narrow the table by search text, status, mode, and workload. Clicking a row opens the full prompt, output, reasoning, native backend response, and raw resource samples.
 
-![Run history table with per-run prefill/decode throughput and resource columns](docs/screenshots/run-history.png)
+![Run history table with in-flight and completed runs, attributed to project, GPU lane, runtime and host OS, with per-run speeds, latency and peak memory](docs/screenshots/run-history.png)
+
+**Analytics** — performance sliced by task category and model, with optional date-range filters. The category × model table shows runs, success rate, input and output tokens (total and per run), decode and prefill speed, latency, and peak VRAM. The *Coding reasoning performance* table shows, per model and reasoning effort, how many runs there were, how many reported exact thinking-token counts, average thinking tokens and time spent thinking, tool-call validity, decode speed, and latency. Summary cards below give run-weighted averages for the current filter.
+
+![Analytics page with category and model filters, the coding reasoning performance table and run-weighted summary cards](docs/screenshots/analytics.png)
+
+![Analytics category × model table with input and output tokens (total and per run), decode and prefill speed, latency and peak VRAM](docs/screenshots/analytics-categories.png)
+
+**Projects** — register each repository once (name, path, optional git remote). Agent requests and GPU samples are attributed to the matching project. The *Usage by project* table shows runs, input and output tokens, and throughput per project. *Agent activity* breaks the same usage down by coding role such as developer, qa, or coding-agent.
+
+![Projects page with the project registry, token usage by project and agent activity by role](docs/screenshots/projects.png)
+
+**Training** — telemetry from the training tracker: run list with status, progress, tokens seen, tokens per second, loss, peak VRAM, and start time. Tabs cover run comparison, evaluation, benchmarks, and a memory forecast. Training and inference share the GPUs but are tracked separately. This screenshot is empty because no training run has been reported yet; [docs/TRAINING_TELEMETRY.md](docs/TRAINING_TELEMETRY.md) describes how to connect a training script.
+
+![Training telemetry page showing the run table and its tabs, with no runs yet](docs/screenshots/training.png)
+
+**Hardware** — live readings for every AMD GPU, sampled by the dashboard independently of any inference or training process. Each card shows who holds it (an inference model or a training lease), busy %, VRAM in use, edge / junction / memory temperature, board power, core and memory clocks, GTT use (the spill indicator), and the negotiated PCIe link, with rolling charts of GPU busy % and temperature. GPUs not assigned to a lane, such as an integrated GPU, are listed too. On Windows the sensors come from AMD's ADL library and Windows performance counters; on Linux, from `amdgpu` sysfs. A sensor a card doesn't expose shows as `n/a`, never as zero. Below the cards are the sampler's own health counters (samples taken, dropped ticks, average sample time).
+
+![Hardware page with live busy %, VRAM, temperatures, power, clocks and PCIe link for both GPUs while each serves a model](docs/screenshots/hardware.png)
+
+**Service** — controls for the running service itself. The *Process* card shows the process ID, uptime, address, config file and data directory, with **Restart service** (optionally loading the current models again) and **Stop service**. The *Loaded models* card lists each GPU's model with its context, how many requests it is answering, and its llama.cpp build, with **Unload** per model or **Unload everything**. The *Policy* card holds the loading and memory settings: weight loading, prompt-cache size in RAM, requiring free VRAM before a load, VRAM headroom, and loading models on demand. Changes are saved to the config file, with a `.bak` copy of the original kept.
+
+![Service page with the running process, a model loaded on each GPU with the requests it is answering, and the loading and memory policy settings](docs/screenshots/service.png)
+
+**Setup wizard** — a first-run guide, opened from any page's header. It walks through four steps: connect a project, choose GPUs, set up the coding agents, and confirm. The project step creates the project record and the shared key both coding agents use. Project prompts and completions from coding agents are redacted by default, while performance telemetry is kept.
+
+![First-run setup wizard, step 1, asking for a project name, repository path, optional git remote and metrics file](docs/screenshots/setup-wizard.png)
 
 ## What This Project Does
 

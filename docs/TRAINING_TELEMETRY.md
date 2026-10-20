@@ -86,6 +86,35 @@ The originally Windows-only code paths and their implemented Linux equivalents w
 | `server.py` process kill | `taskkill /F /T` | process-group `SIGTERM` then `SIGKILL` (`start_new_session=True` at spawn) |
 | `lmstudio.py` runtime discovery | `llama.cpp-win-x86_64-*`, `llama-server.exe` | also match `llama.cpp-linux-*`, binary without `.exe`, or an explicit `server_binary` path in config |
 
+### Windows GPU sources (ADL and Windows counters)
+
+The Hardware tab and the per-run hardware summary also work on Windows, from `training/windows_gpu.py`.
+Windows has no sysfs, so the values come from AMD's ADL library (`atiadlxx.dll`, installed with the Adrenalin
+driver), Windows performance counters and Windows device properties:
+
+| Field | Source | Cadence |
+|---|---|---|
+| GPU busy % | ADL PMLog sensor 19 (graphics activity) | 1 Hz |
+| Edge / junction / memory temperature | ADL sensors 8 / 27 / 9 | 1 Hz |
+| Board power | ADL sensor 73 | 1 Hz |
+| Core / memory clock, fan | ADL sensors 1 / 2 / 14 | 1 Hz |
+| VRAM used, shared (system) memory used | `\GPU Adapter Memory(*)` Dedicated / Shared Usage, joined to the card by name | every 5 s |
+| VRAM total | DXGI adapter description | at start |
+| PCIe link (current and maximum speed and width), driver version | `DEVPKEY_PciDevice_*` and `DEVPKEY_Device_DriverVersion` | every 60 s |
+
+- **The GPU's PCI address** (`0000:03:00.0`) comes from ADL's bus, device and function numbers, so a lane's
+  `pci_bus` setting means the same thing on both operating systems.
+- **The ADL sensor ids are not documented in a place this code could check.** They were identified on an RX 9070 XT
+  and an R9700 (RDNA4) by behaviour: edge matched Task Manager, the junction sensor followed every change in power
+  and activity within a second while the memory sensor moved over tens of seconds, and board power sat at each
+  card's rated draw under load. Other GPU generations or driver versions may map differently.
+- **ADL sensors 40 and 41 are not used.** They read 4 and 8 on both cards while Windows reported PCIe Gen 5 x16, so
+  they are not the link.
+- **Not available on Windows:** throttle status, the amdgpu kernel-fault follower, AMD SMI and per-process GPU time.
+  They are reported as unavailable, never as zero. A card ADL cannot match to a Windows adapter by name (two
+  identical cards) reports its VRAM as unavailable instead of guessing.
+- **Cost:** about 2 ms per tick on the reference machine, with no dropped ticks.
+
 ### Linux GPU sources (amdgpu)
 
 | Field | Source |
@@ -134,10 +163,14 @@ The PCI bus ID joins sysfs card paths, AMD SMI devices, `torch.cuda` device indi
 A lease is an exclusive claim on one or more lanes:
 
 ```text
+GET    /api/leases           active leases + lane holders (loaded inference shown as pseudo-leases)
 POST   /api/leases           {holder: "training:<run_id>", lanes: ["r9700"], ttl_s: 120}
 POST   /api/leases/{id}/renew
+POST   /api/leases/{id}/preempt
 DELETE /api/leases/{id}
 ```
+
+Full request/response shapes are in `API_CONTRACT.md`.
 
 - `DeploymentManager.deploy*` rejects a deploy onto a leased lane with HTTP 409 (or queues it, if requested).
 - Leases expire without renewal, so a crashed trainer does not lock a GPU forever. The tracker's heartbeat renews it.

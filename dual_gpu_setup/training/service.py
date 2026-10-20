@@ -260,8 +260,11 @@ class TrainingService:
             lane = self._lanes.get(str(payload.get("lane") or ""))
             if lane is None:
                 raise TrainingError("lane must be one of: " + ", ".join(sorted(self._lanes)))
+            # Same GPU identity finish_run records a measured profile under: the discovered PCI address
+            # of the lane's GPU, else the address pinned in the config, else the lane key.
+            discovered = next((g.pci_bus for g in self.hardware.gpus if g.lane == lane.key), None)
             return memory_forecast.forecast(
-                store, payload.get("config"), {"key": lane.key, "vram_gb": lane.vram_gb, "pci_bus": lane.pci_bus},
+                store, payload.get("config"), {"key": lane.key, "vram_gb": lane.vram_gb, "pci_bus": discovered or lane.pci_bus},
                 safety_fraction=self.config.policy.vram_safety_fraction, flash_attention=bool(payload.get("flash_attention", True)))
         if path == "/api/training/benchmarks":
             try:

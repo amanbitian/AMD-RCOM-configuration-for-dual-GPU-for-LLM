@@ -731,3 +731,53 @@ def test_a_split_model_is_released_through_either_of_its_lanes(tmp_path, monkeyp
     _with_host(monkeypatch, FakeControl({}))
     _release(manager.ensure_model("huge")[1])
     assert manager.unload(lane="9070xt", model="huge")["released"] is True and manager.handles == {}
+
+
+# --- the service's own server is not an orphan while it is being started or stopped ----------------------
+
+def test_no_orphans_are_reported_during_a_transition_and_the_scan_is_not_cached(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, {("a", "r9700")})
+    scans = []
+    manager.lane_orphans = lambda lanes=None: scans.append(1) or [{"lane": "r9700", "port": 8081, "pid": 5}]
+    manager.transition_lock.acquire()  # a load, swap or unload is running
+    try:
+        assert manager.orphans_cached() == [] and scans == []  # not even scanned
+    finally:
+        manager.transition_lock.release()
+    assert manager.orphans_cached() == [{"lane": "r9700", "port": 8081, "pid": 5}] and len(scans) == 1  # nothing stale was cached
+
+
+def test_a_server_draining_during_an_unload_is_never_reported_as_unmanaged(tmp_path, monkeypatch):
+    """Reproduces the real bug: the handle leaves `handles` first, the process keeps running while it drains."""
+    manager = _manager(tmp_path, {("a", "r9700")}, drain=30.0)
+    control = _with_host(monkeypatch, FakeControl({8081: 100}))
+    handle = manager.ensure_model("a")[1]
+    _release(handle)
+    _give_pid(handle, 100)
+    release, holder = _hold_request(handle)
+    thread, done = _run_unload(manager)
+    time.sleep(0.4)
+    assert thread.is_alive() and manager.handles == {}  # handle gone, server (pid 100) still listening and draining
+    assert [o["pid"] for o in manager.lane_orphans()] == [100]  # a raw scan would flag it ...
+    assert manager.orphans_cached() == []                       # ... but the status path does not
+    manager.unload(force=True)
+    thread.join(3)
+    release.set()
+    assert not thread.is_alive()
+
+
+def test_a_second_unload_while_one_is_waiting_explains_the_wait(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, {("a", "r9700")}, drain=30.0)
+    _with_host(monkeypatch, FakeControl({}))
+    handle = manager.ensure_model("a")[1]
+    _release(handle)
+    release, holder = _hold_request(handle)
+    thread, done = _run_unload(manager)
+    time.sleep(0.4)
+    manager.config.policy.drain_timeout_seconds = 30.0
+    with pytest.raises(app.AppError, match="already in progress.*waits up to 30 s.*Use Stop now") as raised:
+        manager.unload()
+    assert raised.value.status == HTTPStatus.CONFLICT
+    manager.unload(force=True)
+    thread.join(3)
+    release.set()

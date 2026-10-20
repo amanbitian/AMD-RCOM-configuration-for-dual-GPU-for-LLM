@@ -28,6 +28,7 @@ Token fields must have unambiguous meanings:
 | `uncached_input_tokens` | `input_tokens - cached_input_tokens`; `null` if cache usage is unknown. |
 | `prefill_tokens` | Tokens actually processed during prompt evaluation. Prefer the backend's prompt-evaluation count. This may differ from `input_tokens` when cache reuse is active. |
 | `thinking_tokens` | Completion tokens used for hidden or separately reported reasoning. `null` if the backend cannot separate them. |
+| `thinking_tokens_estimated` | When `thinking_tokens` is `null` but reasoning text was observed: `thinking_characters / 4`, labeled as an estimate (`thinking_tokens_source = estimated_from_characters`). Never mixed into exact-count totals; the dashboard summary reports it separately. |
 | `visible_output_tokens` | Tokens in the user-visible assistant answer, excluding separately reported thinking tokens. |
 | `output_tokens` | All generated completion tokens. When reasoning is separate, `thinking_tokens + visible_output_tokens`. |
 | `total_tokens` | `input_tokens + output_tokens`. |

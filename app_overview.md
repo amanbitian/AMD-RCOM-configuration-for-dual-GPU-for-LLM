@@ -84,6 +84,7 @@ jobs:
 | Dashboard pages | Page logic run against a fake DOM in Node; **not opened in a real browser after the latest changes** |
 | Residency guard re-warming a model | Tested with fakes. **Not yet seen to trigger live** |
 | Ubuntu/Linux support (`/proc`, sysfs, AMD SMI, DRM fdinfo, POSIX process control) | Tested with fakes; **not yet verified on the real two-GPU Linux machine** |
+| GPU hardware sensors on Windows (busy %, temperatures, power, clocks, fan, VRAM, PCIe link, via AMD ADL) | Verified on hardware (R9700 and 9070 XT). The sensor ids were identified by behaviour; see 5.6 and 11 |
 | Vulkan backend | Code path exists; not benchmarked or verified here |
 | Training tracker, leases, evaluation pipeline | Tested with fakes and real subprocess/HTTP runs; the LoRA-to-GGUF conversion, real `llama-server` changeover during evaluation, Linux GPU sensors and the DDP numerical check are **not verified** |
 
@@ -242,10 +243,10 @@ rescans.
 | Overview | Totals, prompt-processing vs generation speed per model, token split, 14-day activity, resource peaks, per-GPU performance, tool reliability, recent runs |
 | Chat | Deployment form, single or compare chat, live system and server telemetry |
 | Run history | Searchable runs; each opens to its prompt, output, token accounting, timings, placement and raw samples |
-| Analytics | Breakdown by `task_label` category and model; coding reasoning performance (native effort, thinking tokens, tool-call validity) |
+| Analytics | Breakdown by `task_label` category and model (runs, success, input/output tokens, speeds, latency, VRAM); coding reasoning performance (native effort, thinking tokens, tool-call validity) |
 | Projects | Project registry, usage by project, coding-agent activity |
 | Training | Training runs, comparison, DDP scaling, evaluation queue, benchmarks, memory forecast, measured profiles |
-| Hardware | Live per-GPU readings, lease holders, sampler health |
+| Hardware | Live per-GPU readings, lease holders, sampler health. Windows (AMD ADL): busy %, edge / junction / memory temperature, board power, clocks, fan, VRAM, shared memory and the PCIe link. Linux reads amdgpu sysfs. Throttle status, AMD SMI and the kernel-fault follower are Linux only and show as unavailable on Windows |
 | Service | Process info, restart, stop, loaded models, unload, settings (see 5.10) |
 | Setup wizard | Creates a project and the connection settings for Cline and OpenCode |
 
@@ -333,7 +334,7 @@ The **Service** page, and the matching endpoints, cover everything that used to 
 | **Stop service** | Stops every model and then the service. Start it again with `py launch_service.py`. |
 | **Unload** (per GPU, or everything) | Frees GPU memory. A model that is answering gets up to `drain_timeout_seconds` (30 s) to finish. |
 | **Stop now** | Appears while an unload is waiting. Ends the wait and stops the model at once, cutting the answer. |
-| **Orphans** | A llama-server on a lane port that this service does not manage (for example left by an instance that was killed) is listed in `/api/status` and in a banner, and **Stop them** removes it. It holds VRAM and RAM until stopped. A load stops it automatically. |
+| **Orphans** | A llama-server on a lane port that this service does not manage (for example left by an instance that was killed) is listed in `/api/status` and in a banner, and **Stop them** removes it. It holds VRAM and RAM until stopped. A load stops it automatically. Nothing is reported while a load, swap or unload is running (`transitioning` in `/api/status`), because the service's own server is then starting or draining and is not a leftover. |
 | **Settings** | Edits `load_mode`, `cache_ram_mib`, `vram_admission`, `vram_headroom_gb`, `auto_load_models`, `residency_guard`, `residency_check_seconds`, `drain_timeout_seconds` and `kill_busy_ports`. Values are validated, applied to the running service and saved into the TOML with its comments kept (a `.bak` copy of the original is made once). Each setting says whether it applies **now** or on the **next model load**. |
 
 The restart, stop and settings endpoints require `Content-Type: application/json`.
@@ -643,7 +644,12 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
    empty), so the app uses the operating system's accounting instead. Anything else that reads the HIP figure
    will be misled.
 6. **Vulkan** is configured as a backend but has not been benchmarked or verified here.
-7. **No parameter places the KV cache in RAM or sets its precision.** A deploy request accepts
+7. **Windows GPU sensor ids are inferred, not documented.** Temperatures, power, clocks and fan come from AMD's
+   ADL library, whose sensor numbering was identified on the R9700 and 9070 XT by behaviour (edge matched Task
+   Manager; junction reacted in about a second; memory reacted over tens of seconds; board power sat at each
+   card's rated draw). A different GPU generation or driver may map differently. Two identical cards cannot be
+   told apart by name, so their VRAM would show as unavailable.
+8. **No parameter places the KV cache in RAM or sets its precision.** A deploy request accepts
    `context_window`, `input_tokens`, `max_output_tokens`, the reasoning fields and `tensor_split`, but nothing
    about the cache. An operator can add the flags in section 9 to a model's `extra_args`, but the capacity check
    still counts the cache at 16-bit size in VRAM, so a context that only fits with the cache in RAM or

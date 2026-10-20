@@ -77,8 +77,11 @@ Current deployment state and the latest resource sample. No input.
   "profile": { /* the deploy request that produced the current state, or null */ },
   "deployment_id": "uuid | null",
   // llama-server processes on a lane port that this service does not manage (e.g. left behind by an
-  // instance that was killed). They still hold VRAM and RAM. Scanned at most every 10 s.
+  // instance that was killed). They still hold VRAM and RAM. Scanned at most every 10 s, and always
+  // empty while "transitioning" is true (a server that is starting or draining is the service's own).
   "orphans": [{"lane": "<lane_key>", "port": "int", "pid": "int"}],
+  // true while a load, swap or unload is running (an unload waits up to drain_timeout_seconds for requests)
+  "transitioning": "bool",
   "servers": [
     {
       "target": "primary | <lane_key>",
@@ -161,9 +164,13 @@ day in range rather than the default last 14. The applied range echoes back as `
     "total_runs": "int", "completed_runs": "int", "failed_runs": "int",
     "success_rate": "float | null (percent)",
     "models_used": "int",
-    "input_tokens": "int", "output_tokens": "int", "thinking_tokens": "int",
+    "input_tokens": "int", "output_tokens": "int", "thinking_tokens": "int (exact backend counts only)",
+    "thinking_tokens_reported_runs": "int", "thinking_tokens_estimated": "int (~4 chars/token)",
+    "thinking_tokens_estimated_runs": "int",
     "visible_output_tokens": "int", "total_tokens": "int",
-    "avg_tokens_per_second": "float | null", "aggregate_tokens_per_second": "float | null",
+    "avg_tokens_per_second": "float | null (per-request mean)", "aggregate_tokens_per_second": "float | null",
+    "wall_clock_tokens_per_second": "float | null (output tokens / decode wall-clock, overlapping requests counted once)",
+    "avg_concurrent_requests": "float | null (requests already in flight on the server when a run started)",
     "avg_prefill_tokens_per_second": "float | null",
     "avg_latency_ms": "float | null", "p95_latency_ms": "float | null",
     "avg_ttft_ms": "float | null",
@@ -176,6 +183,7 @@ day in range rather than the default last 14. The applied range echoes back as `
       "model": "string", "runs": "int", "success_rate": "float",
       "input_tokens": "int", "output_tokens": "int", "thinking_tokens": "int",
       "avg_tokens_per_second": "float | null", "avg_prefill_tokens_per_second": "float | null",
+      "wall_clock_tokens_per_second": "float | null", "avg_concurrent_requests": "float | null",
       "avg_latency_ms": "float | null", "avg_gpu_utilization_pct": "float | null",
       "peak_vram_bytes": "int"
     }
@@ -183,12 +191,15 @@ day in range rather than the default last 14. The applied range echoes back as `
   "gpus": [ /* same summary fields, plus gpu: lane key */ ],
   "projects": [ /* same summary fields, plus project_id and project name */ ],
   "agents": [ /* same summary fields, plus agent_role */ ],
+  "backends": [ /* same summary fields, plus backend: "llama.cpp | LM Studio" (read-time label, see GET /api/runs) */ ],
+  "operating_systems": [ /* same summary fields, plus os: "Windows | Linux" (read-time label, see GET /api/runs) */ ],
   "tool_summary": { "events": "int", "failed": "int", "success_rate": "float | null" },
   "categories": [
     {
       "category": "string (a task_label value some /api/chat call used, e.g. 'resume_extraction')",
       "runs": "int", "success_rate": "float", "input_tokens": "int", "output_tokens": "int", "thinking_tokens": "int",
       "avg_tokens_per_second": "float | null", "avg_prefill_tokens_per_second": "float | null",
+      "wall_clock_tokens_per_second": "float | null", "avg_concurrent_requests": "float | null",
       "avg_latency_ms": "float | null", "avg_gpu_utilization_pct": "float | null",
       "peak_vram_bytes": "int"
     }
@@ -200,6 +211,7 @@ day in range rather than the default last 14. The applied range echoes back as `
       "category": "string", "model": "string",
       "runs": "int", "success_rate": "float", "input_tokens": "int", "output_tokens": "int", "thinking_tokens": "int",
       "avg_tokens_per_second": "float | null", "avg_prefill_tokens_per_second": "float | null",
+      "wall_clock_tokens_per_second": "float | null", "avg_concurrent_requests": "float | null",
       "avg_latency_ms": "float | null", "avg_gpu_utilization_pct": "float | null",
       "peak_vram_bytes": "int"
     }
@@ -207,7 +219,9 @@ day in range rather than the default last 14. The applied range echoes back as `
     // Analytics tab filters by category and/or model
   ],
   "daily": [ { "date": "YYYY-MM-DD", "runs": "int", "tokens": "int" } /* last 14 days */ ],
-  "recent_runs": [ /* 20 most recent, see GET /api/runs for row shape */ ]
+  "recent_runs": [ /* 20 most recent, GET /api/runs row shape but slimmed: no request, output_text,
+                      reasoning_text or backend_response; configuration holds only
+                      {reasoning, runtime: {source, build}} */ ]
 }
 ```
 
@@ -240,6 +254,8 @@ day in range rather than the default last 14. The applied range echoes back as `
   "project_id": "uuid | null", "agent_session_id": "uuid | null",
   "coding_task_id": "uuid | null", "agent_role": "string | null",
   "workload_kind": "evaluation | coding_agent",
+  "backend": "llama.cpp | LM Studio (derived at read time from configuration.runtime.source; older runs without it fall back by created_at)",
+  "os": "Windows | Linux (derived at read time from host_os.system; runs without host_os report Windows)",
   "host_os": {
     "system": "Windows | Linux", "release": "...", "version": "...", "machine": "...",
     "distribution": "Ubuntu 24.04 LTS (Linux only, when available)",
@@ -394,7 +410,8 @@ the call returns at once; otherwise the models are stopped immediately, cutting 
 
 **Shares:** same shape as `GET /api/status`, plus `"released": bool` for a lane-scoped unload.
 **Errors:** `400` unknown lane, or `model` without `lane`; `409` if another deployment change is
-already in progress.
+already in progress (for a second graceful unload the message says it is waiting for running requests
+and to use `{"force": true}`).
 
 ## Releasing the GPUs when a task is done
 
@@ -501,6 +518,47 @@ keeps its old behaviour until it is reloaded.
 **Shares:** the `GET` payload plus `"changed": [keys]` and `"next_load": [changed keys that wait for the next load]`.
 **Errors:** `400` unknown key or invalid value; `415` not JSON; `500` the file could not be written (nothing
 changed).
+
+## GET `/api/hardware`
+
+Live GPU readings, independent of any inference or training process, plus who holds each lane.
+
+**Shares:**
+```jsonc
+{
+  "hardware": {
+    "available": "bool",                       // false when no GPU source exists on this host
+    "unavailable_reason": "string | null",
+    "interval_s": "float (sampling period, 1.0)",
+    "gpus": [{
+      "pci_bus": "0000:03:00.0", "card": "string", "name": "string", "lane": "lane key | null",
+      "vram_total_bytes": "int | null",
+      "latest": {                              // null until the first sample
+        "ts": "float", "gpu_busy_pct": "float | null", "vram_used_bytes": "int | null",
+        "gtt_used_bytes": "int | null (system memory used by the GPU)",
+        "temp_edge_c": "float | null", "temp_junction_c": "float | null", "temp_memory_c": "float | null",
+        "power_w": "float | null", "sclk_mhz": "float | null", "mclk_mhz": "float | null", "fan_rpm": "int | null",
+        "pcie_speed": "e.g. '32.0 GT/s PCIe' | null", "pcie_width": "int | null",
+        "pcie_max_speed": "string | null", "pcie_max_width": "int | null",
+        "unavailable": {"<field>": "why it is null"}   // a missing sensor is null with a reason, never 0
+      },
+      "history": [{"ts": "...", "gpu_busy_pct": "...", "vram_used_bytes": "...", "temp_*_c": "...", "power_w": "..."}]
+    }],
+    "system": {"ts": "float", "cpu_pct": "float | null", "ram_used_pct": "float | null", "swap_used_bytes": "int | null"},
+    "amd_smi": {"available": "bool", "reason": "string | null"} | null,
+    "sampler": {"ticks": "int", "dropped_ticks": "int", "last_sample_ms": "float", "avg_sample_ms": "float",
+                "max_sample_ms": "float", "callback_errors": "int", "read_errors": "int", "last_error": "string | null"}
+  },
+  "lane_holders": {"<lane key>": {"holder": "string", "kind": "training | inference", "...": "lease details"}},
+  "kernel_faults": {"active": "bool", "reason": "string | null"}   // amdgpu reset / page-fault follower (Linux only)
+}
+```
+
+**Sources.** Linux reads amdgpu sysfs. Windows reads AMD's ADL library plus Windows performance counters and
+device properties (VRAM and PCIe link refresh every 5 s and 60 s); see
+[docs/TRAINING_TELEMETRY.md](docs/TRAINING_TELEMETRY.md#windows-gpu-sources-adl-and-windows-counters). Samples are
+written to the database only while a training run is active. `unavailable_reason` is set and `gpus` is empty when
+the host has neither source (for example Windows without the AMD driver).
 
 ## POST `/api/chat`
 
@@ -777,6 +835,38 @@ falls back to the server identity when tracker-side capture is disabled.
 - `GET /api/training/alerts`, `/compare`, `/scaling`, `/eval-queue`, `/benchmarks`, `/profiles`, and
   `/notes` expose cross-run views. Matching POST endpoints submit evaluations, forecasts, benchmarks
   and notes; benchmark cancellation and checkpoint designate/promote/demote routes are also supported.
+
+### GPU leases: `/api/leases`
+
+A lease is an exclusive, expiring claim on one or more lanes, used mainly by training so an
+inference deploy can't land on a GPU that's training. Deploys onto a leased lane return `409`.
+
+- `GET /api/leases` → `{"leases": [<lease>], "lane_holders": {"<lane>": {"holder", "kind", "lease_id", "expires_at"}}}`.
+  Loaded inference servers also appear as derived pseudo-leases (`id: "inference:<target>"`,
+  `kind: "inference"`, `model`, `expires_at: null`); they can't be renewed or released here.
+- `POST /api/leases` with `{"holder": "training:<run_id>", "lanes": ["r9700"], "kind": "training", "ttl_s": 120, "pid": 1234}`.
+  `holder` and `lanes` are required; `ttl_s` defaults to 120 (max 7 days). Unknown lanes → `400`;
+  a lane with inference loaded or already leased → `409`. Re-acquiring with the same holder and
+  lanes refreshes the existing lease. The response is the lease **including `token`**, which is
+  needed to renew or release it.
+- `POST /api/leases/{id}/renew` with `{"token", "ttl_s"?}` extends it (an expired lease is
+  revived only if its lanes are still free).
+- `DELETE /api/leases/{id}?token=...` releases it.
+- `POST /api/leases/{id}/preempt` stops the holder's process (only if the PID still matches the
+  start token recorded at acquire) and releases the lease → `{"process": "terminated | pid_mismatch_or_gone | no_process", "lease": <lease>}`.
+
+The token can be passed as body `token`, query `?token=`, or an `X-Lease-Token` header; a wrong
+token → `403`. Lease shape:
+
+```jsonc
+{
+  "id": "hex", "holder": "string", "kind": "training | ...", "state": "active | expired | released",
+  "lanes": ["lane-key"], "ttl_s": "float", "remaining_s": "float (0 unless active)",
+  "acquired_at": "unix seconds", "renewed_at": "unix seconds", "expires_at": "unix seconds",
+  "released_at": "unix seconds | null", "pid": "int | null", "exe": "string | null",
+  "token": "string (acquire response only)"
+}
+```
 
 ## Project and agent telemetry endpoints
 

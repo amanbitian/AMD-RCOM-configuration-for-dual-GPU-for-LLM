@@ -461,3 +461,14 @@ def test_unload_model_needs_a_lane_and_reports_released(live_app):
     assert status == 200 and body["released"] is False and body["state"] == "idle"
     status, body = live.post("/api/unload", {"lane": "r9700"})
     assert status == 200 and body["released"] is False
+
+
+def test_status_reports_whether_a_model_change_is_running(live_app):
+    live = live_app()
+    assert live.get("/api/status")[1]["transitioning"] is False
+    live.state.manager.transition_lock.acquire()
+    try:
+        status, body = live.get("/api/status")
+        assert status == 200 and body["transitioning"] is True and body["orphans"] == []
+    finally:
+        live.state.manager.transition_lock.release()

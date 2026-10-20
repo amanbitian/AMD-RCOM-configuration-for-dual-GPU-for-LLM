@@ -43,6 +43,7 @@ from dual_gpu_setup.training.evaluation import (
     AdapterServerManager, EvalQueue, EvalWorker, EvaluationPipeline,
 )
 from dual_gpu_setup.training.hardware import HardwareSampler, KernelFaultWatcher
+from dual_gpu_setup.training.windows_gpu import WindowsGpuReader
 from dual_gpu_setup.training.selection import select_best
 from dual_gpu_setup.training.service import FileResponse, TrainingService
 from dual_gpu_setup.training.store import TrainingError, TrainingStore
@@ -109,6 +110,76 @@ CLIENT_METRICS_SCHEMA = {
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+# This project replaced LM Studio's bundled runtime with a native llama.cpp build in commit
+# 10650e3 ("replaced Lm studio with LLama.cpp"), committed 2026-10-17 11:36:35 +05:30 =
+# 2026-10-17T06:06:35Z. Runs recorded since then carry an explicitly probed
+# configuration.runtime.source ("llama.cpp" or "lmstudio"); older runs carry none, so they are
+# attributed to LM Studio by their created_at timestamp. Likewise the reference machine ran
+# Windows before host_os capture existed, so runs with no host_os default to Windows. Both are
+# read-time labels only -- no stored run is rewritten.
+LLAMACPP_MIGRATION_CUTOFF = datetime(2026, 10, 17, 6, 6, 35, tzinfo=UTC)
+
+
+def _parse_created_at(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def infer_backend(run: dict[str, Any]) -> str:
+    """Display label for the inference runtime a run used: 'llama.cpp' or 'LM Studio'.
+
+    Prefers the runtime source probed at deploy time (present on every run since the migration).
+    Runs predating that capture fall back to their created_at against the migration cutoff, which
+    resolves every historical run to LM Studio."""
+    source = ((run.get("configuration") or {}).get("runtime") or {}).get("source")
+    if source == "llama.cpp":
+        return "llama.cpp"
+    if source == "lmstudio":
+        return "LM Studio"
+    created = _parse_created_at(run.get("created_at"))
+    return "llama.cpp" if created and created >= LLAMACPP_MIGRATION_CUTOFF else "LM Studio"
+
+
+def wall_clock_decode(runs: list[dict[str, Any]]) -> tuple[int, float]:
+    """Output tokens and the wall-clock seconds spent decoding them, with overlapping decode
+    windows counted once. Concurrent requests share one server, so summing their durations
+    would count the same seconds several times and understate the lane's real throughput."""
+    windows: list[tuple[float, float]] = []
+    tokens = 0
+    for run in runs:
+        timing = run.get("timing") or {}
+        output_tokens = (run.get("usage") or {}).get("output_tokens")
+        decode_ms = timing.get("decode_duration_ms")
+        finished = _parse_created_at(run.get("finished_at"))
+        if run.get("status") != "completed" or not decode_ms or output_tokens is None or finished is None:
+            continue
+        end = finished.timestamp()
+        windows.append((end - decode_ms / 1000, end))
+        tokens += int(output_tokens)
+    seconds = 0.0
+    current_start = current_end = None
+    for start, end in sorted(windows):
+        if current_end is None or start > current_end:
+            if current_end is not None:
+                seconds += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    if current_end is not None:
+        seconds += current_end - current_start
+    return tokens, seconds
+
+
+def infer_os(run: dict[str, Any]) -> str:
+    """Host OS family a run executed on. Back-dated runs with no captured host_os default to
+    Windows, the reference machine's OS before host_os capture existed."""
+    system = (run.get("host_os") or {}).get("system")
+    return str(system) if system else "Windows"
 
 
 def safe_name(value: str) -> str:
@@ -779,8 +850,14 @@ class RunStore:
             rows = connection.execute(f"""
                 SELECT id, created_at, status, mode, target, model_name, lane_keys_json,
                     context_window, reasoning_budget, project_id, agent_role, task_label,
-                    workload_kind, usage_json, timing_json, resources_json, host_os_json,
-                    json_object('reasoning', json_extract(configuration_json, '$.reasoning')) AS configuration_json
+                    workload_kind, usage_json, timing_json, resources_json, host_os_json, finished_at,
+                    json_object(
+                        'reasoning', json_extract(configuration_json, '$.reasoning'),
+                        'runtime', json_object(
+                            'source', json_extract(configuration_json, '$.runtime.source'),
+                            'build', json_extract(configuration_json, '$.runtime.build')
+                        )
+                    ) AS configuration_json
                 FROM runs{where} ORDER BY created_at DESC
             """, params).fetchall()
         return [self._decode(row) for row in rows]
@@ -844,6 +921,7 @@ class RunStore:
                      and (run.get("usage") or {}).get("output_tokens") is not None]
             output_tokens = total(("usage", "output_tokens"), timed)
             decode_ms = sum(nums(("timing", "decode_duration_ms"), timed))
+            wall_tokens, wall_seconds = wall_clock_decode(group)
             return {
                 "runs": len(group),
                 "success_rate": round(len(group_completed) / len(group) * 100, 1) if group else None,
@@ -864,6 +942,13 @@ class RunStore:
                 "aggregate_tokens_per_second": (
                     round(output_tokens / (decode_ms / 1000), 2) if decode_ms > 0 else None
                 ),
+                # Output tokens over wall-clock decode time with overlaps counted once. This is the
+                # throughput the device delivered; the per-request figures above are each request's
+                # own rate and fall as more requests share the server.
+                "wall_clock_tokens_per_second": (
+                    round(wall_tokens / wall_seconds, 2) if wall_seconds > 0 else None
+                ),
+                "avg_concurrent_requests": average(("timing", "concurrent_requests_at_start"), group_completed),
                 "avg_prefill_tokens_per_second": average(
                     ("timing", "prefill_tokens_per_second"), group_completed
                 ),
@@ -923,6 +1008,16 @@ class RunStore:
         for role in sorted({run.get("agent_role") for run in runs if run.get("agent_role")}):
             group = [run for run in runs if run.get("agent_role") == role]
             agent_rows.append({"agent_role": role, **summarize(group)})
+
+        backend_rows: list[dict[str, Any]] = []
+        for backend in sorted({run["backend"] for run in runs}):
+            group = [run for run in runs if run["backend"] == backend]
+            backend_rows.append({"backend": backend, **summarize(group)})
+
+        os_rows: list[dict[str, Any]] = []
+        for os_name in sorted({run["os"] for run in runs}):
+            group = [run for run in runs if run["os"] == os_name]
+            os_rows.append({"os": os_name, **summarize(group)})
 
         tool_summary = {"events": 0, "failed": 0, "success_rate": None}
         reasoning_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -984,10 +1079,17 @@ class RunStore:
                 "input_tokens": total(("usage", "input_tokens")),
                 "output_tokens": total(("usage", "output_tokens")),
                 "thinking_tokens": total(("usage", "thinking_tokens")),
+                # Exact sum above is 0 both when nothing reasoned and when the backend never
+                # reports a count (llama.cpp), so expose coverage and the labeled estimate.
+                "thinking_tokens_reported_runs": len(nums(("usage", "thinking_tokens"))),
+                "thinking_tokens_estimated": total(("usage", "thinking_tokens_estimated")),
+                "thinking_tokens_estimated_runs": len(nums(("usage", "thinking_tokens_estimated"))),
                 "visible_output_tokens": total(("usage", "visible_output_tokens")),
                 "total_tokens": total(("usage", "total_tokens")),
                 "avg_tokens_per_second": average(("timing", "tokens_per_second"), completed),
                 "aggregate_tokens_per_second": summarize(runs)["aggregate_tokens_per_second"],
+                "wall_clock_tokens_per_second": summarize(runs)["wall_clock_tokens_per_second"],
+                "avg_concurrent_requests": summarize(runs)["avg_concurrent_requests"],
                 "avg_prefill_tokens_per_second": average(
                     ("timing", "prefill_tokens_per_second"), completed
                 ),
@@ -1015,6 +1117,8 @@ class RunStore:
             "gpus": gpu_lanes,
             "projects": project_rows,
             "agents": agent_rows,
+            "backends": backend_rows,
+            "operating_systems": os_rows,
             "reasoning_levels": reasoning_levels,
             "tool_summary": tool_summary,
             "categories": categories,
@@ -1043,6 +1147,11 @@ class RunStore:
                 item[output_key] = json.loads(raw) if raw else None
             except json.JSONDecodeError:
                 item[output_key] = None
+        # Read-time labels derived from the runtime source and host OS already on the row, with
+        # back-dated defaults (LM Studio / Windows) for runs predating that capture. See
+        # infer_backend/infer_os. Nothing persisted is rewritten.
+        item["backend"] = infer_backend(item)
+        item["os"] = infer_os(item)
         return item
 
 
@@ -1416,14 +1525,18 @@ class ServerHandle:
     def serving(self, claimed: bool = False):
         """Count an in-flight request so a deployment change can drain before stopping this
         server, instead of killing another client's request mid-generation. `claimed`: the
-        request claimed this handle when it was routed, so convert that claim."""
+        request claimed this handle when it was routed, so convert that claim.
+
+        Yields how many requests (this one included) were in flight on this server when it
+        entered, so runs can record the concurrency they were served under."""
         with self._inflight_lock:
             if claimed and self._claims:
                 self._claims.pop(0)
             self._inflight += 1
+            concurrent_at_start = self._inflight
             self.last_used = time.monotonic()
         try:
-            yield
+            yield concurrent_at_start
         finally:
             with self._inflight_lock:
                 self._inflight = max(0, self._inflight - 1)
@@ -1822,7 +1935,9 @@ class DeploymentManager:
             if force and abort is not None:
                 abort.set()
                 return self.status()
-            raise AppError("Another deployment change is already in progress.", HTTPStatus.CONFLICT)
+            raise AppError("An unload or model change is already in progress; it waits up to "
+                           f"{self.config.policy.drain_timeout_seconds:.0f} s for running requests. "
+                           "Use Stop now to end the wait.", HTTPStatus.CONFLICT)
         if abort is not None:
             abort.set() if force else abort.clear()
         try:
@@ -1894,7 +2009,13 @@ class DeploymentManager:
         return found
 
     def orphans_cached(self, ttl: float = 10.0) -> list[dict[str, Any]]:
-        """lane_orphans for the status poll: a port scan every 2 s would cost a netstat per lane."""
+        """lane_orphans for the status poll: a port scan every 2 s would cost a netstat per lane.
+
+        Nothing is reported while a load, swap or unload is in progress: its handle has already left
+        `handles` while the server is still draining requests or still starting, so a scan then would
+        flag the service's own server as a leftover. Such a scan is not cached either."""
+        if self.transition_lock.locked():
+            return []
         cached = self._orphan_cache
         if cached is not None and time.monotonic() - cached[0] < ttl:
             return cached[1]
@@ -2926,7 +3047,7 @@ class ChatService:
         baseline = self.manager.sampler.latest() if workload_kind == "coding_agent" else self.manager.sampler.capture()
         started = time.monotonic()
         try:
-            with handle.serving():  # drained before a deployment change stops this server
+            with handle.serving() as concurrent_at_start:  # drained before a deployment change stops this server
                 backend = self._post_json(
                     f"{handle.process.base_url}/v1/chat/completions",
                     handle.pin_serving_slot(dict(request_payload)),
@@ -2940,6 +3061,7 @@ class ChatService:
             usage = self._normalize_usage(backend)
             usage.update(self._tool_call_stats(message.get("tool_calls")))
             timing = self._normalize_timing(backend, usage, elapsed)
+            timing["concurrent_requests_at_start"] = concurrent_at_start
             if workload_kind != "coding_agent":
                 self.manager.sampler.capture()
             samples = self._sample_window(started, baseline)
@@ -3244,9 +3366,10 @@ class ApplicationState:
         self.training = TrainingStore(training_db)
         self.leases = LeaseStore(training_db)
         self.manager.lease_guard = self._lease_guard
+        windows_reader, _why = WindowsGpuReader.try_create() if sys.platform == "win32" else (None, None)
         self.hardware = HardwareSampler(
             self.config.lanes, on_samples=self._persist_hardware_samples, on_system=self._persist_system_sample,
-            smi=AmdSmiReader() if sys.platform.startswith("linux") else None,
+            smi=AmdSmiReader() if sys.platform.startswith("linux") else None, windows_reader=windows_reader,
         )
         self.kernel_faults = KernelFaultWatcher(self._record_kernel_fault)
         self.eval_queue = EvalQueue(training_db, capacity=self.config.evaluation.queue_capacity)
@@ -3577,7 +3700,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             manager = self.server.app_state.manager
-            self._send_json(HTTPStatus.OK, {**manager.status(), "orphans": manager.orphans_cached()})
+            self._send_json(HTTPStatus.OK, {**manager.status(), "orphans": manager.orphans_cached(),
+                                            "transitioning": manager.transition_lock.locked()})
             return
         if path == "/api/service":
             try:
@@ -4172,6 +4296,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         reasoning_characters = 0
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         response_started = False
+        concurrent_at_start: int | None = None
         try:
             request = urlrequest.Request(
                 f"{handle.process.base_url}/v1/chat/completions",
@@ -4180,7 +4305,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 method="POST",
             )
             # serving() marks the lane busy so a deployment change drains before stopping it.
-            with handle.serving(claimed=True), urlrequest.urlopen(request, timeout=900) as response:
+            with handle.serving(claimed=True) as concurrent_at_start, urlrequest.urlopen(request, timeout=900) as response:
                 if not stream:
                     backend_payload = json.loads(response.read().decode("utf-8", errors="replace"))
                 else:
@@ -4280,6 +4405,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             timing["time_to_first_visible_token_ms"] = (
                 round((first_visible_at - started) * 1000, 2) if first_visible_at is not None else None
             )
+            timing["concurrent_requests_at_start"] = concurrent_at_start
             samples = state.chat._sample_window(started, baseline)
             resources = ChatService._resource_summary(samples, target)
             stored_backend = backend_payload if capture_content else {

@@ -99,6 +99,77 @@ def test_dashboard_categories_group_by_task_label(tmp_path: Path):
     assert models["modelA"]["runs"] == 3
 
 
+def test_infer_backend_prefers_probed_source_then_falls_back_to_date():
+    assert app.infer_backend({"configuration": {"runtime": {"source": "llama.cpp"}}}) == "llama.cpp"
+    assert app.infer_backend({"configuration": {"runtime": {"source": "lmstudio"}}}) == "LM Studio"
+    # No probed source: created_at decides against the migration cutoff (2026-10-17T06:06:35Z).
+    assert app.infer_backend({"created_at": "2026-09-01T10:00:00.000+00:00"}) == "LM Studio"
+    assert app.infer_backend({"created_at": "2026-10-18T10:00:00.000+00:00"}) == "llama.cpp"
+    # A malformed/absent timestamp is treated as an old (LM Studio) run, never misread as llama.cpp.
+    assert app.infer_backend({}) == "LM Studio"
+    assert app.infer_backend({"created_at": "not-a-date"}) == "LM Studio"
+
+
+def test_infer_os_defaults_to_windows_for_backdated_runs():
+    assert app.infer_os({"host_os": {"system": "Linux", "release": "6.8.0"}}) == "Linux"
+    assert app.infer_os({"host_os": {"system": "Windows"}}) == "Windows"
+    assert app.infer_os({}) == "Windows"  # back-dated run with no captured host_os
+    assert app.infer_os({"host_os": {}}) == "Windows"
+
+
+def test_runs_carry_backend_and_os_labels(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    store.begin_run({
+        "id": "native", "comparison_id": None, "deployment_id": None,
+        "created_at": app.utc_now(), "mode": "single_gpu", "target": "primary",
+        "model_name": "modelA", "model_path": "x.gguf", "lane_keys": ["primary"],
+        "device": "rocm:0", "context_window": 8192, "reasoning_budget": 0,
+        "request": {}, "configuration": {"runtime": {"source": "llama.cpp", "build": 11699}},
+        "host_os": {"system": "Windows", "release": "11"},
+        "client_id": None, "task_label": None, "project_id": None,
+        "workload_kind": "evaluation", "agent_role": None,
+    })
+    store.finish_run("native", {"status": "completed", "usage": {}, "timing": {}, "resources": {}})
+
+    detail = store.get("native")
+    assert detail["backend"] == "llama.cpp" and detail["os"] == "Windows"
+    assert store.recent(10)[0]["backend"] == "llama.cpp"
+    # The lean dashboard query also surfaces the probed source without loading full config.
+    assert store._dashboard_runs()[0]["backend"] == "llama.cpp"
+
+
+def test_dashboard_groups_by_backend_and_os(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    # Two llama.cpp runs and one legacy run with no runtime source (-> LM Studio by date).
+    for run_id in ("a", "b"):
+        store.begin_run({
+            "id": run_id, "comparison_id": None, "deployment_id": None,
+            "created_at": app.utc_now(), "mode": "single_gpu", "target": "primary",
+            "model_name": "modelA", "model_path": "x.gguf", "lane_keys": ["primary"],
+            "device": "rocm:0", "context_window": 8192, "reasoning_budget": 0,
+            "request": {}, "configuration": {"runtime": {"source": "llama.cpp"}},
+            "host_os": {"system": "Windows"}, "client_id": None, "task_label": None,
+            "project_id": None, "workload_kind": "evaluation", "agent_role": None,
+        })
+        store.finish_run(run_id, {"status": "completed", "usage": {}, "timing": {}, "resources": {}})
+    store.begin_run({
+        "id": "legacy", "comparison_id": None, "deployment_id": None,
+        "created_at": "2026-09-01T10:00:00.000+00:00", "mode": "single_gpu", "target": "primary",
+        "model_name": "modelA", "model_path": "x.gguf", "lane_keys": ["primary"],
+        "device": "rocm:0", "context_window": 8192, "reasoning_budget": 0,
+        "request": {}, "configuration": {}, "host_os": {"system": "Windows"},
+        "client_id": None, "task_label": None, "project_id": None,
+        "workload_kind": "evaluation", "agent_role": None,
+    })
+    store.finish_run("legacy", {"status": "completed", "usage": {}, "timing": {}, "resources": {}})
+
+    dashboard = store.dashboard()
+    backends = {row["backend"]: row["runs"] for row in dashboard["backends"]}
+    assert backends == {"llama.cpp": 2, "LM Studio": 1}
+    operating_systems = {row["os"]: row["runs"] for row in dashboard["operating_systems"]}
+    assert operating_systems == {"Windows": 3}
+
+
 def test_dashboard_categories_empty_when_no_task_labels(tmp_path: Path):
     store = app.RunStore(tmp_path / "t.sqlite3")
     make_run(store, "r1", "modelA", None, 60.0, 2000)
@@ -192,6 +263,19 @@ def test_decode_aggregate_excludes_runs_with_missing_decode_time(tmp_path):
     level = dashboard["reasoning_levels"][0]
     assert level["thinking_tokens_reported_runs"] == 1
     assert level["avg_thinking_tokens"] == 30
+
+
+def test_summary_separates_estimated_thinking_from_unreported(tmp_path):
+    store = app.RunStore(tmp_path / "runs.db")
+    for run_id in ("plain", "reasoned"):
+        make_run(store, run_id, "qwen", "code", 25, 1000)
+    store.finish_run("reasoned", {"status": "completed", "usage": {
+        "output_tokens": 80, "thinking_tokens": None, "thinking_tokens_estimated": 30}})
+    summary = store.dashboard()["summary"]
+    assert summary["thinking_tokens"] == 0
+    assert summary["thinking_tokens_reported_runs"] == 0
+    assert summary["thinking_tokens_estimated"] == 30
+    assert summary["thinking_tokens_estimated_runs"] == 1
 
 
 def test_project_filtered_dashboard_and_gpu_breakdown(tmp_path: Path):
@@ -317,3 +401,44 @@ def test_chat_history_archives_content_and_scalar_tokens(tmp_path: Path):
     assert history.query(start_date="2026-10-09", end_date="2026-10-09")  # end date inclusive
     assert history.query(end_date="2026-10-08") == []
     history.close()
+
+
+def test_serving_reports_concurrency_including_the_new_request():
+    handle = app.ServerHandle("primary", None, [], None)
+    with handle.serving() as alone:
+        assert alone == 1
+        with handle.serving() as second:
+            assert second == 2  # the first request is still in flight
+    with handle.serving() as again:
+        assert again == 1  # counts reset once requests finish
+
+
+def test_wall_clock_throughput_counts_overlapping_decode_once(tmp_path: Path):
+    store = app.RunStore(tmp_path / "t.sqlite3")
+    base = app.datetime(2026, 10, 18, 12, 0, 0, tzinfo=app.UTC)
+    # Two requests share one server: A decodes 0-10 s, B decodes 5-15 s, 100 tokens each.
+    for run_id, start, end in [("a", 0, 10), ("b", 5, 15)]:
+        store.begin_run({
+            "id": run_id, "comparison_id": None, "deployment_id": None,
+            "created_at": base.isoformat(timespec="milliseconds"), "mode": "single_gpu", "target": "9070xt",
+            "model_name": "modelA", "model_path": "x.gguf", "lane_keys": ["9070xt"], "device": "rocm:0",
+            "context_window": 8192, "reasoning_budget": 0, "request": {}, "configuration": {},
+            "client_id": None, "task_label": None, "project_id": None, "workload_kind": "evaluation",
+            "agent_role": None,
+        })
+        store.finish_run(run_id, {
+            "status": "completed", "usage": {"output_tokens": 100, "total_tokens": 100},
+            "timing": {"decode_duration_ms": (end - start) * 1000, "tokens_per_second": 10.0,
+                       "concurrent_requests_at_start": 2},
+            "resources": {},
+        })
+        with store.connect() as connection:
+            connection.execute("UPDATE runs SET finished_at = ? WHERE id = ?",
+                               ((base + app.timedelta(seconds=end)).isoformat(timespec="milliseconds"), run_id))
+
+    dashboard = store.dashboard()
+    summary = dashboard["summary"]
+    assert summary["wall_clock_tokens_per_second"] == round(200 / 15, 2)  # 15 s of union, not 20 s summed
+    assert summary["aggregate_tokens_per_second"] == 10.0  # the old sum-based figure undercounts
+    assert summary["avg_concurrent_requests"] == 2
+    assert dashboard["gpus"][0]["wall_clock_tokens_per_second"] == round(200 / 15, 2)

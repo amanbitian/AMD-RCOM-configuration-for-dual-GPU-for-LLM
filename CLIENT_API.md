@@ -330,7 +330,8 @@ fields when available), so results from Windows and Ubuntu hosts remain distingu
 | usage | `cached_input_tokens` | Prompt tokens served from KV cache reuse |
 | usage | `uncached_input_tokens` | `input_tokens - cached_input_tokens` |
 | usage | `prefill_tokens` | Tokens processed during prefill |
-| usage | `thinking_tokens` | Reasoning tokens, if any |
+| usage | `thinking_tokens` | Exact reasoning tokens from the backend; `null` when it reports none (llama.cpp never does) |
+| usage | `thinking_tokens_estimated` | ~4 chars/token estimate, set only when reasoning text was seen but no exact count came back |
 | usage | `visible_output_tokens` | `output_tokens - thinking_tokens` |
 | usage | `output_tokens` | Total completion tokens |
 | usage | `total_tokens` | `input_tokens + output_tokens` |
@@ -364,7 +365,7 @@ writing a local copy.
 
 Once some runs carry a `task_label`, open the dashboard's **Analytics** tab (a nav item
 alongside Overview / Chat / Run history). Two dropdowns — Category and Model — filter a
-breakdown table (runs, success rate, decode tok/s, prefill tok/s, avg latency, peak VRAM) so
+breakdown table (runs, success rate, input/output tokens, decode tok/s, prefill tok/s, avg latency, peak VRAM) so
 you can compare, say, `resume_extraction` on the 4B model against the 26B model side by side,
 exactly like a hand-built benchmark table but always current. The same data is available
 programmatically as `categories`/`category_models` in `/api/dashboard` — see
