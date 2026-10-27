@@ -1,8 +1,9 @@
-"""Independent GPU hardware telemetry from Linux amdgpu sysfs.
+"""Independent GPU hardware telemetry: Linux amdgpu sysfs, or on Windows AMD's ADL library.
 
 Runs in the dashboard process (never inside the training process). Every field that a card does
 not expose is returned as None with a reason in `unavailable`, so a missing sensor is never
-mistaken for a zero reading. On non-Linux hosts discovery returns no GPUs and says why.
+mistaken for a zero reading. The Windows source is `windows_gpu.WindowsGpuReader`, passed in by the
+caller; on any other host without one, discovery returns no GPUs and says why.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from dual_gpu_setup.hostos import get_host
+from dual_gpu_setup.host_info import os_info
+from dual_gpu_setup.training.environment import rocm_installation
 
 AMD_VENDOR = "0x1002"
 _CARD_RE = re.compile(r"^card\d+$")
@@ -72,17 +75,34 @@ class GpuDevice:
     lane: str | None = None
     vram_total_bytes: int | None = None
     temp_files: dict[str, Path] = field(default_factory=dict)
+    # Windows only: the reader that samples this GPU, its ADL adapter index and the LUID of the
+    # Windows adapter (for the memory counters). On Linux these stay None.
+    reader: Any = None
+    adl_index: int | None = None
+    luid: str | None = None
 
     def identity(self) -> dict[str, Any]:
         return {"pci_bus": self.pci_bus, "card": self.card, "name": self.name, "lane": self.lane,
                 "vram_total_bytes": self.vram_total_bytes}
 
 
-def discover_gpus(sysfs_root: str | Path = "/sys", platform_name: str | None = None) -> tuple[list[GpuDevice], str | None]:
+def discover_windows_gpus(reader: Any) -> tuple[list[GpuDevice], str | None]:
+    found = reader.discover()
+    devices = [GpuDevice(pci_bus=g["pci_bus"], card=f"adl{g['adl_index']}", device_path=Path(), hwmon_path=None,
+                         name=g["name"], vram_total_bytes=g["vram_total_bytes"], reader=reader,
+                         adl_index=g["adl_index"], luid=g["luid"]) for g in found]
+    return devices, None if devices else "ADL reported no AMD GPUs."
+
+
+def discover_gpus(sysfs_root: str | Path = "/sys", platform_name: str | None = None,
+                  windows_reader: Any = None) -> tuple[list[GpuDevice], str | None]:
     """Returns (gpus, unavailable_reason). Reason is set when discovery itself is not possible."""
     platform_name = platform_name or sys.platform
+    if platform_name.startswith("win") and windows_reader is not None:
+        return discover_windows_gpus(windows_reader)
     if not platform_name.startswith("linux"):
-        return [], f"GPU sysfs telemetry requires Linux (running on {platform_name})."
+        return [], (f"GPU telemetry needs Linux sysfs, or on Windows the AMD ADL library (running on {platform_name}; "
+                    "no ADL reader is available).")
     drm = Path(sysfs_root) / "class" / "drm"
     if not drm.is_dir():
         return [], f"{drm} not found."
@@ -203,6 +223,11 @@ def map_torch_devices(torch_devices: list[dict[str, Any]], gpus: list[GpuDevice]
 
 
 def sample_gpu(gpu: GpuDevice, now: float | None = None) -> dict[str, Any]:
+    if gpu.reader is not None:
+        sample: dict[str, Any] = {"ts": time.time() if now is None else now, "pci_bus": gpu.pci_bus,
+                                  "lane": gpu.lane, "name": gpu.name}
+        sample.update(gpu.reader.sample(gpu.adl_index, gpu.pci_bus, gpu.luid, gpu.vram_total_bytes))
+        return sample
     device = gpu.device_path
     unavailable: dict[str, str] = {}
 
@@ -263,13 +288,15 @@ class HardwareSampler:
         on_samples: Callable[[list[dict[str, Any]]], None] | None = None,
         on_system: Callable[[dict[str, Any]], None] | None = None,
         smi: Any = None,
+        windows_reader: Any = None,
     ):
         self.interval_s = interval_s
+        self.windows_reader = windows_reader
         self.on_samples = on_samples
         self.on_system = on_system
         self.smi = smi
         self.system_latest: dict[str, Any] | None = None
-        self.gpus, self.unavailable_reason = discover_gpus(sysfs_root, platform_name)
+        self.gpus, self.unavailable_reason = discover_gpus(sysfs_root, platform_name, windows_reader)
         assign_lanes(self.gpus, lanes)
         self._history: dict[str, collections.deque] = {
             g.pci_bus: collections.deque(maxlen=max(10, int(history_seconds / interval_s))) for g in self.gpus
@@ -331,22 +358,37 @@ class HardwareSampler:
 
         gpus = []
         for gpu in self.gpus:
+            if gpu.reader is not None:
+                from dual_gpu_setup.training.windows_gpu import speed_label
+
+                link = gpu.reader.link(gpu.pci_bus) or {}
+                gpus.append({**gpu.identity(), "pcie_speed": speed_label(link.get("speed")), "pcie_width": link.get("width"),
+                             "pcie_max_speed": speed_label(link.get("max_speed")), "pcie_max_width": link.get("max_width"),
+                             "vbios_version": None, "driver_version": link.get("driver_version")})
+                continue
             device = gpu.device_path
             gpus.append({**gpu.identity(), "pcie_speed": _read(device / "current_link_speed"),
                          "pcie_width": _read(device / "current_link_width"), "pcie_max_speed": _read(device / "max_link_speed"),
                          "pcie_max_width": _read(device / "max_link_width"), "vbios_version": _read(device / "vbios_version")})
-        return {"gpus": gpus, "kernel": stdlib_platform.release(), "amdgpu_driver": text("/sys/module/amdgpu/version"),
-                "rocm_version": text("/opt/rocm/.info/version"), "unavailable_reason": self.unavailable_reason,
+        rocm = rocm_installation()
+        windows_driver = next((g["driver_version"] for g in gpus if g.get("driver_version")), None)
+        return {"gpus": gpus, "os": os_info(), "kernel": stdlib_platform.release(),
+                "amdgpu_driver": windows_driver or text("/sys/module/amdgpu/version"), "rocm": rocm,
+                "rocm_version": rocm["version"], "unavailable_reason": self.unavailable_reason,
                 "visibility": {k: os.environ.get(k) for k in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES") if os.environ.get(k)}}
 
     def start(self) -> None:
         if not self.gpus or self._thread is not None:
             return
+        if self.windows_reader is not None:
+            self.windows_reader.start()  # background refresh of VRAM, PCIe link and driver version
         self._thread = threading.Thread(target=self._run, name="gpu-sampler", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        if self.windows_reader is not None:
+            self.windows_reader.stop()
 
     def _run(self) -> None:
         next_tick = time.monotonic()
@@ -378,7 +420,8 @@ class HardwareSampler:
                     "latest": latest,
                     "history": [
                         {k: s.get(k) for k in ("ts", "gpu_busy_pct", "vram_used_bytes", "temp_junction_c",
-                                               "temp_memory_c", "temp_edge_c", "power_w")}
+                                               "temp_memory_c", "temp_edge_c", "power_w", "throttle_status",
+                                               "amd_smi_fields", "unavailable")}
                         for s in history
                     ],
                 })

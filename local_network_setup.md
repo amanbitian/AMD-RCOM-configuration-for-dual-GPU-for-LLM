@@ -1,42 +1,48 @@
 # Local Network Setup
 
-This guide explains how to run Dual GPU Studio on the Windows GPU machine and access its web interface from a Mac on the same local network.
+This guide explains how to run Dual GPU Studio on a Windows or Ubuntu GPU host and access its web interface from another device on the same local network.
 
-The models, GPU orchestration, SQLite database, and `llama-server` processes remain on the Windows machine. The Mac only opens the web interface and sends chat requests to the Windows application.
+The models, GPU orchestration, SQLite database, and `llama-server` processes remain on the GPU host. The client device only opens the web interface and sends requests to that host.
 
 ## Network layout
 
 ```text
-Mac web browser
+Client web browser
     |
     |  Local network: TCP 8090
     v
-Windows PC: Dual GPU Studio
+Windows or Ubuntu GPU host: Dual GPU Studio
     |
     +-- llama-server lane A: 127.0.0.1:8081
     +-- llama-server lane B: 127.0.0.1:8082
     +-- Local GPUs, models, logs, and SQLite run history
 ```
 
-Only the Dual GPU Studio web port needs to be reachable from the Mac. The underlying model-server ports can remain bound to `127.0.0.1`.
+Only the Dual GPU Studio web port needs to be reachable from the client. The underlying model-server ports can remain bound to `127.0.0.1`.
 
 ## Requirements
 
-- The Windows PC and Mac must be connected to the same trusted Ethernet or Wi-Fi network.
-- The Windows network profile should be set to **Private**.
+- The GPU host and client must be connected to the same trusted Ethernet or Wi-Fi network.
+- On Windows, the network profile should be set to **Private**.
 - Guest Wi-Fi or wireless client isolation must not block communication between devices.
-- The configured `llama-server` runtime (an official llama.cpp build set in `discovery.backend_server_binaries`, or LM Studio's bundled one) and the model files must be accessible on the Windows PC.
-- The Windows PC must remain awake while the Mac is using the application.
+- The configured `llama-server` runtime and model files must be accessible on the GPU host. Ubuntu should use the native llama.cpp binary configured in `backend_server_binaries`; Windows may also use the LM Studio fallback.
+- The GPU host must remain awake while the client is using the application.
 
 ## 1. Start the application for LAN access
 
-Local-network listening is now enabled by default. From the project directory on Windows, run:
+From the project directory on Windows, run:
 
 ```powershell
-python .\app.py --config .\example.dual_gpu.toml
+python .\app.py --config .\example.dual_gpu.toml --host 0.0.0.0
 ```
 
-The terminal prints the Windows-local address and one or more detected local-network addresses. Open a displayed **Local network** URL on the Mac.
+On Ubuntu, use the edited native llama.cpp config:
+
+```bash
+python3 app.py --config ./dual_gpu.toml --host 0.0.0.0 --port 8090 --no-browser
+```
+
+The terminal prints the local address and one or more detected local-network addresses. Open a displayed **Local network** URL on the client.
 
 The equivalent explicit command is:
 
@@ -50,24 +56,27 @@ python .\app.py `
 
 What these options mean:
 
-- `--host 0.0.0.0` makes the web application listen on all Windows network interfaces.
+- `--host 0.0.0.0` makes the web application listen on all host network interfaces.
 - `--port 8090` exposes the web application on TCP port 8090.
-- `--no-browser` prevents Windows from opening a local browser automatically.
+- `--no-browser` prevents the host from opening a local browser automatically.
 - `--config` selects the GPU, model, and runtime configuration.
 
 Keep this terminal open. Press `Ctrl+C` when you want to stop the application and unload model servers managed by it.
 
 If the service was started in the background with `py launch_service.py`, there is no terminal to close. Use
-the dashboard's **Service** page from the Mac: **Restart service** or **Stop service**, **Unload** for each GPU,
-and the settings. Starting it again after **Stop service** needs the Windows PC (`py launch_service.py`).
+the dashboard's **Service** page from the client: **Restart service** or **Stop service**, **Unload** for each GPU,
+and the settings. Starting it again after **Stop service** requires access to the GPU host
+(`py launch_service.py --host 0.0.0.0` on Windows or
+`python3 launch_service.py --config ./dual_gpu.toml --host 0.0.0.0` on Ubuntu).
 Anyone who can open the UI can use these controls; see the security notes in
 [app_overview.md](app_overview.md#12-security-posture).
 
-Passing `--host 127.0.0.1` intentionally disables LAN access. A Mac cannot connect while the application is bound only to `127.0.0.1`.
+Passing `--host 127.0.0.1` intentionally disables LAN access; another device cannot connect while the
+application is bound only to loopback.
 
-## 2. Find the Windows IP address
+## 2. Find the host IP address
 
-Run this on Windows:
+On Windows:
 
 ```powershell
 ipconfig
@@ -92,7 +101,17 @@ Get-NetIPAddress -AddressFamily IPv4 |
   Select-Object InterfaceAlias, IPAddress
 ```
 
-## 3. Allow the port through Windows Firewall
+On Ubuntu:
+
+```bash
+ip -brief address
+```
+
+Use the non-loopback IPv4 address on the active Ethernet or Wi-Fi interface.
+
+## 3. Allow the port through the host firewall
+
+### Windows Firewall
 
 Open PowerShell **as Administrator** and create a rule restricted to private local subnets:
 
@@ -128,12 +147,24 @@ To remove the rule when LAN access is no longer required:
 Remove-NetFirewallRule -DisplayName "Dual GPU Studio 8090"
 ```
 
+### Ubuntu UFW
+
+If UFW is active, allow only the trusted local subnet (replace the example CIDR if needed):
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 8090 proto tcp
+sudo ufw status
+```
+
+Remove that rule later with the matching `ufw delete allow ...` command. Do not open port 8090
+globally on an internet-facing interface.
+
 ## 4. Connect from the Mac
 
 Open Safari, Chrome, or Firefox on the Mac and visit:
 
 ```text
-http://<windows-ip-address>:8090
+http://<host-ip-address>:8090
 ```
 
 For the example address above:
@@ -142,29 +173,29 @@ For the example address above:
 http://192.168.1.50:8090
 ```
 
-The Overview, Chat, and Run History pages should load. All run data continues to be stored on the Windows PC in:
+The Overview, Chat, and Run History pages should load. All run data continues to be stored on the GPU host in:
 
 ```text
 chat_runs/chatbot.sqlite3
 ```
 
-Nothing is stored permanently on the Mac by the application, apart from normal browser data.
+Nothing is stored permanently on the client by the application, apart from normal browser data.
 
 ## 5. Verify the connection
 
-First verify the application locally on Windows:
+First verify the application locally on the GPU host:
 
 ```text
 http://127.0.0.1:8090
 ```
 
-Then verify the LAN address from the Mac:
+Then verify the LAN address from the client:
 
 ```text
-http://<windows-ip-address>:8090
+http://<host-ip-address>:8090
 ```
 
-From macOS Terminal, you can test whether the web server responds:
+From the client terminal, you can test whether the web server responds:
 
 ```bash
 curl http://192.168.1.50:8090/api/status
@@ -174,14 +205,14 @@ A successful response is JSON containing fields such as `state`, `mode`, `server
 
 ## Optional: use a stable address
 
-The Windows IP address may change when the router renews its DHCP lease. For a stable bookmark, use one of these approaches:
+The host IP address may change when the router renews its DHCP lease. For a stable bookmark, use one of these approaches:
 
-- Configure a DHCP reservation for the Windows PC in the router.
+- Configure a DHCP reservation for the GPU host in the router.
 - Assign a suitable static IP using your network administrator's addressing plan.
-- Try the Windows computer name if local name resolution works, for example:
+- Try the host name if local name resolution works, for example:
 
 ```text
-http://windows-computer-name:8090
+http://gpu-host-name:8090
 ```
 
 A router-side DHCP reservation is generally safer than manually choosing an arbitrary static address.
@@ -202,19 +233,19 @@ For access from outside the home/local network, use a secure VPN such as a priva
 
 ## Troubleshooting
 
-### The page works on Windows but not on the Mac
+### The page works on the GPU host but not on the client
 
 Check that:
 
 - the service was started with `--host 0.0.0.0` and the terminal shows a `Local network:` URL (the secure default bind is `127.0.0.1`);
-- the Mac is using the current Windows IPv4 address;
+- the client is using the current host IPv4 address;
 - both machines are connected to the same network;
-- the Windows network profile is Private;
+- the Windows network profile is Private, or the Ubuntu firewall has a matching local-subnet rule;
 - the firewall rule exists and uses the same port as the app;
 - a VPN on either machine is not routing or filtering local traffic;
 - the Wi-Fi access point does not enable client/AP isolation.
 
-### Confirm that Windows is listening
+### Confirm that the host is listening
 
 Run on Windows:
 
@@ -224,7 +255,13 @@ Get-NetTCPConnection -LocalPort 8090 -State Listen
 
 The local address should normally appear as `0.0.0.0` when LAN listening is enabled.
 
-### Test basic connectivity from the Mac
+On Ubuntu, use:
+
+```bash
+ss -ltnp | grep ':8090'
+```
+
+### Test basic connectivity from the client
 
 Run:
 
@@ -232,29 +269,33 @@ Run:
 ping 192.168.1.50
 ```
 
-Some Windows firewall configurations block ping even when TCP port 8090 works, so also test with `curl`:
+Some firewall configurations block ping even when TCP port 8090 works, so also test with `curl`:
 
 ```bash
 curl -v http://192.168.1.50:8090/api/status
 ```
 
-### The Windows address keeps changing
+### The host address keeps changing
 
-Create a DHCP reservation in the router for the Windows PC and update the Mac bookmark to use that reserved address.
+Create a DHCP reservation in the router for the GPU host and update the client bookmark to use that reserved address.
 
 ### The UI loads but models do not start
 
-LAN connectivity is working in this case. Check the Windows application terminal and confirm:
+LAN connectivity is working in this case. Check the application log or host terminal and confirm:
 
 - model files exist at the configured paths;
-- the `llama-server` runtime can be found (the configured build, or LM Studio's) and the model fits the free VRAM (a `Not enough free VRAM` error means another application holds the GPU);
+- the native `llama-server` configured on Ubuntu (or the configured/LM Studio build on Windows) can be found and the model fits the free VRAM (a `Not enough free VRAM` error means another application holds the GPU);
 - GPU device matching is correct;
 - lane ports are not occupied by unrelated applications.
 
-You can validate device discovery on Windows with:
+Validate device discovery with the config for that host:
 
 ```powershell
 dual-gpu --config .\example.dual_gpu.toml inspect
+```
+
+```bash
+dual-gpu --config ./dual_gpu.toml inspect
 ```
 
 ## Recommended launch command
@@ -273,5 +314,11 @@ python .\app.py `
 Then open the following address on the Mac:
 
 ```text
-http://<windows-ip-address>:8090
+http://<host-ip-address>:8090
+```
+
+The Ubuntu equivalent is:
+
+```bash
+python3 app.py --config ./dual_gpu.toml --host 0.0.0.0 --port 8090 --data-dir ./chat_runs --no-browser
 ```

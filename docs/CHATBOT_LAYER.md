@@ -2,9 +2,12 @@
 
 ## Status and scope
 
-This document is the implementation specification for adding an interactive chatbot above the existing dual-GPU orchestration code.
+This document is the original implementation specification for the interactive chatbot above the dual-GPU orchestration code.
 
-The current repository is a batch-oriented orchestrator. It can start `llama-server`, place a model on one GPU or both GPUs, run configured commands, and then stop the server. It does **not** yet provide a permanent chat service, browser UI, conversation database, live metric stream, or request scheduler. Everything described below is a proposed addition unless explicitly identified as existing behavior.
+The layer described here is now implemented. For current behavior and exact endpoint shapes, use
+[app_overview.md](../app_overview.md) and [API_CONTRACT.md](../API_CONTRACT.md); the remainder of this
+file preserves the design rationale. The implementation supports Windows and Ubuntu/Linux and records
+host OS metadata with every new run.
 
 The chatbot layer must support three execution modes:
 
@@ -12,7 +15,7 @@ The chatbot layer must support three execution modes:
 2. **Two models in parallel**: one model is loaded on each GPU and both servers can answer concurrently. A user can chat with either model or send the same prompt to both for comparison.
 3. **One GPU at a time**: a model is loaded on one selected GPU while the other GPU stays unused and available for another workload.
 
-The design also records the prompt, response, generation settings, token counts, timing, GPU/CPU/RAM metrics, errors, and model placement for every model invocation.
+The design also records the prompt, response, generation settings, token counts, timing, GPU/CPU/RAM metrics, errors, model placement, and host OS for every model invocation.
 
 ## Goals
 

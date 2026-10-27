@@ -139,7 +139,9 @@ def test_hardware_summary_and_threshold_exposure(tmp_path):
     samples = []
     for i in range(10):
         samples.append({"ts": base + i, "pci_bus": "0000:03:00.0", "lane": "r9700", "gpu_busy_pct": 90,
-                        "vram_used_bytes": 1000 + i, "temp_memory_c": 85 + i, "power_w": 300.0})
+                        "vram_used_bytes": 1000 + i, "temp_memory_c": 85 + i, "power_w": 300.0,
+                        "throttle_status": 4 if i >= 8 else 0, "amd_smi_fields": ["throttle_status"],
+                        "unavailable": {"temp_junction_c": "not exposed"}})
     samples.append({"ts": base + 1, "pci_bus": "0000:04:00.0", "lane": "9070xt"})  # nothing measured
     store.add_hardware_samples(samples)
     clock.now = base + 20
@@ -148,9 +150,13 @@ def test_hardware_summary_and_threshold_exposure(tmp_path):
     assert gpu["max_temp_memory_c"] == 94
     assert gpu["seconds_memory_over_alert"] == 5  # 90..94
     assert gpu["energy_wh"] == pytest.approx(300 * 10 / 3600)
+    assert gpu["seconds_throttled"] == 2
     assert gpu["max_temp_junction_c"] is None and gpu["seconds_junction_over_alert"] is None
     assert summary["0000:04:00.0"]["avg_power_w"] is None
-    assert store.hardware_series("r")["gpus"]["0000:03:00.0"]["points"][0]["vram_used_bytes"] == 1000
+    point = store.hardware_series("r")["gpus"]["0000:03:00.0"]["points"][0]
+    assert point["vram_used_bytes"] == 1000
+    assert point["throttle_status"] == 0 and point["telemetry_sources"] == ["throttle_status"]
+    assert point["unavailable"] == {"temp_junction_c": "not exposed"}
 
 
 def test_samples_are_only_persisted_while_a_run_is_active(tmp_path):

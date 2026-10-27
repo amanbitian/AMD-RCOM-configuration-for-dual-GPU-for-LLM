@@ -92,6 +92,25 @@ draft_gpu_layers = 48
     assert model.draft_gpu_layers == 48
 
 
+def test_discovery_paths_expand_environment_and_resolve_from_config(tmp_path: Path, monkeypatch):
+    runtime_root = tmp_path / "native-runtime"
+    monkeypatch.setenv("DGPU_RUNTIME_ROOT", runtime_root.as_posix())
+    config_path = tmp_path / "portable.toml"
+    config_path.write_text(
+        _MINIMAL_TOML.format(lmstudio_home="./lmstudio", models_dir="./models").replace(
+            'models_dir = "./models"',
+            'models_dir = "./models"\nbackend_server_binaries = { rocm = "$DGPU_RUNTIME_ROOT/llama-server" }',
+        ),
+        encoding="utf-8",
+    )
+
+    discovery = load_config(config_path).discovery
+
+    assert Path(discovery.lmstudio_home) == tmp_path / "lmstudio"
+    assert Path(discovery.models_dir) == tmp_path / "models"
+    assert Path(discovery.backend_server_binaries["rocm"]) == runtime_root / "llama-server"
+
+
 def test_wrong_lane_count_rejected(tmp_path: Path):
     config_path = tmp_path / "one_lane.toml"
     config_path.write_text(

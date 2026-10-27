@@ -151,6 +151,7 @@ def test_configured_build_does_not_inherit_lm_studio_vendor_dlls(tmp_path):
     binary = tmp_path / "llama.cpp" / "llama-server.exe"
     binary.parent.mkdir()
     binary.touch()
+    binary.chmod(0o755)
     assert vendor_bin(_discovery(tmp_path), "rocm") == vendor / "bin"
     assert vendor_bin(_discovery(tmp_path, str(binary)), "rocm") is None
     explicit = _discovery(tmp_path, str(binary))
@@ -183,6 +184,39 @@ def test_runtime_info_probes_once_and_labels_the_source(tmp_path, monkeypatch):
 def test_missing_binary_yields_an_unprobed_runtime(tmp_path):
     info = runtime_info(_discovery(tmp_path), "rocm", tmp_path / "nope.exe")
     assert info.flags == frozenset() and info.build is None
+
+
+def test_device_listing_accepts_linux_logger_output_on_stderr(tmp_path, monkeypatch):
+    binary = tmp_path / "llama-server"
+    binary.touch()
+    monkeypatch.setattr(lmstudio, "server_binary", lambda _config, _backend: binary)
+    monkeypatch.setattr(lmstudio, "runtime_dir", lambda _config, _backend: tmp_path)
+    monkeypatch.setattr(lmstudio, "backend_env", lambda _config, _backend: {})
+    monkeypatch.setattr(
+        lmstudio,
+        "get_host",
+        lambda: SimpleNamespace(control=SimpleNamespace(spawn_kwargs=lambda: {})),
+    )
+    monkeypatch.setattr(
+        lmstudio.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "", "ROCm0: AMD Radeon Test (16384 MiB, 12000 MiB free)\n"
+        ),
+    )
+
+    assert lmstudio.list_devices(SimpleNamespace(), "rocm") == [
+        ("ROCm0", "AMD Radeon Test (16384 MiB, 12000 MiB free)")
+    ]
+
+
+def test_linux_native_binary_must_be_executable(tmp_path, monkeypatch):
+    binary = tmp_path / "llama-server"
+    binary.touch()
+    monkeypatch.setattr(lmstudio.sys, "platform", "linux")
+    monkeypatch.setattr(lmstudio.os, "access", lambda path, mode: False)
+    with pytest.raises(SystemExit, match="chmod \\+x"):
+        lmstudio.native_server_binary(_discovery(tmp_path, str(binary)), "rocm")
 
 
 def test_split_models_can_fall_back_to_lm_studio_while_lanes_keep_the_configured_build():

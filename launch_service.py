@@ -36,6 +36,8 @@ from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from dual_gpu_setup.host_info import default_config_name, detached_process_kwargs, os_info, os_log_line
+
 
 def _probe(base_url: str, timeout: float = 2.0) -> dict | None:
     """Returns the /api/status payload if base_url is our service and healthy, else None."""
@@ -71,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).with_name("example.dual_gpu.toml")),
+        default=str(Path(__file__).with_name(default_config_name())),
         help="Path to the dual-GPU TOML configuration, forwarded to app.py.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host app.py should bind to if started.")
@@ -107,7 +109,7 @@ def main() -> int:
         if open_browser:
             webbrowser.open(base_url)
         print(json.dumps({"already_running": True, "base_url": base_url, "status": status,
-                          "browser_opened": open_browser}, indent=2))
+                          "host_os": os_info(), "browser_opened": open_browser}, indent=2))
         return 0
 
     app_path = Path(__file__).with_name("app.py")
@@ -127,22 +129,16 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "launcher.log"
 
-    creationflags = 0
-    if sys.platform == "win32":
-        # DETACHED_PROCESS: no console, so it survives this launcher exiting.
-        # CREATE_NEW_PROCESS_GROUP: isolates it from signals sent to this launcher's group.
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-
     with open(log_path, "a", encoding="utf-8", errors="replace") as log_handle:
         log_handle.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} :: launch_service.py :: {' '.join(command)} ===\n")
+        log_handle.write(f"host_os={os_log_line()}\n")
         log_handle.flush()
         process = subprocess.Popen(
             command,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            close_fds=True,
+            **detached_process_kwargs(),
         )
 
     deadline = time.monotonic() + args.startup_timeout
@@ -163,6 +159,7 @@ def main() -> int:
                 "base_url": base_url,
                 "status": status,
                 "log_path": str(log_path),
+                "host_os": os_info(),
                 "browser_opened": open_browser,
             }, indent=2))
             return 0

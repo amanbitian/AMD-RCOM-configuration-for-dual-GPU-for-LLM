@@ -68,6 +68,10 @@ def native_server_binary(config: AppConfig, backend: str) -> Path | None:
     path = Path(configured)
     if not path.is_file():
         raise SystemExit(f"Configured {backend} server binary does not exist: {path}")
+    if sys.platform.startswith("linux") and not os.access(path, os.X_OK):
+        raise SystemExit(
+            f"Configured {backend} server binary is not executable: {path}. Run: chmod +x {path}"
+        )
     return path
 
 
@@ -207,7 +211,9 @@ def list_devices(config: AppConfig, backend: str) -> list[tuple[str, str]]:
     )
     prefix = BACKEND_SPECS[backend]["prefix"]
     found: list[tuple[str, str]] = []
-    for line in (proc.stdout or "").splitlines():
+    # Some Linux builds route the device list through llama.cpp's stderr logger.
+    output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+    for line in output.splitlines():
         match = re.match(rf"\s*({prefix}\d+):\s*(.+)", line)
         if match:
             found.append((match.group(1), match.group(2).strip()))

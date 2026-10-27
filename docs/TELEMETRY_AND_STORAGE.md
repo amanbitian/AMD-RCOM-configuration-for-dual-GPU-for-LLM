@@ -15,7 +15,7 @@ A **run** means one request to one model. Sending one prompt to two models creat
 5. Represent an unavailable measurement as `null`, with an optional `unavailable_reason`. Never turn missing data into zero.
 6. Sample resource data before generation, during generation, and once after completion.
 7. Keep per-GPU samples. Aggregate values alone cannot explain an uneven tensor split.
-8. Version the schema and record application, runtime, driver, and model identifiers on every deployment or run.
+8. Version the schema and record application, runtime, driver, model, and host OS identifiers on every deployment or run.
 
 ## Token definitions
 
@@ -28,6 +28,7 @@ Token fields must have unambiguous meanings:
 | `uncached_input_tokens` | `input_tokens - cached_input_tokens`; `null` if cache usage is unknown. |
 | `prefill_tokens` | Tokens actually processed during prompt evaluation. Prefer the backend's prompt-evaluation count. This may differ from `input_tokens` when cache reuse is active. |
 | `thinking_tokens` | Completion tokens used for hidden or separately reported reasoning. `null` if the backend cannot separate them. |
+| `thinking_tokens_estimated` | When `thinking_tokens` is `null` but reasoning text was observed: `thinking_characters / 4`, labeled as an estimate (`thinking_tokens_source = estimated_from_characters`). Never mixed into exact-count totals; the dashboard summary reports it separately. |
 | `visible_output_tokens` | Tokens in the user-visible assistant answer, excluding separately reported thinking tokens. |
 | `output_tokens` | All generated completion tokens. When reasoning is separate, `thinking_tokens + visible_output_tokens`. |
 | `total_tokens` | `input_tokens + output_tokens`. |
@@ -79,6 +80,7 @@ Do not calculate decode rate from `t4 - t3` for a zero- or one-token completion.
 | Model file modification time or content fingerprint | Model catalog |
 | Backend and runtime version | Server adapter |
 | Application/schema version | Application |
+| Host OS, release, version, machine, and Linux distribution | Application/platform metadata |
 | GPU name, stable ID, driver version, backend device ID | GPU discovery |
 | Tensor split, GPU layers, CPU-offloaded layers | Deployment/backend |
 | Context requested and allocated | Request and server metadata |
@@ -217,7 +219,7 @@ deployment_models
 runs
   id, comparison_id, conversation_id, request_message_id, response_message_id,
   deployment_id, deployment_model_id, status, created_at, started_at,
-  first_token_at, finished_at, finish_reason, error_json,
+  first_token_at, finished_at, finish_reason, error_json, host_os_json,
   request_json, prompt_snapshot_json, response_json, backend_usage_json
 
 run_token_metrics
@@ -262,6 +264,15 @@ Use JSON only for backend-specific or evolving structures. Keep frequently filte
   "run_id": "01J...",
   "comparison_id": null,
   "status": "completed",
+  "host_os": {
+    "system": "Linux",
+    "release": "6.8.0",
+    "version": "#...",
+    "machine": "x86_64",
+    "distribution": "Ubuntu 24.04 LTS",
+    "distribution_id": "ubuntu",
+    "distribution_version": "24.04"
+  },
   "mode": "single_large_model",
   "model": {
     "id": "gpt-oss-120b-GGUF",
@@ -315,7 +326,7 @@ Use JSON only for backend-specific or evolving structures. Keep frequently filte
 
 The values are illustrative. Production values must come from measurement.
 
-## Collection sources on Windows
+## Collection sources on Windows and Linux
 
 Use the best available source and record which source produced each field:
 
@@ -324,8 +335,17 @@ Use the best available source and record which source produced each field:
 - Windows performance counters for process CPU, working set/private bytes, dedicated GPU memory, and shared GPU memory.
 - Vendor tooling or management libraries for physical GPU utilization, VRAM, clocks, temperature, and power. AMD ROCm/Vulkan availability varies by GPU, driver, and Windows runtime.
 - `psutil` for process/system CPU, RAM, disk I/O, and process lifecycle where supported.
+- Linux `/proc` for process/system CPU, RSS, faults, RAM and swap; amdgpu DRM `fdinfo` for
+  per-process VRAM/GTT and engine activity; sysfs/AMD SMI for device telemetry when available.
+- Native llama.cpp `--list-devices` output for Linux free-VRAM admission and device identity.
 
-The current repository reads Windows `GPU Process Memory` counters once after load. The chatbot requires a continuous collector and a reliable mapping from model-server PID to physical GPU. If a counter cannot identify the physical adapter, combine PID counters with the scheduler's device reservation and clearly mark the attribution method.
+The implemented background collector uses the platform host layer continuously and maps model-server
+PIDs to scheduled lanes. Linux DRM/journal/sysfs fields may be unavailable because of permissions;
+those values remain `null` rather than being reported as zero. Every new persisted run and client
+JSONL record includes `host_os`, allowing mixed Windows/Ubuntu results to be separated reliably.
+Training runs additionally preserve the tracker host separately from the dashboard/service host,
+ROCm installation/component versions, PyTorch HIP runtime, relevant accelerator environment, PCIe
+mapping, AMD SMI throttle state, telemetry source and per-field unavailable reasons.
 
 ## Retention and export
 

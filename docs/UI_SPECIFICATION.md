@@ -18,6 +18,7 @@ Recommended primary navigation:
 The global status bar remains visible on every page and shows:
 
 - Service health and active execution mode.
+- Host operating system and release in service details, so exported screenshots and diagnostics are attributable.
 - GPU A and GPU B name, utilization, dedicated VRAM used/total, shared memory, and temperature if available.
 - Loaded model name on each GPU or `Shared by <model>` for a multi-GPU deployment.
 - Active requests and queue depth.
@@ -188,10 +189,11 @@ For the selected response, show:
 ### Resource panel
 
 - Per-GPU average/peak utilization and peak dedicated VRAM.
-- Peak shared GPU memory and spill warning.
+- Peak shared GPU memory/GTT and spill warning when that platform exposes them.
 - Average/peak process CPU.
 - Peak process RAM and total system RAM pressure.
 - Temperature, power, energy/token, and throttling when available.
+- Telemetry source and unavailable reason in drill-down details, so a missing ROCm/AMD SMI field is explainable.
 
 ### Configuration panel
 
@@ -199,7 +201,7 @@ For the selected response, show:
 - Mode and actual GPU IDs.
 - Context, reasoning, and generation controls.
 - Tensor split, GPU layers, CPU offload, threads, batch settings, flash attention, and cache settings.
-- Runtime, driver, and application versions.
+- Runtime, driver, application, and host OS versions.
 
 ## Live metrics page
 
@@ -286,6 +288,7 @@ Allow editing configuration overrides, but label probed/model-metadata values se
 - Model-specific reasoning budgets replace global hard-coded presets.
 - Compare mode streams and controls both models independently.
 - Every response links to its stored run and full configuration.
+- Run details expose the recorded host OS; unavailable Linux sensor fields remain visibly unavailable rather than zero.
 - Live and final token rates are visually distinguished.
 - Shared GPU memory is not mislabeled as definitive spill.
 - Missing metrics render as unavailable.

@@ -97,8 +97,9 @@ class AmdSmiReader:
         metrics = _call(m, "amdsmi_get_gpu_metrics_info", handle)
         if isinstance(metrics, dict):
             throttle = metrics.get("throttle_status")
-            if throttle is not None and not (isinstance(throttle, str) and throttle.upper() == "N/A"):
-                out["throttle_status"] = throttle
+            numeric = _number(throttle)
+            if numeric is not None:
+                out["throttle_status"] = int(numeric)
         return out
 
     def merge(self, sample: dict[str, Any]) -> dict[str, Any]:

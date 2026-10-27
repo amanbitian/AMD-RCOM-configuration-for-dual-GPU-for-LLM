@@ -20,7 +20,7 @@ Every training experiment must answer four questions at once:
 | GPU 0 | Radeon AI PRO R9700, 32 GB, Navi 48, 64 CU, 640 GB/s, blower cooler | Primary trainer. Sustained junction/memory temperature must be watched. |
 | GPU 1 | Radeon RX 9070 XT, 16 GB, Navi 48, 64 CU, 640 GB/s | Same compute class as GPU 0; differs mainly in **memory capacity**. Speed must still be measured, not assumed equal. |
 | Interconnect | PCIe 5.0, x8/x8 expected | Verify per run from sysfs; risers/BIOS can silently negotiate down. |
-| OS for training | Ubuntu + ROCm | ROCm PyTorch on RDNA4 is a Linux-first stack. Windows stays supported for inference. |
+| OS for training | Ubuntu + ROCm | ROCm PyTorch on RDNA4 is a Linux-first stack. Inference remains supported on both Windows and Linux. |
 
 Memory limits per strategy are **upper bounds on model/optimizer state**, not usable capacity. Activations, all-gather buffers, workspace, and allocator overhead must also fit on each card individually:
 
@@ -66,24 +66,54 @@ Build only this before the first real run, then let measured data drive the rest
 
 ## 1. Platform layer
 
-Move the existing Windows code behind an interface and add a Linux implementation:
+At design time, the platform work was to move the existing Windows code behind an interface and add
+a Linux implementation. This now lives under `dual_gpu_setup/hostos/`:
 
 ```text
-dual_gpu_setup/platform/
+dual_gpu_setup/hostos/
   base.py        # ProcessProbe, SystemProbe, GpuProbe, ProcessControl protocols
   windows.py     # current ctypes + PDH code moved from app.py / server.py
   linux.py       # /proc, sysfs, optional amdsmi
 ```
 
-Current Windows-only code paths to route through it:
+The originally Windows-only code paths and their implemented Linux equivalents were:
 
-| Location | Today | Linux replacement |
+| Location | Original Windows path | Linux implementation |
 |---|---|---|
 | `app.py` `ResourceSampler._process_metrics` / `_system_metrics` | `ctypes.windll`; returns `{}` elsewhere | `/proc/<pid>/stat`, `/proc/<pid>/status`, `/proc/stat`, `/proc/meminfo` (or `psutil`) |
 | `server.py` `gpu_process_metrics_batch` | PowerShell `Get-Counter` | sysfs device counters + `/proc/<pid>/fdinfo` (`drm-memory-vram`, `drm-engine-gfx`) |
 | `server.py` `_pid_listening_on`, `_is_llama_server` | `netstat`, `tasklist` | `/proc/net/tcp` + `/proc/<pid>/exe` (or `psutil`) |
 | `server.py` process kill | `taskkill /F /T` | process-group `SIGTERM` then `SIGKILL` (`start_new_session=True` at spawn) |
 | `lmstudio.py` runtime discovery | `llama.cpp-win-x86_64-*`, `llama-server.exe` | also match `llama.cpp-linux-*`, binary without `.exe`, or an explicit `server_binary` path in config |
+
+### Windows GPU sources (ADL and Windows counters)
+
+The Hardware tab and the per-run hardware summary also work on Windows, from `training/windows_gpu.py`.
+Windows has no sysfs, so the values come from AMD's ADL library (`atiadlxx.dll`, installed with the Adrenalin
+driver), Windows performance counters and Windows device properties:
+
+| Field | Source | Cadence |
+|---|---|---|
+| GPU busy % | ADL PMLog sensor 19 (graphics activity) | 1 Hz |
+| Edge / junction / memory temperature | ADL sensors 8 / 27 / 9 | 1 Hz |
+| Board power | ADL sensor 73 | 1 Hz |
+| Core / memory clock, fan | ADL sensors 1 / 2 / 14 | 1 Hz |
+| VRAM used, shared (system) memory used | `\GPU Adapter Memory(*)` Dedicated / Shared Usage, joined to the card by name | every 5 s |
+| VRAM total | DXGI adapter description | at start |
+| PCIe link (current and maximum speed and width), driver version | `DEVPKEY_PciDevice_*` and `DEVPKEY_Device_DriverVersion` | every 60 s |
+
+- **The GPU's PCI address** (`0000:03:00.0`) comes from ADL's bus, device and function numbers, so a lane's
+  `pci_bus` setting means the same thing on both operating systems.
+- **The ADL sensor ids are not documented in a place this code could check.** They were identified on an RX 9070 XT
+  and an R9700 (RDNA4) by behaviour: edge matched Task Manager, the junction sensor followed every change in power
+  and activity within a second while the memory sensor moved over tens of seconds, and board power sat at each
+  card's rated draw under load. Other GPU generations or driver versions may map differently.
+- **ADL sensors 40 and 41 are not used.** They read 4 and 8 on both cards while Windows reported PCIe Gen 5 x16, so
+  they are not the link.
+- **Not available on Windows:** throttle status, the amdgpu kernel-fault follower, AMD SMI and per-process GPU time.
+  They are reported as unavailable, never as zero. A card ADL cannot match to a Windows adapter by name (two
+  identical cards) reports its VRAM as unavailable instead of guessing.
+- **Cost:** about 2 ms per tick on the reference machine, with no dropped ticks.
 
 ### Linux GPU sources (amdgpu)
 
@@ -133,10 +163,14 @@ The PCI bus ID joins sysfs card paths, AMD SMI devices, `torch.cuda` device indi
 A lease is an exclusive claim on one or more lanes:
 
 ```text
+GET    /api/leases           active leases + lane holders (loaded inference shown as pseudo-leases)
 POST   /api/leases           {holder: "training:<run_id>", lanes: ["r9700"], ttl_s: 120}
 POST   /api/leases/{id}/renew
+POST   /api/leases/{id}/preempt
 DELETE /api/leases/{id}
 ```
+
+Full request/response shapes are in `API_CONTRACT.md`.
 
 - `DeploymentManager.deploy*` rejects a deploy onto a leased lane with HTTP 409 (or queues it, if requested).
 - Leases expire without renewal, so a crashed trainer does not lock a GPU forever. The tracker's heartbeat renews it.
@@ -292,7 +326,7 @@ TalentTensor task metrics (computed in that project, logged through `tracker.eva
 
 ### Reproducibility snapshot (P0, once per run)
 
-Git commit and dirty-diff hash, full config, seed, dataset manifest hash, tokenizer hash, base-model revision, precision, optimizer, attention implementation, gradient checkpointing, `torch`/`transformers`/`peft`/`trl` versions, ROCm version, amdgpu firmware and kernel versions, and relevant environment (`HIP_VISIBLE_DEVICES`, `HSA_OVERRIDE_GFX_VERSION`, `PYTORCH_HIP_ALLOC_CONF`, `MIOPEN_*`). Pin the ROCm stack and run a short training smoke test before any upgrade; compatibility claims in release notes must be checked against the exact installed version.
+Git commit and dirty-diff hash, full config, seed, dataset manifest hash, tokenizer hash, base-model revision, precision, optimizer, attention implementation, gradient checkpointing, `torch`/`transformers`/`peft`/`trl` versions, training-process and dashboard-host OS, ROCm installation path and component version files, PyTorch HIP version, amdgpu and kernel versions, and relevant `HSA_*`, `HIP_*`, `MIOPEN_*`, `PYTORCH_*`, `RCCL_*`, `ROCR_*`, and `TORCH_*` environment. Pin the ROCm stack and run a short training smoke test before any upgrade; compatibility claims in release notes must be checked against the exact installed version.
 
 ## 5. Checkpoints
 
@@ -490,8 +524,9 @@ Everything in this document is implemented in `dual_gpu_setup/training/` (plus `
 | Area | Where | Notes |
 |---|---|---|
 | Windows/Linux host layer | `hostos/` | `/proc`, DRM fdinfo and POSIX signals on Linux; ctypes/PDH/taskkill on Windows. Native `llama-server` via `discovery.backend_server_binaries` (no LM Studio needed). |
+| Environment/OS attribution | `training/environment.py`, `host_info.py`, `training/store.py` | A top-level `host_os` is persisted even if tracker capture is disabled. Snapshots distinguish training-process and dashboard-host OS and include Linux distribution, Python, kernel, packages, ROCm component versions and relevant accelerator environment. |
 | Stable GPU identity | `lane.pci_bus`, `training/hardware.py` | PCI address -> name -> unique VRAM size. PyTorch device indices mapped to PCI (`env.gpu_map`), negotiated PCIe link and driver recorded per run (`env.server_hardware`). |
-| Hardware telemetry | `training/hardware.py`, `amd_smi.py` | 1 Hz sysfs sampler, nullable sensors, overhead and dropped-tick stats, optional AMD SMI that only fills gaps, amdgpu kernel-fault follower. |
+| Hardware telemetry | `training/hardware.py`, `amd_smi.py` | 1 Hz sysfs sampler, nullable sensors, overhead and dropped-tick stats, optional AMD SMI that only fills gaps, persisted throttle/source/unavailable metadata, amdgpu kernel-fault follower. |
 | Leases | `scheduling/leases.py` | Atomic multi-lane, token-protected, expiring, PID start-token verified before any termination. Deploys onto leased lanes return 409; training refuses lanes inference holds. |
 | Tracker + HF callback | `training/tracker.py`, `hf_callback.py` | No per-microbatch sync, JSONL spool, global token all-reduce once per window, CUDA-event phase timing (forward / backward+other / optimizer), data-wait, all-reduce time. |
 | Run lifecycle / recovery | `training/store.py`, `checkpoints.py` | Stalled judged on step progress, rank-aware stall detection, manifest-last checkpoints, resume continuity report. |

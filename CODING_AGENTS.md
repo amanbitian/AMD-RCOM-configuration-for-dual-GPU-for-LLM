@@ -11,6 +11,15 @@ worktrees so they do not edit the same files concurrently.
 py app.py --config .\example.dual_gpu.toml --no-browser
 ```
 
+On Ubuntu, point at the edited native llama.cpp configuration:
+
+```bash
+python3 app.py --config ./dual_gpu.toml --no-browser
+```
+
+If `--config` is omitted, the app chooses `example.dual_gpu.toml` on Windows and
+`example.dual_gpu.ubuntu.toml` on Linux.
+
 The service now binds to `127.0.0.1` by default. Register each repository once:
 
 You can do the complete setup without these API commands: open the dashboard and use **Setup
@@ -139,7 +148,8 @@ persisted.
 
 Existing evaluation metrics remain available: input, cached, uncached, prefill, reasoning, visible
 output and total tokens; TTFT, prefill/decode time and rates, end-to-end latency; CPU, RAM, page
-faults, dedicated/shared VRAM, GPU utilization and spill suspicion. Coding runs add project, role,
+faults, dedicated/shared VRAM, GPU utilization and spill suspicion. Every new run also records its
+host OS (including Ubuntu distribution details when available). Coding runs add project, role,
 session, task, workload and GPU-lane attribution. Overview totals use the complete matching history,
 while Run history remains paginated/capped for responsive browsing.
 
@@ -150,7 +160,7 @@ available; the dashboard also retains the original average per-request rate for 
 ## Coding-agent latency and reasoning
 
 Coding gateway requests use the background resource sampler. They do not run synchronous
-PowerShell GPU-counter queries before and after every completion. Very short requests may
+host GPU-counter probes before and after every completion. Very short requests may
 have no fresh resource sample; resource metrics describe the available sampling window,
 not an exact measurement at each request boundary.
 

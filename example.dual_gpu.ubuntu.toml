@@ -1,0 +1,71 @@
+[project]
+name = "shared-eval-stack"
+suite_prefix = "dualgpu"
+log_dir = "./runs"
+host = "127.0.0.1"
+cleanup_ports_on_start = true
+start_timeout_seconds = 900
+
+[discovery]
+# Build llama.cpp with the ROCm backend and make this file executable (chmod +x).
+# An explicit binary keeps Ubuntu independent of LM Studio.
+backend_server_binaries = { rocm = "/opt/llama.cpp/build/bin/llama-server" }
+models_dir = "/srv/models"
+multi_gpu_runtime = "configured"
+
+[policy]
+vram_safety_fraction = 0.90
+ctx_min = 16384
+ctx_mid = 32768
+ctx_max = 49152
+ctx_mid_headroom_gb = 5
+ctx_max_headroom_gb = 10
+safety_tokens = 256
+reasoning_mode = "off"
+reasoning_budget = 0
+cache_reuse = 256
+flash_attn = "auto"
+gpu_layers = 999
+parallel = 1
+no_mmproj = true
+jinja = true
+kill_busy_ports = true
+health_poll_seconds = 1.0
+settle_seconds_after_restart = 2.0
+load_mode = "none"
+cache_ram_mib = 0
+vram_admission = true
+vram_headroom_gb = 1.0
+auto_load_models = true
+# Linux does not page dedicated VRAM out in the Windows-specific way this guard handles.
+residency_guard = false
+
+[[lanes]]
+key = "gpu0"
+display = "Primary AMD GPU"
+# Match a unique substring printed by: llama-server --list-devices
+match = "R9700"
+vram_gb = 32
+port = 8081
+backend = "rocm"
+# pci_bus = "0000:03:00.0"
+
+[[lanes]]
+key = "gpu1"
+display = "Secondary AMD GPU"
+match = "9070 XT"
+vram_gb = 16
+port = 8082
+backend = "rocm"
+# pci_bus = "0000:0b:00.0"
+
+[[models]]
+name = "example-small-model"
+path = "example/model-Q4_K_M.gguf"
+
+# Add your evaluator after its path and arguments are known.
+# [[tasks]]
+# name = "eval"
+# cwd = "/srv/evaluator"
+# command = ["python3", "benchmark.py", "--base-url", "{base_url}", "--model", "{model_name}"]
+# continue_on_error = false

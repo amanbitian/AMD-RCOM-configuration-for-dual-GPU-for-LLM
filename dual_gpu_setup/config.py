@@ -192,10 +192,18 @@ def _expand(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
-def _dict_of_strings(data: dict[str, Any] | None) -> dict[str, str]:
+def _config_path(value: Any, base_dir: Path) -> str:
+    text = _expand(str(value))
+    if not text:
+        return ""
+    path = Path(text)
+    return str(path if path.is_absolute() else (base_dir / path).resolve())
+
+
+def _dict_of_paths(data: dict[str, Any] | None, base_dir: Path) -> dict[str, str]:
     if not data:
         return {}
-    return {str(key): str(value) for key, value in data.items()}
+    return {str(key): _config_path(value, base_dir) for key, value in data.items()}
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -217,11 +225,19 @@ def load_config(path: str | Path) -> AppConfig:
     policy_defaults = PolicyConfig()
 
     discovery = DiscoveryConfig(
-        lmstudio_home=_expand(discovery_raw.get("lmstudio_home", discovery_defaults.lmstudio_home)),
-        models_dir=_expand(discovery_raw.get("models_dir", "")),
-        backend_runtime_overrides=_dict_of_strings(discovery_raw.get("backend_runtime_overrides")),
-        backend_vendor_bin_overrides=_dict_of_strings(discovery_raw.get("backend_vendor_bin_overrides")),
-        backend_server_binaries=_dict_of_strings(discovery_raw.get("backend_server_binaries")),
+        lmstudio_home=_config_path(
+            discovery_raw.get("lmstudio_home", discovery_defaults.lmstudio_home), config_path.parent
+        ),
+        models_dir=_config_path(discovery_raw.get("models_dir", ""), config_path.parent),
+        backend_runtime_overrides=_dict_of_paths(
+            discovery_raw.get("backend_runtime_overrides"), config_path.parent
+        ),
+        backend_vendor_bin_overrides=_dict_of_paths(
+            discovery_raw.get("backend_vendor_bin_overrides"), config_path.parent
+        ),
+        backend_server_binaries=_dict_of_paths(
+            discovery_raw.get("backend_server_binaries"), config_path.parent
+        ),
         multi_gpu_runtime=str(discovery_raw.get("multi_gpu_runtime", discovery_defaults.multi_gpu_runtime)),
     )
     if discovery.multi_gpu_runtime not in {"configured", "lmstudio"}:

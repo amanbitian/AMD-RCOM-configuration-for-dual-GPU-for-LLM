@@ -6,7 +6,7 @@ disagreement is a bug to fix. For exact request and response shapes, [API_CONTRA
 the authority. When behaviour changes, update this file in the same change (see
 [Keeping this document true](#16-keeping-this-document-true)).
 
-Last checked against the code: **2026-10-17** (378 automated tests passing, 1 skipped).
+Last checked against the code: **2026-10-17** (390 automated tests passing, 1 skipped).
 
 ## Contents
 
@@ -31,7 +31,7 @@ Last checked against the code: **2026-10-17** (378 automated tests passing, 1 sk
 
 ## 1. What the app is, and is not
 
-**It is** a local service that runs `llama-server` (llama.cpp) on **two GPUs** of one Windows machine and
+**It is** a local service that runs `llama-server` (llama.cpp) on **two GPUs** of one Windows or Linux machine and
 lets people and other applications use them without each project re-implementing GPU handling. It does five
 jobs:
 
@@ -83,7 +83,8 @@ jobs:
 | Service restart, stop, settings, orphan handling, unload and Stop now | Verified on hardware (spare ports) |
 | Dashboard pages | Page logic run against a fake DOM in Node; **not opened in a real browser after the latest changes** |
 | Residency guard re-warming a model | Tested with fakes. **Not yet seen to trigger live** |
-| Linux support (`/proc`, sysfs, AMD SMI, DRM fdinfo) | Not verified; code exists |
+| Ubuntu/Linux support (`/proc`, sysfs, AMD SMI, DRM fdinfo, POSIX process control) | Tested with fakes; **not yet verified on the real two-GPU Linux machine** |
+| GPU hardware sensors on Windows (busy %, temperatures, power, clocks, fan, VRAM, PCIe link, via AMD ADL) | Verified on hardware (R9700 and 9070 XT). The sensor ids were identified by behaviour; see 5.6 and 11 |
 | Vulkan backend | Code path exists; not benchmarked or verified here |
 | Training tracker, leases, evaluation pipeline | Tested with fakes and real subprocess/HTTP runs; the LoRA-to-GGUF conversion, real `llama-server` changeover during evaluation, Linux GPU sensors and the DDP numerical check are **not verified** |
 
@@ -242,10 +243,10 @@ rescans.
 | Overview | Totals, prompt-processing vs generation speed per model, token split, 14-day activity, resource peaks, per-GPU performance, tool reliability, recent runs |
 | Chat | Deployment form, single or compare chat, live system and server telemetry |
 | Run history | Searchable runs; each opens to its prompt, output, token accounting, timings, placement and raw samples |
-| Analytics | Breakdown by `task_label` category and model; coding reasoning performance (native effort, thinking tokens, tool-call validity) |
+| Analytics | Breakdown by `task_label` category and model (runs, success, input/output tokens, speeds, latency, VRAM); coding reasoning performance (native effort, thinking tokens, tool-call validity) |
 | Projects | Project registry, usage by project, coding-agent activity |
 | Training | Training runs, comparison, DDP scaling, evaluation queue, benchmarks, memory forecast, measured profiles |
-| Hardware | Live per-GPU readings, lease holders, sampler health |
+| Hardware | Live per-GPU readings, lease holders, sampler health. Windows (AMD ADL): busy %, edge / junction / memory temperature, board power, clocks, fan, VRAM, shared memory and the PCIe link. Linux reads amdgpu sysfs. Throttle status, AMD SMI and the kernel-fault follower are Linux only and show as unavailable on Windows |
 | Service | Process info, restart, stop, loaded models, unload, settings (see 5.10) |
 | Setup wizard | Creates a project and the connection settings for Cline and OpenCode |
 
@@ -333,7 +334,7 @@ The **Service** page, and the matching endpoints, cover everything that used to 
 | **Stop service** | Stops every model and then the service. Start it again with `py launch_service.py`. |
 | **Unload** (per GPU, or everything) | Frees GPU memory. A model that is answering gets up to `drain_timeout_seconds` (30 s) to finish. |
 | **Stop now** | Appears while an unload is waiting. Ends the wait and stops the model at once, cutting the answer. |
-| **Orphans** | A llama-server on a lane port that this service does not manage (for example left by an instance that was killed) is listed in `/api/status` and in a banner, and **Stop them** removes it. It holds VRAM and RAM until stopped. A load stops it automatically. |
+| **Orphans** | A llama-server on a lane port that this service does not manage (for example left by an instance that was killed) is listed in `/api/status` and in a banner, and **Stop them** removes it. It holds VRAM and RAM until stopped. A load stops it automatically. Nothing is reported while a load, swap or unload is running (`transitioning` in `/api/status`), because the service's own server is then starting or draining and is not a leftover. |
 | **Settings** | Edits `load_mode`, `cache_ram_mib`, `vram_admission`, `vram_headroom_gb`, `auto_load_models`, `residency_guard`, `residency_check_seconds`, `drain_timeout_seconds` and `kill_busy_ports`. Values are validated, applied to the running service and saved into the TOML with its comments kept (a `.bak` copy of the original is made once). Each setting says whether it applies **now** or on the **next model load**. |
 
 The restart, stop and settings endpoints require `Content-Type: application/json`.
@@ -381,7 +382,8 @@ Full design and status: [docs/TRAINING_TELEMETRY.md](docs/TRAINING_TELEMETRY.md)
 |---|---|
 | Tracker client | `TrainingTracker` (standard library only) and a Hugging Face `Trainer` callback stream loss, learning rate, gradient norm, token counts, step time, GPU phase timing and memory. Metrics are per window, never per micro-batch, and the client never blocks or fails training (spool to disk and replay if the dashboard is down). |
 | Run reliability | `stalled` is judged on step progress, rank loss in DDP is detected, a checkpoint counts only once its manifest is committed, and a resume continuity report checks optimizer, scheduler and RNG state. |
-| Hardware telemetry | A 1 Hz sampler reports utilization, VRAM, temperatures, power, clocks and PCIe link; sensors that cannot be read are `null`, never `0`; amdgpu resets and page faults are captured from the kernel log. |
+| Hardware telemetry | A 1 Hz sampler reports utilization, VRAM/GTT, temperatures, power, clocks, PCIe link and AMD SMI throttle status; sensor source and unavailable reasons are persisted, and missing values are `null`, never `0`; amdgpu resets and page faults are captured from the kernel log. |
+| Reproducibility | Every run has top-level host OS attribution even when tracker-side environment capture is disabled. Full snapshots distinguish the training-process OS from the dashboard host and include kernel, ROCm component versions, amdgpu, PyTorch/HIP, relevant ROCm environment variables and physical GPU mapping. |
 | Evaluation pipeline | Checkpoints queue for evaluation on a spare lane (native, GGUF F16 and quantized GGUF), best checkpoint is chosen on the deployed score, regressions are flagged. Needs `[evaluation]` configured. |
 | Experiments | Equal-token-budget comparison with seed-noise gating, benchmark sweeps (batch, context, LoRA, checkpointing, precision) that only recommend, a memory forecast, energy per million tokens, MFU estimate, DDP straggler and scaling analysis. |
 | Privacy | Free-form payloads are scrubbed (content-bearing keys dropped, long strings truncated, e-mail and phone-like text redacted) before storage. |
@@ -416,9 +418,10 @@ listed in `summary.json`.
 `{model_size_gb}`, `{suite_id}`, `{run_dir}`, `{actual_ctx}`, `{lane_key}`, `{lane_display}`, `{backend}`,
 `{device}`, `{host}`, `{port}`, `{project_name}`, `{config_dir}`) and the environment variables
 `DGPU_SUITE_ID`, `DGPU_BASE_URL`, `DGPU_MODEL_NAME`, `DGPU_LANE_KEY`, `DGPU_LANE_DISPLAY`, `DGPU_BACKEND`,
-`DGPU_DEVICE`, `DGPU_ACTUAL_CTX`, `DGPU_RUN_DIR`.
+`DGPU_DEVICE`, `DGPU_ACTUAL_CTX`, `DGPU_RUN_DIR`, `DGPU_HOST_OS`, `DGPU_HOST_OS_JSON`.
 
 **Output** under `log_dir`: `summary.json`, `server_logs/`, one folder per model with `load.json` and task logs.
+The summary and every plain-text launch/task log include host OS metadata.
 
 ## 6. HTTP API map
 
@@ -440,7 +443,9 @@ not JSON where required, `500`, `501` not available, `503` cannot serve now (ret
 
 ## 7. Configuration reference
 
-One TOML file, passed with `--config` (default `example.dual_gpu.toml`). Unknown keys are ignored.
+One TOML file, passed with `--config` (default `example.dual_gpu.ubuntu.toml` on Linux and
+`example.dual_gpu.toml` on Windows). Unknown keys are ignored. Relative discovery paths are resolved
+from the config file's directory, and `~`/environment variables are expanded.
 
 **`[project]`**
 
@@ -502,12 +507,12 @@ internal `--replace-pid` is used by the restart.
 
 | File | Contents |
 |---|---|
-| `<data-dir>/chatbot.sqlite3` | Runs, deployments, resource samples, projects, sessions, coding tasks, tool events, clients |
+| `<data-dir>/chatbot.sqlite3` | Runs (including host OS), deployments, resource samples, projects, sessions, coding tasks, tool events, clients |
 | `<data-dir>/chat_history.sqlite3` | Full conversations (only if `store_chat_history`) |
 | `<data-dir>/project_usage.sqlite3` | Daily usage per project |
 | `<data-dir>/training.sqlite3` | Training runs, steps, checkpoints, hardware samples, evaluation queue, leases, benchmarks |
-| `<data-dir>/deployments/<time>/server_logs/*.log` | Each `llama-server`'s output, with its exact command line at the top of each launch |
-| `<data-dir>/launcher.log` | Output of the background service and of restarts |
+| `<data-dir>/deployments/<time>/server_logs/*.log` | Each `llama-server`'s output, with its exact command line and host OS at the top of each launch |
+| `<data-dir>/launcher.log` | Output of the background service and of restarts, with host OS in each launch header |
 | `<data-dir>/restart_state.json` | Present only between a restart with "reload models" and the new process starting |
 | `<data-dir>/artifacts/` | Training artifacts |
 | `<config>.bak` | A copy of the config, made once, before the first settings save |
@@ -611,7 +616,8 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
 **Scope limits**
 
 - Exactly **two lanes**.
-- **Windows-first.** Linux code exists and is unverified.
+- **Ubuntu/Linux hardware is unverified.** The code path and fake `/proc`/DRM tests exist, but the
+  reference two-GPU machine is Windows.
 - **One machine**, one service.
 - The deployment APIs keep **one deployment at a time**. A whole-deployment call replaces everything;
   `deploy_lane` and the gateway's on-demand loading manage lanes individually.
@@ -638,7 +644,12 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
    empty), so the app uses the operating system's accounting instead. Anything else that reads the HIP figure
    will be misled.
 6. **Vulkan** is configured as a backend but has not been benchmarked or verified here.
-7. **No parameter places the KV cache in RAM or sets its precision.** A deploy request accepts
+7. **Windows GPU sensor ids are inferred, not documented.** Temperatures, power, clocks and fan come from AMD's
+   ADL library, whose sensor numbering was identified on the R9700 and 9070 XT by behaviour (edge matched Task
+   Manager; junction reacted in about a second; memory reacted over tens of seconds; board power sat at each
+   card's rated draw). A different GPU generation or driver may map differently. Two identical cards cannot be
+   told apart by name, so their VRAM would show as unavailable.
+8. **No parameter places the KV cache in RAM or sets its precision.** A deploy request accepts
    `context_window`, `input_tokens`, `max_output_tokens`, the reasoning fields and `tensor_split`, but nothing
    about the cache. An operator can add the flags in section 9 to a model's `extra_args`, but the capacity check
    still counts the cache at 16-bit size in VRAM, so a context that only fits with the cache in RAM or
@@ -663,7 +674,7 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
 
 ## 13. Testing and verification status
 
-- **378 automated tests** (`py -m pytest`) pass, 1 skipped (a DDP numerical check that needs `torch`). They
+- **390 automated tests** (`py -m pytest`) pass, 1 skipped (a DDP numerical check that needs `torch`). They
   cover the GGUF reader, KV estimator, config, run store, capacity checks, runtime and flag selection,
   the model manager (placement, eviction, admission, orphans, unload, Stop now, release), service control,
   settings saving, the gateway, leases and the training layer.
@@ -691,6 +702,16 @@ py app.py --check
 
 # Tests
 py -m pytest
+```
+
+Ubuntu equivalents use the edited Linux config and native llama.cpp binary:
+
+```bash
+python3 launch_service.py --config ./dual_gpu.toml
+python3 app.py --config ./dual_gpu.toml --check
+dual-gpu --config ./dual_gpu.toml inspect
+dual-gpu --config ./dual_gpu.toml plan
+python3 -m pytest
 ```
 
 | I want to | Do this |

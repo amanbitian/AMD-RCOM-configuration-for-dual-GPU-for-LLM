@@ -19,8 +19,9 @@ because if the service is down there's nothing listening to receive that request
 codebase wants to trigger the service on demand rather than assuming a human already started
 it, run [launch_service.py](launch_service.py) as a command before calling anything else:
 
-```
-python launch_service.py --config F:/Projects/Dual_gpu_setup/example.dual_gpu.toml
+```bash
+# Windows or Ubuntu; omitting --config selects the OS-specific example.
+python launch_service.py --config /path/to/dual_gpu.toml
 ```
 
 This is a one-shot command, not an always-on daemon: it checks whether the service is already
@@ -34,10 +35,13 @@ or `POST /api/service/restart` (see [API_CONTRACT.md](API_CONTRACT.md#service-co
 
 ```python
 # from any Python client, before using the API below
-import subprocess, sys, json
+import json, subprocess, sys
+from pathlib import Path
+
+repo = Path("/path/to/Dual_gpu_setup")
+config = Path("/path/to/dual_gpu.toml")
 result = subprocess.run(
-    [sys.executable, "F:/Projects/Dual_gpu_setup/launch_service.py",
-     "--config", "F:/Projects/Dual_gpu_setup/example.dual_gpu.toml"],
+    [sys.executable, str(repo / "launch_service.py"), "--config", str(config)],
     capture_output=True, text=True, check=True,
 )
 base_url = json.loads(result.stdout)["base_url"]  # e.g. http://127.0.0.1:8090
@@ -57,7 +61,8 @@ POST /api/clients/register
 `output_path` is a file path in *your* repo. Every run you attribute to this
 client (step 3) gets appended there as one JSON line — so your codebase ends up
 with its own durable copy of the performance data, independent of this repo's
-own SQLite store.
+own SQLite store. Use a path valid on the machine running Dual GPU Studio (for
+example `/srv/my-project/metrics/dual_gpu_runs.jsonl` on Ubuntu).
 
 Response:
 ```
@@ -311,7 +316,9 @@ The response is unchanged from today's `/api/chat` (per-target `usage`, `timing`
 
 confirming whether the JSON line was appended to your `output_path`. A write
 failure there (e.g. bad path) never fails the chat call itself — you still get
-the metrics in the response either way.
+the metrics in the response either way. Each delivered JSONL record also has a
+`host_os` object (`system`, `release`, `version`, `machine`, plus Linux distribution
+fields when available), so results from Windows and Ubuntu hosts remain distinguishable.
 
 ## 4. What data you get
 
@@ -323,7 +330,8 @@ the metrics in the response either way.
 | usage | `cached_input_tokens` | Prompt tokens served from KV cache reuse |
 | usage | `uncached_input_tokens` | `input_tokens - cached_input_tokens` |
 | usage | `prefill_tokens` | Tokens processed during prefill |
-| usage | `thinking_tokens` | Reasoning tokens, if any |
+| usage | `thinking_tokens` | Exact reasoning tokens from the backend; `null` when it reports none (llama.cpp never does) |
+| usage | `thinking_tokens_estimated` | ~4 chars/token estimate, set only when reasoning text was seen but no exact count came back |
 | usage | `visible_output_tokens` | `output_tokens - thinking_tokens` |
 | usage | `output_tokens` | Total completion tokens |
 | usage | `total_tokens` | `input_tokens + output_tokens` |
@@ -340,6 +348,9 @@ the metrics in the response either way.
 | resources | `process_page_fault_delta` | Page faults incurred by the model process during this run |
 | resources | `peak_system_ram_used_bytes` / `peak_system_pagefile_used_bytes` | Whole-system RAM / commit-charge pressure during the run |
 
+OS attribution is stored beside these groups as top-level `host_os`; it is returned
+with run-history rows and written to registered client JSONL files.
+
 ## 5. Fetch your own run history any time
 
 ```
@@ -354,7 +365,7 @@ writing a local copy.
 
 Once some runs carry a `task_label`, open the dashboard's **Analytics** tab (a nav item
 alongside Overview / Chat / Run history). Two dropdowns — Category and Model — filter a
-breakdown table (runs, success rate, decode tok/s, prefill tok/s, avg latency, peak VRAM) so
+breakdown table (runs, success rate, input/output tokens, decode tok/s, prefill tok/s, avg latency, peak VRAM) so
 you can compare, say, `resume_extraction` on the 4B model against the 26B model side by side,
 exactly like a hand-built benchmark table but always current. The same data is available
 programmatically as `categories`/`category_models` in `/api/dashboard` — see
