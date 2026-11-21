@@ -296,6 +296,15 @@ def test_restore_reloads_a_fresh_saved_deployment_once(tmp_path):
     assert not control.restore_path.exists() and control.restore_after_restart() is False
 
 
+def test_ordinary_start_discards_restore_without_loading_models(tmp_path):
+    control, state = _control(tmp_path)
+    control.restore_path.write_text(json.dumps({"created": time.time(), "profile": PROFILE}), encoding="utf-8")
+
+    assert control.restore_after_restart(allowed=False) is False
+    time.sleep(0.1)
+    assert state.manager.deployed == [] and not control.restore_path.exists()
+
+
 def test_a_profile_from_an_on_demand_load_is_made_deployable_before_the_reload(tmp_path):
     """On-demand loads record `models` even for one GPU; deploy() wants `model` there."""
     control, state = _control(tmp_path)
@@ -437,6 +446,62 @@ def test_launcher_stays_silent_for_programs(monkeypatch, capsys):
     monkeypatch.setattr(launch_service, "_probe", lambda base_url, timeout=2.0: {"state": "idle"})
     monkeypatch.setattr(sys, "argv", ["launch_service.py"])
     assert launch_service.main() == 0 and opened == []
+
+
+def test_launcher_requires_explicit_start_when_service_is_down(monkeypatch, capsys):
+    monkeypatch.setattr(launch_service, "_probe", lambda base_url, timeout=2.0: None)
+    monkeypatch.setattr(
+        launch_service.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("launcher must not spawn without --start"),
+    )
+    monkeypatch.setattr(sys, "argv", ["launch_service.py"])
+
+    assert launch_service.main() == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["started"] is False
+    assert result["start_blocked"] is True
+    assert "--start" in result["error"]
+
+
+def test_launcher_starts_only_with_explicit_flag(monkeypatch, capsys, tmp_path):
+    probes = iter([None, {"state": "idle"}])
+    monkeypatch.setattr(launch_service, "_probe", lambda base_url, timeout=2.0: next(probes))
+    monkeypatch.setattr(launch_service, "interactive", lambda: False)
+    monkeypatch.setattr(launch_service, "detached_process_kwargs", lambda: {})
+    spawned = []
+
+    class Process:
+        pid = 4242
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(
+        launch_service.subprocess,
+        "Popen",
+        lambda command, **kwargs: spawned.append(command) or Process(),
+    )
+    config = tmp_path / "config.toml"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch_service.py",
+            "--start",
+            "--config",
+            str(config),
+            "--data-dir",
+            "runs",
+            "--no-browser",
+        ],
+    )
+
+    assert launch_service.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["started"] is True and result["pid"] == 4242
+    assert spawned and "--start" not in spawned[0]
 
 
 # --- dashboard script --------------------------------------------------------------------------------

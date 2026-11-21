@@ -608,3 +608,35 @@ These are cheap to store now and valuable later:
 - The current state of LoRA → GGUF conversion for the chosen base model (run the converter smoke test).
 - Release-note claims about RDNA4 training stability, checked against the exact installed ROCm version.
 - Whether the training project uses HF `Trainer`/TRL or a custom loop; this decides whether the callback or the manual API is the primary integration.
+
+## Using one dashboard history across Windows and Ubuntu (merge by run id)
+
+Each install keeps its own local `training.sqlite3`. Do **not** share one live SQLite file between operating systems
+(NTFS from Linux, WAL side files and Windows Fast Startup are a classic way to corrupt it). Instead, merge: run ids are
+random UUIDs, so databases from different installs combine losslessly.
+
+```bash
+# see what would be imported (nothing is written, not even a schema upgrade)
+python -m dual_gpu_setup.training.merge --dest ~/dual-gpu-data/chat_runs/training.sqlite3 \
+       --from /mnt/windows/Projects/Dual_gpu_setup/chat_runs/training.sqlite3 --dry-run
+# import (repeatable --from); or do it automatically at every start:
+python app.py --config dual_gpu.toml --import-from /path/to/other/training.sqlite3
+```
+
+Guarantees (each covered by `tests/test_training_merge.py`):
+
+* the other database is opened **read-only** and never modified; a run id that already exists locally is never
+  overwritten, so merging is idempotent and safe to repeat or to pass on every start;
+* each run is copied with its steps, events, checkpoints, ranks, notes and evals in **one transaction** (all or nothing);
+* `hardware_samples` / `system_samples` have no run id, so the samples inside each imported run's time window are copied,
+  skipping any `(pci_bus, ts)` already present; unavailable sensors stay `NULL`, never 0;
+* leases, queued eval jobs and counters are machine-local live state and are not copied; hardware profiles and
+  benchmarks are merged with `INSERT OR IGNORE`.
+
+Limits: file paths stored in old rows (checkpoint/artifact paths, configs) are kept verbatim, so an `F:\...` path from a
+Windows run will not resolve on Linux (its numbers and charts are unaffected; its artifact downloads will not work).
+Timestamps are epoch seconds, so both installs need correct clocks for a combined timeline. To get the other OS's data
+across, copy a consistent snapshot rather than the live file:
+`python -c "import sqlite3;s=sqlite3.connect('chat_runs/training.sqlite3');d=sqlite3.connect('snapshot.sqlite3');s.backup(d);d.close()"`.
+When the other install's drive is mounted read-only the merge falls back to an immutable read and warns that data still
+sitting in its `-wal` file was not seen.

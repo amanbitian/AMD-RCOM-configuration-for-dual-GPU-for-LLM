@@ -222,6 +222,48 @@ def map_torch_devices(torch_devices: list[dict[str, Any]], gpus: list[GpuDevice]
     return mapping
 
 
+def _speed_gts(text: str | None) -> float | None:
+    """'32.0 GT/s PCIe' -> 32.0"""
+    try:
+        return float((text or "").split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def pcie_link_chain(device: Path) -> list[Path]:
+    """The GPU's PCI device plus every PCI ancestor up to the root port. A Radeon card's own
+    `current_link_width` is the link inside its on-board switch (x16); the link that matters for
+    bandwidth is the narrowest one on the way to the CPU, usually the root port's slot link."""
+    chain = [device]
+    try:
+        parent = device.resolve().parent
+    except OSError:
+        return chain
+    while _PCI_RE.match(parent.name):
+        chain.append(parent)
+        parent = parent.parent
+    return chain
+
+
+def pcie_slot_link(device: Path) -> dict[str, Any]:
+    """Effective (narrowest) current link and the best that same path could negotiate."""
+    widths, speeds, max_widths, max_speeds = [], [], [], []
+    for node in pcie_link_chain(device):
+        w, s_, mw, ms = (_read(node / n) for n in ("current_link_width", "current_link_speed", "max_link_width", "max_link_speed"))
+        if w and w.isdigit():
+            widths.append(int(w))
+        if mw and mw.isdigit():
+            max_widths.append(int(mw))
+        if _speed_gts(s_) is not None:
+            speeds.append((_speed_gts(s_), s_))
+        if _speed_gts(ms) is not None:
+            max_speeds.append((_speed_gts(ms), ms))
+    return {
+        "width": min(widths) if widths else None, "max_width": min(max_widths) if max_widths else None,
+        "speed": min(speeds)[1] if speeds else None, "max_speed": min(max_speeds)[1] if max_speeds else None,
+    }
+
+
 def sample_gpu(gpu: GpuDevice, now: float | None = None) -> dict[str, Any]:
     if gpu.reader is not None:
         sample: dict[str, Any] = {"ts": time.time() if now is None else now, "pci_bus": gpu.pci_bus,
@@ -266,11 +308,15 @@ def sample_gpu(gpu: GpuDevice, now: float | None = None) -> dict[str, Any]:
     sample["sclk_mhz"] = value("sclk_mhz", None if sclk is None else sclk / 1_000_000.0, "hwmon freq1_input not exposed")
     sample["mclk_mhz"] = value("mclk_mhz", None if mclk is None else mclk / 1_000_000.0, "hwmon freq2_input not exposed")
     sample["fan_rpm"] = value("fan_rpm", _read_int(gpu.hwmon_path / "fan1_input") if gpu.hwmon_path else None, "hwmon fan1_input not exposed")
-    sample["pcie_speed"] = value("pcie_speed", _read(device / "current_link_speed"), "current_link_speed not exposed")
-    width = _read(device / "current_link_width")
-    sample["pcie_width"] = value("pcie_width", int(width) if width and width.isdigit() else None, "current_link_width not exposed")
-    sample["pcie_max_speed"] = _read(device / "max_link_speed")
-    sample["pcie_max_width"] = _read(device / "max_link_width")
+    link = pcie_slot_link(device)
+    device_width = _read(device / "current_link_width")
+    sample["pcie_device_width"] = int(device_width) if device_width and device_width.isdigit() else None
+    sample["pcie_speed"] = value("pcie_speed", link["speed"], "current_link_speed not exposed")
+    sample["pcie_width"] = value("pcie_width", link["width"], "current_link_width not exposed")
+    sample["pcie_slot_speed"], sample["pcie_slot_width"] = link["speed"], link["width"]
+    sample["pcie_slot_max_width"] = link["max_width"]
+    sample["pcie_max_speed"] = link["max_speed"]
+    sample["pcie_max_width"] = link["max_width"]
     sample["unavailable"] = unavailable
     return sample
 
@@ -367,9 +413,11 @@ class HardwareSampler:
                              "vbios_version": None, "driver_version": link.get("driver_version")})
                 continue
             device = gpu.device_path
-            gpus.append({**gpu.identity(), "pcie_speed": _read(device / "current_link_speed"),
-                         "pcie_width": _read(device / "current_link_width"), "pcie_max_speed": _read(device / "max_link_speed"),
-                         "pcie_max_width": _read(device / "max_link_width"), "vbios_version": _read(device / "vbios_version")})
+            link = pcie_slot_link(device)
+            gpus.append({**gpu.identity(), "pcie_speed": link["speed"],
+                         "pcie_width": None if link["width"] is None else str(link["width"]), "pcie_max_speed": link["max_speed"],
+                         "pcie_max_width": None if link["max_width"] is None else str(link["max_width"]),
+                         "pcie_device_width": _read(device / "current_link_width"), "vbios_version": _read(device / "vbios_version")})
         rocm = rocm_installation()
         windows_driver = next((g["driver_version"] for g in gpus if g.get("driver_version")), None)
         return {"gpus": gpus, "os": os_info(), "kernel": stdlib_platform.release(),

@@ -122,6 +122,68 @@ CREATE TABLE IF NOT EXISTS system_samples (
     ram_used_pct REAL,
     swap_used_bytes INTEGER
 );
+CREATE TABLE IF NOT EXISTS training_eval_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES training_runs(id) ON DELETE CASCADE,
+    step INTEGER NOT NULL,
+    ts REAL,
+    source TEXT NOT NULL DEFAULT 'tracker',
+    metrics_json TEXT NOT NULL,
+    UNIQUE(run_id, step, source)
+);
+CREATE TABLE IF NOT EXISTS host_samples (
+    ts REAL NOT NULL,
+    host_os TEXT NOT NULL DEFAULT '',
+    cpu_pct REAL,
+    cpu_temp_c REAL,
+    cpu_power_w REAL,
+    ram_used_pct REAL,
+    swap_used_bytes INTEGER,
+    mem_pressure_pct REAL,
+    ram_temp_c REAL,
+    ssd_temp_c REAL,
+    coolant_temp_c REAL,
+    pump_rpm REAL,
+    cpu_fan_rpm REAL,
+    case_fan_rpm REAL,
+    disk_free_bytes INTEGER,
+    gpu_power_w REAL,
+    est_system_power_w REAL,
+    model TEXT,
+    lanes_json TEXT,
+    context_json TEXT,
+    unavailable_json TEXT,
+    PRIMARY KEY (host_os, ts)
+);
+CREATE TABLE IF NOT EXISTS hardware_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'warning',
+    scope TEXT NOT NULL DEFAULT 'gpu',
+    pci_bus TEXT,
+    lane TEXT,
+    metric TEXT,
+    threshold REAL,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    last_seen_at REAL,
+    peak_value REAL,
+    last_value REAL,
+    samples INTEGER NOT NULL DEFAULT 1,
+    host_os TEXT NOT NULL DEFAULT '',
+    context_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hardware_alerts_time ON hardware_alerts(started_at);
+CREATE TABLE IF NOT EXISTS hardware_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info',
+    lane TEXT,
+    host_os TEXT NOT NULL DEFAULT '',
+    payload_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hardware_events_ts ON hardware_events(ts);
 CREATE TABLE IF NOT EXISTS training_rank_steps (
     run_id TEXT NOT NULL REFERENCES training_runs(id) ON DELETE CASCADE,
     step INTEGER NOT NULL,
@@ -235,6 +297,13 @@ ADDITIONS = {
         "throttle_status": "INTEGER",
         "telemetry_sources_json": "TEXT",
         "unavailable_json": "TEXT",
+        # context stored with every sample so a combined Windows + Linux history is self-describing
+        "host_os": "TEXT",
+        "model": "TEXT",
+        "context_json": "TEXT",
+        "pcie_device_width": "INTEGER",
+        "pcie_slot_speed": "TEXT",
+        "pcie_slot_width": "INTEGER",
     },
 }
 
@@ -246,6 +315,7 @@ HARDWARE_FIELDS = (
     "pcie_speed", "pcie_width",
 )
 HARDWARE_EXTRA_FIELDS = ("throttle_status", "telemetry_sources_json", "unavailable_json")
+HARDWARE_CONTEXT_FIELDS = ("host_os", "model", "context_json", "pcie_device_width", "pcie_slot_speed", "pcie_slot_width")
 STEP_NUMERIC = ("loss", "lr", "grad_norm", "step_time_ms", "excluded_ms", "data_wait_ms", "fwd_ms", "bwd_ms", "opt_ms", "comm_ms")
 STEP_INT = (
     "processed_tokens", "nonpad_tokens", "supervised_tokens", "mem_alloc_bytes",
@@ -539,13 +609,16 @@ class TrainingStore(Database):
                 raise TrainingError("Training run not found.", 404)
             return self._present(row, connection, include_blobs=True)
 
-    def list_runs(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    def list_runs(self, limit: int = 100, offset: int = 0, host_os: str | None = None) -> dict[str, Any]:
+        """Newest first. `host_os` ("Windows" / "Linux") keeps runs recorded on that OS."""
         limit = max(1, min(int(limit), 500))
+        where, args = ("", []) if not host_os else (
+            " WHERE json_valid(host_os_json) AND json_extract(host_os_json, '$.system') = ?", [host_os])
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM training_runs ORDER BY started_at DESC LIMIT ? OFFSET ?", (limit, max(0, int(offset)))
-            ).fetchall()
-            total = connection.execute("SELECT COUNT(*) FROM training_runs").fetchone()[0]
+                f"SELECT * FROM training_runs{where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                (*args, limit, max(0, int(offset)))).fetchall()
+            total = connection.execute(f"SELECT COUNT(*) FROM training_runs{where}", args).fetchone()[0]
             return {"runs": [self._present(r, connection, include_blobs=False) for r in rows], "total": total}
 
     def find_runs(self, tag_key: str, tag_value: Any) -> list[str]:
@@ -692,6 +765,18 @@ class TrainingStore(Database):
             )
         self._active_cache = (0.0, False)
         return self.get_run(run_id)
+
+    def live_runs(self) -> list[dict[str, Any]]:
+        """Runs whose trainer is still heartbeating, with the lanes they occupy. Used to decide which
+        GPUs are in use for the hardware log (a run that holds no lease still counts)."""
+        now = self.clock()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, lanes_json, last_heartbeat_at, started_at FROM training_runs WHERE status = ?",
+                (STATUS_RUNNING,),
+            ).fetchall()
+        return [{"id": r["id"], "name": r["name"], "lanes": _load(r["lanes_json"]) or []}
+                for r in rows if now - (r["last_heartbeat_at"] or r["started_at"]) <= self.heartbeat_lost_s]
 
     def add_event_to_active_runs(self, kind: str, severity: str, payload: dict[str, Any]) -> int:
         """Attach a host-level event (e.g. an amdgpu fault from the kernel log) to every live run."""
@@ -950,11 +1035,14 @@ class TrainingStore(Database):
         rows = [(
             s["ts"], s["pci_bus"], s.get("lane"), *(s.get(field) for field in HARDWARE_FIELDS),
             _int(s.get("throttle_status")), _dump(s.get("amd_smi_fields")), _dump(s.get("unavailable")),
+            s.get("host_os"), s.get("model"), _dump(s.get("context")), _int(s.get("pcie_device_width")),
+            s.get("pcie_slot_speed"), _int(s.get("pcie_slot_width")),
         ) for s in samples]
-        columns = ", ".join(("ts", "pci_bus", "lane") + HARDWARE_FIELDS + HARDWARE_EXTRA_FIELDS)
+        columns = ", ".join(("ts", "pci_bus", "lane") + HARDWARE_FIELDS + HARDWARE_EXTRA_FIELDS + HARDWARE_CONTEXT_FIELDS)
         with self.connect() as connection:
             connection.executemany(
-                f"INSERT INTO hardware_samples ({columns}) VALUES ({placeholders(3 + len(HARDWARE_FIELDS) + len(HARDWARE_EXTRA_FIELDS))})", rows)
+                f"INSERT INTO hardware_samples ({columns}) VALUES "
+                f"({placeholders(3 + len(HARDWARE_FIELDS) + len(HARDWARE_EXTRA_FIELDS) + len(HARDWARE_CONTEXT_FIELDS))})", rows)
         return len(rows)
 
     def add_system_sample(self, ts: float, cpu_pct: float | None, ram_used_pct: float | None,
@@ -964,10 +1052,10 @@ class TrainingStore(Database):
                                " VALUES (?,?,?,?)", (ts, cpu_pct, ram_used_pct, swap_used_bytes))
 
     def prune_hardware(self, older_than_days: float) -> int:
-        cutoff = self.clock() - older_than_days * 86400
-        with self.connect() as connection:
-            connection.execute("DELETE FROM system_samples WHERE ts < ?", (cutoff,))
-            return connection.execute("DELETE FROM hardware_samples WHERE ts < ?", (cutoff,)).rowcount
+        """Deliberately a no-op. Hardware and system samples are history and are never deleted;
+        `archive.HardwareArchive` writes compressed daily copies instead. Kept so older callers
+        keep working."""
+        return 0
 
     def run_window(self, run_id: str) -> tuple[float, float]:
         row = self._row(run_id)

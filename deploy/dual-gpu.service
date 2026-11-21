@@ -1,0 +1,42 @@
+# Dual-GPU Studio as a systemd *user* service (no root needed; sees the GPUs through your video/render groups).
+#
+#   Easiest:  scripts/install_linux_service.sh --enable      (fills in the paths below for you)
+#   Sharing history with the Windows install (--exchange-dir): add that folder to ReadWritePaths= below.
+#
+#   mkdir -p ~/.config/systemd/user ~/dual-gpu-data
+#   cp deploy/dual-gpu.service ~/.config/systemd/user/
+#   $EDITOR ~/.config/systemd/user/dual-gpu.service        # set WorkingDirectory / paths below
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dual-gpu.service
+#   loginctl enable-linger "$USER"                         # keep it running without an open login session
+#   journalctl --user -u dual-gpu.service -f
+#
+# For a system-wide unit instead: copy to /etc/systemd/system/, add `User=` / `Group=` (member of video, render, and
+# adm or systemd-journal for kernel-fault telemetry), and change WantedBy to multi-user.target.
+[Unit]
+Description=Dual-GPU Studio (llama-server lanes, training telemetry, GPU leases)
+Documentation=file://%h/Dual_gpu_setup/docs/LINUX_SERVICE.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Dual_gpu_setup
+# Binds 127.0.0.1:8090 by default. Do NOT add --host 0.0.0.0 / --lan unless you accept an unauthenticated API on the LAN.
+ExecStart=%h/Dual_gpu_setup/.venv/bin/python app.py --config %h/Dual_gpu_setup/dual_gpu.toml --host 127.0.0.1 --port 8090 --data-dir %h/dual-gpu-data/chat_runs --no-browser
+Restart=on-failure
+RestartSec=5
+# Graceful shutdown: app.py handles SIGTERM (stops serving, stops its llama-server children, flushes the SQLite
+# stores); SIGKILL only after the timeout. Training leases are owned by the training process, which releases its own.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60
+Environment=PYTHONUNBUFFERED=1
+# Hardening that does not interfere with /dev/kfd and /dev/dri access:
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+# ...but the service must write its database, logs and run artifacts here (and the llama.cpp/model dirs are read-only):
+ReadWritePaths=%h/dual-gpu-data %h/Dual_gpu_setup/runs
+
+[Install]
+WantedBy=default.target

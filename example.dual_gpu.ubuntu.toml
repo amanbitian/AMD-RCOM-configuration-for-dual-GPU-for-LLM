@@ -5,6 +5,8 @@ log_dir = "./runs"
 host = "127.0.0.1"
 cleanup_ports_on_start = true
 start_timeout_seconds = 900
+# Full per-model API input/output and telemetry archive (asynchronous, separate SQLite database).
+store_chat_history = true
 
 [discovery]
 # Build llama.cpp with the ROCm backend and make this file executable (chmod +x).
@@ -40,24 +42,31 @@ auto_load_models = true
 # Linux does not page dedicated VRAM out in the Windows-specific way this guard handles.
 residency_guard = false
 
+# Lane keys MUST be exactly "r9700" and "9070xt": the SLM trainer (SLM_training, `dgpu.rank_lanes`) addresses GPUs by
+# these keys, and rank 0 (evals + checkpoints) is the 32 GB R9700.  A CI test in both repositories enforces this.
+#
+# PCI bus is the PRIMARY identity: a lane with `pci_bus` is matched only by that address; `match` (marketing name)
+# and `vram_gb` are fallbacks for lanes WITHOUT a pci_bus.  Fill in the real addresses of this machine:
+#     python scripts/detect_linux_lanes.py          # prints these stanzas with the detected pci_bus values
+# then uncomment / paste the pci_bus lines.  (`lspci -nn | grep -i 'AMD/ATI'` shows the same addresses.)
 [[lanes]]
-key = "gpu0"
-display = "Primary AMD GPU"
-# Match a unique substring printed by: llama-server --list-devices
+key = "r9700"
+display = "AMD Radeon AI PRO R9700"
+# Match a unique substring printed by: llama-server --list-devices   (fallback only)
 match = "R9700"
 vram_gb = 32
 port = 8081
 backend = "rocm"
-# pci_bus = "0000:03:00.0"
+# pci_bus = "0000:03:00.0"   # <- REQUIRED for certification: set to the detected Linux PCI bus
 
 [[lanes]]
-key = "gpu1"
-display = "Secondary AMD GPU"
+key = "9070xt"
+display = "AMD Radeon RX 9070 XT"
 match = "9070 XT"
 vram_gb = 16
 port = 8082
 backend = "rocm"
-# pci_bus = "0000:0b:00.0"
+# pci_bus = "0000:0b:00.0"   # <- REQUIRED for certification: set to the detected Linux PCI bus
 
 [[models]]
 name = "example-small-model"

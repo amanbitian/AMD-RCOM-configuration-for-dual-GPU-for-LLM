@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 import socket
 import subprocess
 import time
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
+from typing import Any, ClassVar
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -110,8 +112,24 @@ def placement_error(dedicated_gb: float, model_bytes: int, device: str) -> str |
     )
 
 
+_ROCM_DEVICE = re.compile(r"^ROCm(\d+)$")
+
+
+def isolated_device(config: AppConfig, backend: str, device: str) -> tuple[str, dict[str, str]]:
+    """With policy `isolate_single_lane`, a ROCm lane server gets only its own GPU: HIP_VISIBLE_DEVICES=<n> makes
+    the process unable to see (and so wake) the other card, and the device it is told to use becomes ROCm0, the
+    first and only visible one. Returns (device, extra environment); unchanged when off or not a ROCm device."""
+    match = _ROCM_DEVICE.match(device or "")
+    if not getattr(config.policy, "isolate_single_lane", False) or backend != "rocm" or not match:
+        return device, {}
+    return "ROCm0", {"HIP_VISIBLE_DEVICES": match.group(1)}
+
+
 @dataclass(slots=True)
 class LlamaServerProcess:
+    # Set by the service: remembers which servers it started. None = legacy behaviour (any llama-server on a
+    # lane port may be stopped), which is what unit tests and library use get.
+    registry: ClassVar[Any] = None
     config: AppConfig
     backend: str
     device: str
@@ -123,6 +141,8 @@ class LlamaServerProcess:
     host: str = "127.0.0.1"
     tensor_split: str = ""
     lane_extra_args: list[str] | None = None
+    # extra environment for the server process, e.g. HIP_VISIBLE_DEVICES when the other GPU is hidden from it
+    extra_env: dict[str, str] | None = None
     proc: subprocess.Popen | None = None
     log_path: Path | None = None
     _log_handle: object | None = None
@@ -148,16 +168,19 @@ class LlamaServerProcess:
         ctx_size: int,
         run_dir: Path,
     ) -> "LlamaServerProcess":
+        device = resolve_device(config, lane)
+        device, extra_env = isolated_device(config, lane.backend, device)
         return cls(
             config=config,
             backend=lane.backend,
-            device=resolve_device(config, lane),
+            device=device,
             port=lane.port,
             model=model,
             model_path=model_path,
             ctx_size=ctx_size,
             host=model.host or lane.host or config.project.host,
             lane_extra_args=list(lane.extra_args),
+            extra_env=extra_env,
             run_dir=run_dir,
         )
 
@@ -203,6 +226,11 @@ class LlamaServerProcess:
             return
         if not control.is_llama_server(pid):
             raise RuntimeError(f"Port {port} is held by PID {pid}, which is not {control.server_binary_name}.")
+        registry = LlamaServerProcess.registry
+        if registry is not None and not registry.owns(pid):
+            raise RuntimeError(
+                f"Port {port} is held by a {control.server_binary_name} (PID {pid}) that this service did not start, so it "
+                "is not stopped automatically. Stop it yourself, or use Stop on the orphan in the dashboard.")
         control.terminate_tree(pid)
         _wait_port_free(port, timeout=30)
 
@@ -298,24 +326,42 @@ class LlamaServerProcess:
         return args
 
     def _draft_args(self, policy: "PolicyConfig") -> list[str]:
-        # Speculative decoding: run a small draft model on the same lane(s) as the
-        # target. It is lossless -- the target verifies every proposed token -- so it
-        # only changes throughput. Omitted knobs fall back to llama-server defaults.
-        if not self.model.draft_model:
+        # Speculative decoding is lossless: the target verifies every proposal. Support
+        # both a separate draft GGUF and an embedded head such as Qwen3.8's MTP layer.
+        if not self.model.draft_model and not self.model.spec_type:
             return []
-        draft_path = resolve_model_path(self.config, replace(self.model, path=self.model.draft_model))
-        draft_layers = self.model.draft_gpu_layers if self.model.draft_gpu_layers is not None else policy.gpu_layers
-        args = [
-            "--model-draft", str(draft_path),
-            "--gpu-layers-draft", str(draft_layers),
-            "--device-draft", self.device,
-        ]
+        runtime = self.runtime()
+
+        def spelling(modern: str, legacy: str) -> str:
+            # Empty flag inventories belong to old/unprobeable runtimes; retain the legacy
+            # behavior there. A probed modern runtime gets its canonical spelling.
+            return modern if runtime.supports(modern) else legacy
+
+        args: list[str] = []
+        spec_type = self.model.spec_type or ("draft-simple" if runtime.supports("--spec-type") else "")
+        if spec_type:
+            if runtime.flags and not runtime.supports("--spec-type"):
+                raise RuntimeError(
+                    f"Configured speculative type '{spec_type}' is unsupported by {runtime.binary}."
+                )
+            args.extend(["--spec-type", spec_type])
+        if self.model.draft_model:
+            draft_path = resolve_model_path(self.config, replace(self.model, path=self.model.draft_model))
+            draft_layers = (
+                self.model.draft_gpu_layers
+                if self.model.draft_gpu_layers is not None else policy.gpu_layers
+            )
+            args.extend([
+                spelling("--spec-draft-model", "--model-draft"), str(draft_path),
+                spelling("--spec-draft-ngl", "--gpu-layers-draft"), str(draft_layers),
+                spelling("--spec-draft-device", "--device-draft"), self.device,
+            ])
         if self.model.draft_max:
-            args.extend(["--draft-max", str(self.model.draft_max)])
+            args.extend([spelling("--spec-draft-n-max", "--draft-max"), str(self.model.draft_max)])
         if self.model.draft_min:
-            args.extend(["--draft-min", str(self.model.draft_min)])
+            args.extend([spelling("--spec-draft-n-min", "--draft-min"), str(self.model.draft_min)])
         if self.model.draft_p_min > 0:
-            args.extend(["--draft-p-min", str(self.model.draft_p_min)])
+            args.extend([spelling("--spec-draft-p-min", "--draft-p-min"), str(self.model.draft_p_min)])
         return args
 
     def start(self) -> None:
@@ -337,10 +383,15 @@ class LlamaServerProcess:
             args,
             stdout=self._log_handle,
             stderr=subprocess.STDOUT,
-            env=backend_env(self.config, self.backend),
+            env={**backend_env(self.config, self.backend), **(self.extra_env or {})},
             cwd=str(runtime_dir(self.config, self.backend)),
             **get_host().control.spawn_kwargs(),
         )
+        if LlamaServerProcess.registry is not None:
+            try:
+                LlamaServerProcess.registry.record(self.proc.pid, self.port, self.model.name)
+            except Exception:  # noqa: BLE001 - bookkeeping must not stop a load
+                pass
 
         deadline = time.time() + self.config.project.start_timeout_seconds
         while time.time() < deadline:
@@ -415,5 +466,10 @@ class LlamaServerProcess:
                 except subprocess.TimeoutExpired:
                     pass
         _wait_port_free(self.port, timeout=30)
+        if self.proc is not None and LlamaServerProcess.registry is not None:
+            try:
+                LlamaServerProcess.registry.forget(self.proc.pid)
+            except Exception:  # noqa: BLE001
+                pass
         if self._log_handle and not self._log_handle.closed:
             self._log_handle.close()

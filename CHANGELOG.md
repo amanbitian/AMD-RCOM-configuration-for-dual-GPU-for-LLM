@@ -1,5 +1,84 @@
 # Changelog
 
+## 2026-11-20 - Windows history imported, All / Windows / Ubuntu toggle
+
+- **Windows history is now in the Linux dashboard.** The import tools existed but had never been run, so the Linux
+  install showed none of the Windows data. The Windows `chat_runs` folder was copied byte for byte to the Linux disk and
+  imported from the copy.
+  - **Imported:** 18,080 inference runs, 876,922 metric samples, 4 training runs and 9,315 Windows GPU samples.
+  - **Safety:** verified backups were taken first, no table lost rows, and the files on the shared partition were never
+    opened.
+- **OS tags survive the import.** Before this change, merged telemetry from an older Windows schema arrived with no OS.
+  Imported rows now take the source's OS, and this install's own untagged rows are tagged with its OS (empty values
+  only). `--import-runs-from` also brings the matching `project_usage.sqlite3` rows.
+- **OS toggle.** All / Windows / Ubuntu in the dashboard header filters the overview, analytics, run history, training
+  runs and the hardware log. The API takes `os=` on the same endpoints. `/api/hardware/range` and a **Saved data** button
+  show where each OS's samples are.
+
+## 2026-11-20 - Data safety, hardware log, both-OS history, GPU-mode safety (improvement plan 17 Nov)
+
+Nothing is deleted any more. Hardware and system samples were deleted after 30 days at every start; that delete is
+gone (`prune_hardware` is a no-op) and the only remaining delete, `--prune-older-than-days`, needs `--confirm-delete`
+and takes its own backup first.
+
+- **Safe start.** One verified SQLite backup per database per app/schema version (`<data-dir>/backups`, kept forever,
+  single file, integrity-checked); the service refuses to start if a backup fails (`--skip-backup` to override). A
+  database written by newer code is refused rather than downgraded. Runs left `running` by a dead service are marked
+  `interrupted`. Every run is tagged `origin_os` (older runs: Windows, flagged `origin_os_inferred = 1`) and carries a
+  path-independent `model_fingerprint`. All schema changes are add-only (training schema v5, run schema v2).
+- **Hardware log.** While any GPU is in use (model loaded, request running, training/eval lease) the service saves,
+  once a second, GPU rows (usage, VRAM, temperatures, fan, power, clocks, slot link, throttle) plus a host row (CPU
+  usage/temperature/power, RAM and SSD temperature, coolant, pump and fan speeds, memory pressure, free disk, estimated
+  system watts), each tagged with OS, model and run. Idle time and the integrated GPU are not logged. Saved alerts with
+  start, end and peak; kernel faults and server crashes saved as events. `/api/hardware/{log,history,summary,alerts,
+  events,export,archive}`, `/api/runs/{id}/hardware`, and a Hardware-log panel in the dashboard (range picker, charts,
+  alerts, export to CSV or JSON lines). Compressed daily archives (`<data-dir>/archive`) are written beside the database.
+- **Sensor fixes.** PCIe slot link is the narrowest link on the path to the CPU (a Radeon's own x16 reading hid the x8
+  slot); throttle status falls back to the `amd-smi` command when the Python module is missing and says so when the card
+  reports N/A; checkpoints a trainer wrote but never reported are registered from disk, attributed only to the run that
+  wrote them; the service reports a missing sensor source in `/api/health` instead of leaving it blank.
+- **Windows and Linux history.** `--exchange-dir` shares run history and a consistent training/telemetry snapshot through
+  plain files; `--import-runs-from` and `--import-from` import another install's databases read-only, by id, adding
+  only. See `docs/CROSS_OS_HISTORY.md`.
+- **Training quality.** `/api/training/runs/{id}/quality` and dashboard charts: raw and rolling-mean loss, validation
+  loss and perplexity per validation set, z-loss term, total objective. Validation metrics a trainer only logs locally
+  are read from its `metrics.jsonl`.
+- **GPU modes.** Free VRAM on Linux comes from the kernel files instead of starting `llama-server --list-devices`;
+  per-lane `auto_use = false` keeps automatic placement off a GPU; one-lane configs start; the capacity check subtracts
+  CPU-offloaded experts and counts quantised KV caches; split-model correctness canary (`split_canary`); opt-in
+  `isolate_single_lane` with a real-hardware test; automatic cleanup only stops servers this service started.
+- **Reliability.** Opt-in `auto_restart` with back-off and crash-loop stop; crashes are always recorded; connection cap
+  and idle timeout; deploy/unload/refresh/lane-switch refuse non-JSON POSTs; logs rotate into compressed files that are kept; routine poll lines are no longer logged; dashboard
+  and health answers are cached for a few seconds. Service installers: `scripts/install_linux_service.sh`,
+  `scripts/install_windows_task.ps1`; inference benchmark baseline: `scripts/benchmark_inference.py`.
+
+## 2026-11-12 - LAN gateway discovery and browser-client integration
+
+- Added `--lan` to `app.py` and `launch_service.py` as a clear, explicit alias for binding the
+  public gateway to `0.0.0.0`; per-GPU llama-server ports remain loopback-only.
+- Added `GET /api/health`, API version `1`, network metadata in `/api/bootstrap`, and the
+  `X-DGPU-API-Version` response header so remote applications can discover and health-check the
+  GPU host without parsing logs.
+- Added opt-in repeatable `--cors-origin` support, including preflight and streaming response
+  headers, for browser applications on another LAN origin.
+- Full per-model input/output and telemetry retention is now enabled by default for chat,
+  streaming chat, completions, and infill. Writes remain off the inference path; SQLite failures
+  retry and fall back to JSONL instead of silently dropping records.
+- LAN discovery now prioritizes the default-route address, all response paths carry the API version,
+  browser lease requests may send `X-Lease-Token`, and the launcher verifies service identity via
+  `/api/health` before treating an existing listener as Dual GPU Studio.
+
+## 2026-10-28 - Embedded MTP and modern speculative decoding
+
+- Added opt-in per-model `spec_type`, including Qwen3.8 embedded `draft-mtp`; normal decode remains
+  the default and dual-lane scheduling, parallel deployments, and model routing are unchanged.
+- Deployment reads only the GGUF header's tensor inventory and refuses MTP when no `*.nextn.*`
+  prediction tensors exist, preventing a misleading or failed server launch.
+- Speculative arguments select modern llama.cpp `--spec-draft-*` spellings when supported and
+  retain legacy spellings for older or unprobeable runtimes. This fixes configured draft widths
+  on builds where `--draft-max` and `--draft-min` have been removed.
+- Added configuration, GGUF inventory, legacy compatibility, and embedded-MTP command tests.
+
 ## 2026-10-20 - Thinking tokens no longer shown as 0 when the backend doesn't count them; token columns in Analytics
 
 - llama.cpp never reports an exact `reasoning_tokens` count, so the Overview's token-accounting donut summed

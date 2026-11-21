@@ -131,7 +131,7 @@ jobs:
 
 | Surface | Use it when | Start with |
 |---|---|---|
-| **Dashboard** | You want to load models, chat, compare two models, see history and telemetry, or control the service | `py launch_service.py` then open http://127.0.0.1:8090 |
+| **Dashboard** | You want to load models, chat, compare two models, see history and telemetry, or control the service | `py launch_service.py --start` then open http://127.0.0.1:8090 |
 | **OpenAI gateway** | An editor or coding agent (Cline, OpenCode, Continue, Aider) or any OpenAI client should use the GPUs | Base URL `http://127.0.0.1:8090/v1`, any API key |
 | **Client Integration API** | Your own code needs to plan, load and run models and get metrics back | [CLIENT_API.md](CLIENT_API.md) |
 | **Batch CLI** | You want a one-off sweep: every configured model run once against your task command | `dual-gpu --config <toml> run` |
@@ -276,11 +276,12 @@ nothing is left untracked. Optional headers: `X-DGPU-Agent-Role`, `X-DGPU-Sessio
 
 - Prompts and completions are **redacted** in the metrics database unless the request sends
   `X-DGPU-Capture-Content: true`. Token counts, timings and resource figures are always kept.
-- A separate **conversation archive** (`chat_history.sqlite3`) keeps full content. It is off unless
-  `project.store_chat_history = true`, is written off the request path, and drops records rather than slow
-  a request. `X-DGPU-No-History: true` skips one turn. Read it with `GET /api/chat-history`.
-- Autocomplete requests are not recorded as runs; only a request count and token totals go to the daily
-  usage ledger (`GET /api/usage`).
+- A separate **per-model archive** (`chat_history.sqlite3`) keeps the full request and output plus
+  token, timing, status/error, and resource telemetry. It is enabled by default, written off the
+  request path, retries SQLite failures, and falls back to JSONL rather than silently losing records.
+  `X-DGPU-No-History: true` skips one turn. Read it with `GET /api/chat-history?content=1`.
+- Autocomplete stays out of the synchronous metrics run DB, but its input/output and telemetry are
+  retained by the asynchronous archive and its totals are added to `GET /api/usage`.
 
 **Quality features:** `grammar`, `response_format` and `json_schema` are validated and passed straight to
 `llama-server`; tool-call validity is measured on every coding run; the streamed response carries a run id
@@ -331,7 +332,7 @@ The **Service** page, and the matching endpoints, cover everything that used to 
 | Control | What it does |
 |---|---|
 | **Restart service** | Stops every model (and leftover servers), starts a replacement process that waits for this one to exit before binding the port, and optionally reloads the same models afterwards. The page reconnects by itself. A saved deployment older than 10 minutes is ignored. |
-| **Stop service** | Stops every model and then the service. Start it again with `py launch_service.py`. |
+| **Stop service** | Stops every model and then the service. Start it again with `py launch_service.py --start`. |
 | **Unload** (per GPU, or everything) | Frees GPU memory. A model that is answering gets up to `drain_timeout_seconds` (30 s) to finish. |
 | **Stop now** | Appears while an unload is waiting. Ends the wait and stops the model at once, cutting the answer. |
 | **Orphans** | A llama-server on a lane port that this service does not manage (for example left by an instance that was killed) is listed in `/api/status` and in a banner, and **Stop them** removes it. It holds VRAM and RAM until stopped. A load stops it automatically. Nothing is reported while a load, swap or unload is running (`transitioning` in `/api/status`), because the service's own server is then starting or draining and is not a leftover. |
@@ -457,7 +458,7 @@ from the config file's directory, and `~`/environment variables are expanded.
 | `host` | `127.0.0.1` | Bind host for `llama-server` |
 | `cleanup_ports_on_start` | `true` | Batch CLI `run` only: stop leftover servers on lane ports before starting |
 | `start_timeout_seconds` | `900` | How long a model may take to become healthy |
-| `store_chat_history` | `false` | Keep full conversations in `chat_history.sqlite3` |
+| `store_chat_history` | `true` | Keep full per-model API input/output and telemetry in `chat_history.sqlite3` |
 | `chat_history_path` | next to the metrics DB | Archive location |
 | `default_project` | `unassigned` | Project for unattributed requests |
 
@@ -499,16 +500,18 @@ from the config file's directory, and `~`/environment variables are expanded.
 `primary_metric`, `queue_capacity`, `ctx_size`, `timeout_s`, thresholds for accuracy and latency regression,
 and `peak_tflops` per lane for the MFU estimate.
 
-**`app.py` options:** `--config`, `--host` (default `127.0.0.1`), `--port` (default `8090`), `--data-dir`
-(default `./chat_runs`), `--no-browser`, `--check` (validate and exit), `--prune-older-than-days N`. The
-internal `--replace-pid` is used by the restart.
+**`app.py` options:** `--config`, `--host` (default `127.0.0.1`), `--lan` (bind `0.0.0.0` for trusted-LAN
+access), `--port` (default `8090`), `--cors-origin ORIGIN` (repeatable browser-origin allowlist),
+`--data-dir` (default `./chat_runs`), `--no-browser`, `--check` (validate and exit),
+`--prune-older-than-days N`. The internal `--replace-pid` is used by the restart.
 
 ## 8. Files the app writes
 
 | File | Contents |
 |---|---|
 | `<data-dir>/chatbot.sqlite3` | Runs (including host OS), deployments, resource samples, projects, sessions, coding tasks, tool events, clients |
-| `<data-dir>/chat_history.sqlite3` | Full conversations (only if `store_chat_history`) |
+| `<data-dir>/chat_history.sqlite3` | Full per-model requests, outputs, and telemetry (enabled by default) |
+| `<data-dir>/chat_history.fallback.jsonl` | Recovery log used only when SQLite history writes keep failing |
 | `<data-dir>/project_usage.sqlite3` | Daily usage per project |
 | `<data-dir>/training.sqlite3` | Training runs, steps, checkpoints, hardware samples, evaluation queue, leases, benchmarks |
 | `<data-dir>/deployments/<time>/server_logs/*.log` | Each `llama-server`'s output, with its exact command line and host OS at the top of each launch |
@@ -662,14 +665,16 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
   unload, deploy and (with a JSON content type) restart, stop and settings. The default bind is
   `127.0.0.1`. Binding to `0.0.0.0` (needed for LAN use, see [local_network_setup.md](local_network_setup.md))
   exposes full control and recorded data to the network; use network-level access control.
+- Browser clients on another origin must be explicitly allowed with `--cors-origin`; native clients do
+  not need CORS. `GET /api/health` is the discovery and liveness endpoint for LAN integrations.
 - **Only some endpoints require a JSON content type** (restart, stop, settings, and the two LM Studio
   POSTs). That forces a CORS preflight, so a web page cannot trigger them with a blind form post. Other
   state-changing endpoints, including `/api/deploy` and `/api/unload`, accept any content type, so a web
   page you visit could in principle post to them on a local service. This is a known gap.
 - `llama-server` processes bind to `127.0.0.1` unless a lane or model `host` says otherwise, and run without
   an API key or web UI protection of their own.
-- Coding prompts and completions are redacted from the metrics database by default; the conversation
-  archive is opt-in and holds full content.
+- Coding prompts and completions are redacted from the metrics database by default; the separate
+  per-model archive is enabled by default and holds full content plus telemetry.
 - Training payloads are scrubbed of personal data before storage.
 
 ## 13. Testing and verification status
@@ -689,8 +694,8 @@ Full text and example: [API_CONTRACT.md](API_CONTRACT.md#releasing-the-gpus-when
 
 ```powershell
 # Start the service in the background and open the UI (use py: `python` is not on PATH here)
-py launch_service.py
-py launch_service.py --no-browser            # no browser, e.g. from a script
+py launch_service.py --start
+py launch_service.py --start --no-browser    # no browser, e.g. from a script
 
 # Run in the foreground instead
 py app.py --config .\example.dual_gpu.toml
@@ -707,7 +712,7 @@ py -m pytest
 Ubuntu equivalents use the edited Linux config and native llama.cpp binary:
 
 ```bash
-python3 launch_service.py --config ./dual_gpu.toml
+python3 launch_service.py --start --config ./dual_gpu.toml
 python3 app.py --config ./dual_gpu.toml --check
 dual-gpu --config ./dual_gpu.toml inspect
 dual-gpu --config ./dual_gpu.toml plan

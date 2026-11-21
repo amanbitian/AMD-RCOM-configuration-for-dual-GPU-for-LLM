@@ -5,12 +5,10 @@ log_dir = "./runs"
 host = "127.0.0.1"
 cleanup_ports_on_start = true
 start_timeout_seconds = 900
-# Full-conversation archive (opt-in). When true, every request through /api/chat and the
-# OpenAI gateway is logged -- full prompts, responses, reasoning, tool calls, and token
-# counts -- to a SEPARATE SQLite file, written off the request path. The metrics database
-# stays lean and redacted. Read it back via GET /api/chat-history. Default path is
-# chat_history.sqlite3 next to the metrics DB; override with chat_history_path.
-# store_chat_history = true
+# Full per-model archive: prompts/request payloads, responses, reasoning, tool calls, token/timing
+# telemetry, and resource summaries. Written asynchronously to a separate SQLite file so the
+# inference path stays fast. Set false only when content retention is not wanted.
+store_chat_history = true
 # chat_history_path = "G:/llm-archive/chat_history.sqlite3"
 
 [discovery]
@@ -113,6 +111,10 @@ size_gb = 19.76
 # draft_max = 16        # max tokens drafted per step (backend default if omitted)
 # draft_p_min = 0.0     # min draft-token probability to keep speculating
 # draft_gpu_layers = 999  # draft layers on GPU (defaults to policy.gpu_layers)
+# For a Qwen3.8 GGUF with an embedded nextn head, use MTP instead of draft_model:
+# spec_type = "draft-mtp"
+# draft_max = 2          # benchmark 2-4 with parallel=1 before raising concurrency
+# draft_p_min = 0.1
 
 [[models]]
 name = "gpt-oss-120b-GGUF"

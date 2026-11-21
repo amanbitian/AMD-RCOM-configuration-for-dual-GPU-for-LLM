@@ -127,6 +127,39 @@ def validate_manifest(directory: str | Path, verify_hashes: bool = False) -> tup
     return True, None
 
 
+_DISCOVER_RE = re.compile(r"^(?:checkpoint-|step_)0*(\d+)$")
+_WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin", "adapter_model.safetensors", "adapter_model.bin")
+
+
+def discover_checkpoints(directory: str | Path) -> list[dict[str, Any]]:
+    """Checkpoint directories a trainer left on disk, whether or not it reported them to the service:
+    `checkpoint-<step>` (Hugging Face) and `step_<step>` (custom loops). In-progress `.tmp_*` directories
+    are ignored. No manifest is needed: `valid` means a weights file is present and non-empty, and the
+    recorded manifest is marked `discovered` (sizes only, no hashes) so it is never mistaken for a
+    trainer-written one. Nothing is written into the checkpoint directory."""
+    directory = Path(directory)
+    found = []
+    if not directory.is_dir():
+        return found
+    for child in directory.iterdir():
+        match = _DISCOVER_RE.match(child.name)
+        if not match or not child.is_dir():
+            continue
+        files = [p for p in child.rglob("*") if p.is_file() and not p.name.endswith(".tmp")]
+        weights = [p for p in files if p.name in _WEIGHT_FILES and p.stat().st_size > 0]
+        sizes = [{"path": p.relative_to(child).as_posix(), "size": p.stat().st_size} for p in sorted(files)]
+        total = sum(f["size"] for f in sizes)
+        manifest = {"version": MANIFEST_VERSION, "step": int(match.group(1)), "kind": "discovered", "files": sizes,
+                    "total_bytes": total, "hashed": False, "discovered_at": time.time(),
+                    **inspect_resume_state(child)}
+        stamps = [p.stat().st_mtime for p in files] or [child.stat().st_mtime]
+        found.append({"step": int(match.group(1)), "path": str(child), "kind": "resume", "valid": bool(weights),
+                      "mtime": max(stamps),
+                      "size_bytes": total, "manifest": manifest,
+                      "error": None if weights else "no weights file found in checkpoint directory"})
+    return sorted(found, key=lambda c: c["step"])
+
+
 def find_latest_valid(output_dir: str | Path, verify_hashes: bool = False) -> Path | None:
     """Newest `checkpoint-<step>` directory whose manifest validates (for Trainer resume)."""
     output_dir = Path(output_dir)

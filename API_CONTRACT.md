@@ -15,7 +15,8 @@ Every endpoint below requires `app.py` to already be running — there is no HTT
 that starts it, since a stopped service has nothing listening to receive that request. A
 client that wants to trigger the service on demand (rather than assuming a human already
 started it) runs [launch_service.py](launch_service.py) as a one-shot command, not an
-always-on daemon: `python launch_service.py --config <path>`. It's idempotent (a no-op if
+always-on daemon: `python launch_service.py --start --config <path>`. The explicit `--start`
+prevents background clients from bringing the service up after login. It's idempotent (a no-op if
 already running) and exits once the service is confirmed healthy or has failed to start —
 it never itself stays resident. See [CLIENT_API.md](CLIENT_API.md#0-make-sure-the-service-is-actually-running)
 for the full example. Run from a terminal it also opens the UI in your browser (a program
@@ -24,10 +25,43 @@ can be restarted or stopped over HTTP (see [Service control](#service-control)).
 When `--config` is omitted, Windows uses `example.dual_gpu.toml` and Linux uses
 `example.dual_gpu.ubuntu.toml`; production clients should normally pass their edited config explicitly.
 
+### LAN access
+
+The GPUs and `llama-server` processes stay on the GPU host. A second computer on the same trusted
+LAN sends requests to the host's gateway; it does not need the model files or GPU drivers. Start
+the gateway on the GPU host with:
+
+```powershell
+py app.py --config .\example.dual_gpu.toml --lan --no-browser
+```
+
+`--lan` is shorthand for `--host 0.0.0.0`. The public gateway remains on the configured web port
+(default `8090`); the per-GPU backend ports remain loopback-only. A remote application should use
+the `openai_base_url` returned by `GET /api/health` or `GET /api/bootstrap`, or select a matching
+entry from `advertised_openai_base_urls`, for example:
+
+```text
+http://192.168.1.50:8090/v1
+```
+
+The LAN host must be trusted and its firewall should allow TCP `8090` only from the local subnet.
+This service has no built-in authentication or TLS; do not port-forward it to the internet. For a
+browser application hosted on another origin, add one or more explicit origins:
+
+```powershell
+py app.py --lan --cors-origin http://192.168.1.60:3000 --no-browser
+```
+
+Repeat `--cors-origin` for each allowed origin. `--cors-origin *` is supported for trusted-LAN
+prototyping but is not recommended for a shared network. Native clients do not need CORS.
+
 ## Conventions
 
 - Base URL: `http://127.0.0.1:<port>` (default port `8090`; see `--port`/`--host` in
   [README.md](README.md#quick-start)).
+- LAN base URL: `http://<gpu-host-ip>:<port>` when started with `--lan`.
+- API contract version: `1`, returned as `api_version` by discovery endpoints and as the
+  `X-DGPU-API-Version` response header on JSON, download, passthrough, and SSE responses.
 - All request/response bodies are JSON. `Content-Type: application/json` on requests with a
   body; request bodies are capped at 10 MB.
 - **No authentication.** This is a local-trust-boundary service — anyone who can reach the
@@ -46,6 +80,49 @@ When `--config` is omitted, Windows uses `example.dual_gpu.toml` and Linux uses
 - New runs are attributed to the host OS. `host_os` always contains `system`, `release`,
   `version`, and `machine`; Linux also supplies `distribution`, `distribution_id`, and
   `distribution_version` when `/etc/os-release` is available.
+- **OS filter.** `GET /api/runs`, `/api/dashboard`, `/api/training/runs` and the `/api/hardware/*` history views
+  (`history`, `summary`, `alerts`, `events`, `export`, `range`) take an optional `os=all|windows|ubuntu` (`linux` is
+  accepted for `ubuntu`). Omitted or `all` returns both. Any other value is a `400`. `system_samples` has no OS
+  column and is exported whole.
+- A browser client may use CORS only for origins explicitly allowed with `--cors-origin`; the
+  server returns `204` to preflight requests, permits `X-Lease-Token`, caches preflight for 600
+  seconds, and exposes `X-DGPU-Run-ID` plus `X-DGPU-API-Version`.
+
+---
+
+## GET `/api/health`
+
+Lightweight discovery and liveness endpoint for another computer or application. It does not load
+a model and returns `200` while the HTTP service is running; `ready` tells the caller whether a
+deployment is currently available for inference.
+
+**Shares:**
+```json
+{
+  "status": "ok",
+  "service": "dual-gpu-studio",
+  "app_version": "0.1.0",
+  "api_version": "1",
+  "ready": true,
+  "state": "ready",
+  "mode": "parallel_models",
+  "network": {
+    "bind_host": "0.0.0.0",
+    "port": 8090,
+    "lan_enabled": true,
+    "base_url": "http://127.0.0.1:8090",
+    "openai_base_url": "http://192.168.1.50:8090/v1",
+    "advertised_urls": ["http://192.168.1.50:8090"],
+    "advertised_openai_base_urls": ["http://192.168.1.50:8090/v1"],
+    "model_server_ports": "loopback_only"
+  }
+}
+```
+
+`base_url` is host-local when the service binds to `0.0.0.0`; `openai_base_url` prefers the first
+detected private address for convenience. A client that needs a specific interface should select
+the corresponding entry from `advertised_openai_base_urls`. The response is intentionally
+small enough to use as a health probe.
 
 ---
 
@@ -57,7 +134,9 @@ Full snapshot used to render the dashboard on load. No input.
 ```jsonc
 {
   "app_version": "0.1.0",
+  "api_version": "1",
   "config_path": "/path/to/dual_gpu.toml",
+  "network": { /* same shape as GET /api/health.network */ },
   "catalog": { /* see GET /api/models/refresh below for shape */ },
   "status": { /* see GET /api/status below for shape */ },
   "runs": [ /* up to 20 most recent runs, see GET /api/runs for row shape */ ]
@@ -71,7 +150,9 @@ Current deployment state and the latest resource sample. No input.
 **Shares:**
 ```jsonc
 {
-  "state": "idle | switching | ready | error",
+  "api_version": "1",
+  "network": { /* same shape as GET /api/health.network */ },
+  "state": "idle | switching | ready | degraded | error",
   "mode": "idle | single_large_model | parallel_models | single_gpu",
   "error": "string | null",
   "profile": { /* the deploy request that produced the current state, or null */ },
@@ -281,12 +362,13 @@ day in range rather than the default last 14. The applied range echoes back as `
 
 ## GET `/api/chat-history`
 
-The full-conversation archive (a separate SQLite file, opt-in via `project.store_chat_history`).
-Disabled by default; when off, returns `{"enabled": false, "turns": []}`.
+The full per-model archive in a separate SQLite file. It is enabled by default via
+`project.store_chat_history = true`; set it to `false` only when content retention is not wanted.
+When disabled, this endpoint returns `{"enabled": false, "turns": []}`.
 
-**Query params:** `project_id`, `start_date`/`end_date` (YYYY-MM-DD, inclusive; 400 on bad
-format), `limit` (default 100, capped 500), `offset`, and `content=1|true|yes` to include full
-bodies (omitted by default).
+**Query params:** `project_id`, exact `model_name`, `target` (GPU lane), `status`,
+`start_date`/`end_date` (YYYY-MM-DD, inclusive; 400 on bad format), `limit` (default 100, capped
+500), `offset`, and `content=1|true|yes` to include full bodies (omitted by default).
 
 **Shares:**
 ```jsonc
@@ -296,19 +378,24 @@ bodies (omitted by default).
     {
       "id": "run-uuid", "created_at": "ISO-8601", "project_id": "…", "client_id": "…",
       "agent_role": "…", "model_name": "…", "target": "r9700", "workload_kind": "coding_agent",
+      "status": "completed | failed | cancelled", "error_text": "string|null",
       "input_tokens": "int|null", "cached_input_tokens": "int|null", "output_tokens": "int|null",
       "thinking_tokens": "int|null", "total_tokens": "int|null",
       "tokens_per_second": "float|null", "latency_ms": "float|null", "finish_reason": "…",
       // only when content=1:
+      "request": { /* full request payload, including completion/infill prompts */ },
       "messages": [ /* full input messages */ ], "tools": [ /* tool schemas */ ],
-      "output_text": "…", "reasoning_text": "…|null", "tool_calls": [ /* parsed */ ]
+      "output_text": "…", "reasoning_text": "…|null", "tool_calls": [ /* parsed */ ],
+      "resources": { /* per-model sampler-window summary */ }
     }
   ],
   "limit": 100, "offset": 0
 }
 ```
 Content is archived regardless of `X-DGPU-Capture-Content` (which only governs the metrics DB).
-Per-request opt-out: `X-DGPU-No-History: true`, or `"store_history": false` in an `/api/chat` body.
+Per-request opt-out: `X-DGPU-No-History: true`, or `"store_history": false` in any inference body.
+Writes are asynchronous and batched. SQLite failures are retried, then preserved in
+`chat_history.fallback.jsonl` beside the database rather than silently discarded.
 
 ---
 
@@ -497,7 +584,7 @@ restart itself; `415` not JSON.
 ### POST `/api/service/stop`
 
 Stops every model server and then the service. Nothing answers afterwards; start it again with
-`launch_service.py`. Same errors as restart.
+`launch_service.py --start`. Same errors as restart.
 
 ### GET `/api/settings` and POST `/api/settings`
 
@@ -685,17 +772,19 @@ pointing at the base URL and naming itself once; nothing is ever left untracked.
 Streaming requests are relayed as SSE and receive an `X-DGPU-Run-ID` response header; non-streaming
 responses contain `dgpu_run_id`. The optional `X-DGPU-Agent-Role`, `X-DGPU-Session`, `X-DGPU-Task`,
 `X-DGPU-Task-Label`, and `X-DGPU-Connection-Type` headers add finer attribution. Coding prompt and
-completion content is redacted from storage unless `X-DGPU-Capture-Content: true` is supplied.
+completion content remains redacted from the metrics DB unless `X-DGPU-Capture-Content: true` is
+supplied, while the separate full archive retains it by default.
 
 ### Inline autocomplete (FIM) endpoints
 
 `POST /v1/completions` and `POST /v1/infill` (and their `/v1/<lane>/<role>/...` variants) proxy
 the raw fill-in-middle endpoints of the selected lane's llama-server, for IDE inline
 autocomplete (Continue, Tabby, Twinny, llama.vscode, …). Lane selection is identical to chat
-(path, `X-DGPU-Target`, or `model`). These are a **thin passthrough**: because autocomplete
-fires on nearly every typing pause, they do **no** run recording, GPU sampling, or history
-logging — so autocomplete adds no inference overhead and never bloats the metrics DB. They are
-still drain-safe (counted in-flight during a deployment change). Point a small, fast FIM coder
+(path, `X-DGPU-Target`, or `model`). Because autocomplete fires on nearly every typing pause, it
+stays out of the synchronous metrics run database and performs no blocking GPU probe. It does
+archive the complete request/output plus token, timing, concurrency, and background-sampler
+resource telemetry asynchronously. Both streaming and non-streaming responses carry
+`X-DGPU-Run-ID`. Requests remain drain-safe during deployment changes. Point a small, fast FIM coder
 model (e.g. Qwen2.5-Coder-1.5B/7B) at the smaller lane for autocomplete and the agent model at
 the larger lane.
 
@@ -785,8 +874,8 @@ inclusive; 400 on bad format).
   }
 }
 ```
-Token counts are exact for chat/inference and best-effort for autocomplete (counted for
-non-streamed completions; streamed autocomplete records the request without token totals).
+Token counts are exact when the backend supplies them. Autocomplete parses both streamed and
+non-streamed usage; older backends that omit final stream usage remain best-effort.
 
 ## Training and ROCm telemetry
 
@@ -835,6 +924,36 @@ falls back to the server identity when tracker-side capture is disabled.
 - `GET /api/training/alerts`, `/compare`, `/scaling`, `/eval-queue`, `/benchmarks`, `/profiles`, and
   `/notes` expose cross-run views. Matching POST endpoints submit evaluations, forecasts, benchmarks
   and notes; benchmark cancellation and checkpoint designate/promote/demote routes are also supported.
+
+- `GET /api/training/runs/{id}/quality?window=100&max_points=800` returns `loss`, `loss_rolling` (mean over the
+  trailing `window` optimiser steps), `validation.sets.<name>.{loss,ppl}` (every `val/<name>_loss` / `val/<name>_ppl` the run
+  reported, discovered not fixed), `validation.latest`, `z_loss_term`, `objective_total`, `ce_objective`, `grad_norm`, `lr`
+  as `[step, value]` pairs.
+- `POST /api/training/runs/{id}/checkpoints/scan` (`{"directory"?, "all"?}`) registers checkpoint directories
+  (`checkpoint-<n>`, `step_<n>`) found on disk that the trainer never reported; default directory is the run's
+  `<out_dir>/<run_name>`, and only checkpoints written inside that run's own time window and step range are attributed to it.
+  `POST /api/training/runs/{id}/metrics/ingest` (`{"path"?}`) reads validation metrics from the trainer's `metrics.jsonl`.
+  Both also run for every run at service start.
+
+### Saved hardware log: `/api/hardware/*` (Windows and Linux)
+
+The service saves GPU and host telemetry once a second **only while a GPU is in use**, tagged with `host_os`, model and
+run, and never deletes it. Ranges are `start` / `end` (epoch seconds or ISO; default the last hour; `start=0` = everything).
+
+- `GET /api/hardware/log` → logger state, rows written, write errors, telemetry health (sampler, throttle source, archive,
+  backups, exchange, storage warnings, interrupted runs, history-write failures).
+- `GET /api/hardware/history?max_points=600` → thinned `gpus.<pci>.points[]` and `host[]` series (stored rows are never thinned).
+- `GET /api/hardware/summary[&lane=]` → per GPU min/avg/max junction, memory and edge temperature, average and peak watts,
+  `energy_wh`, `peak_fan_rpm`, `throttled_seconds`; host peaks and `est_system_energy_wh` (GPU + CPU power: an estimate, not wall power).
+- `GET /api/hardware/alerts[&open=1]` → saved alerts with `started_at`, `ended_at`, `peak_value`, `threshold`, `host_os`.
+  `GET /api/hardware/events` → kernel faults, server crashes and restarts.
+- `GET /api/hardware/export?table=hardware_samples|host_samples|hardware_alerts|hardware_events|system_samples&format=csv|jsonl`.
+- `GET /api/hardware/range[?os=]` → first and last saved GPU sample and the sample count, overall and per OS
+  (`per_os`), so a client can jump to where an OS's data is.
+- `GET /api/hardware/archive` → compressed daily archive files and the exchange status. `GET /api/runs/{id}/hardware` → the
+  summary and series over one inference run's own time window.
+- `POST /api/lanes/auto-use` `{"lane": "9070xt", "enabled": false}` keeps automatic placement off a GPU (an explicit
+  request naming the lane still works); the catalog's lanes carry `auto_use`.
 
 ### GPU leases: `/api/leases`
 

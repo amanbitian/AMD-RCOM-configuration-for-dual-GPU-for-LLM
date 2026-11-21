@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import os
 import re
 import queue
@@ -31,13 +32,25 @@ from dual_gpu_setup.config import AppConfig, LaneConfig, ModelConfig, load_confi
 from dual_gpu_setup import settings as service_settings
 from dual_gpu_setup.lmstudio import lane_free_vram_gb, model_size_gb, resolve_model_path
 from dual_gpu_setup.lmstudio_gpus import GpuSelectionError, get_selection, release, set_selection
-from dual_gpu_setup.orchestrator import ctx_for, estimate_kv_cache_gb, lane_capacity_gb, resolve_context_window
+from dual_gpu_setup.orchestrator import (
+    cache_types_from_args, ctx_for, estimate_kv_cache_gb, lane_capacity_gb, offloaded_weights_gb, resolve_context_window,
+)
 from dual_gpu_setup.hostos import get_host
 from dual_gpu_setup.host_info import default_config_name, detached_process_kwargs, os_info, os_log_line
 from dual_gpu_setup.scheduling.leases import LeaseError, LeaseStore
 from dual_gpu_setup.server import PLACEMENT_MIN_VRAM_FRACTION, LlamaServerProcess
+from dual_gpu_setup.gguf import fingerprint as gguf_fingerprint, has_embedded_mtp
+from dual_gpu_setup.osfilter import normalize_os
 from dual_gpu_setup.reasoning import coding_request, model_reasoning
-from dual_gpu_setup.training.amd_smi import AmdSmiReader
+from dual_gpu_setup import datasafe
+from dual_gpu_setup.canary import run_split_canary
+from dual_gpu_setup.supervisor import CrashTracker
+from dual_gpu_setup.logs import LOGGER_NAME, is_routine_poll, setup_service_logging
+from dual_gpu_setup.process_registry import ProcessRegistry
+from dual_gpu_setup.archive import HardwareArchive
+from dual_gpu_setup.hardware_log import HardwareLog
+from dual_gpu_setup.host_sensors import make_host_sensors
+from dual_gpu_setup.training.amd_smi import make_reader as make_amd_smi_reader
 from dual_gpu_setup.training.benchmarks import BenchmarkRunner
 from dual_gpu_setup.training.evaluation import (
     AdapterServerManager, EvalQueue, EvalWorker, EvaluationPipeline,
@@ -50,7 +63,16 @@ from dual_gpu_setup.training.store import TrainingError, TrainingStore
 
 
 APP_VERSION = "0.1.0"
+RUN_SCHEMA_VERSION = 2  # 1 = original; 2 adds origin_os / origin_os_inferred / model_fingerprint (add-only)
+API_VERSION = "1"
 DEFAULT_REASONING_PRESETS = {"off": 0, "low": 1024, "medium": 4096, "high": 8192}
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+CORS_ALLOWED_HEADERS = (
+    "Content-Type, Authorization, X-DGPU-Project, X-DGPU-Agent-Role, X-DGPU-Session, "
+    "X-DGPU-Task, X-DGPU-Task-Label, X-DGPU-Capture-Content, X-DGPU-No-History, "
+    "X-DGPU-Connection-Type, X-DGPU-Target, X-Lease-Token"
+)
 
 # Documents exactly the fields ChatService already computes (see _normalize_usage,
 # _normalize_timing, _resource_summary) and hands to clients unchanged via /api/chat's
@@ -106,6 +128,17 @@ CLIENT_METRICS_SCHEMA = {
         "peak_system_pagefile_used_bytes": "Peak whole-system commit charge (pagefile usage) during the run.",
     },
 }
+
+
+# Endpoints that load, stop or reconfigure GPU work. They must carry a JSON content type, which makes a browser send a
+# CORS preflight first, so another web page cannot trigger them with a hidden form POST.
+JSON_ONLY_CONTROL_POSTS = frozenset({"/api/deploy", "/api/unload", "/api/models/refresh", "/api/lanes/auto-use"})
+
+
+def kv_estimate(path: Path, context: int, *arg_lists: list[str] | None) -> tuple[float | None, str]:
+    """KV-cache estimate that honours --cache-type-k/-v given on the model or lane command line."""
+    k, v = cache_types_from_args(*arg_lists)
+    return estimate_kv_cache_gb(path, context) if (k, v) == ("f16", "f16") else estimate_kv_cache_gb(path, context, k, v)
 
 
 def utc_now() -> str:
@@ -189,6 +222,7 @@ def safe_name(value: str) -> str:
 def local_network_addresses() -> list[str]:
     """Return private IPv4 addresses that another LAN device can use."""
     candidates: set[str] = set()
+    preferred: str | None = None
     try:
         candidates.update(socket.gethostbyname_ex(socket.gethostname())[2])
     except OSError:
@@ -196,7 +230,8 @@ def local_network_addresses() -> list[str]:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.connect(("8.8.8.8", 80))
-            candidates.add(str(probe.getsockname()[0]))
+            preferred = str(probe.getsockname()[0])
+            candidates.add(preferred)
     except OSError:
         pass
     addresses: list[str] = []
@@ -207,7 +242,40 @@ def local_network_addresses() -> list[str]:
             continue
         if address.version == 4 and address.is_private and not address.is_loopback and not address.is_link_local:
             addresses.append(candidate)
-    return sorted(addresses, key=lambda value: tuple(int(part) for part in value.split(".")))
+    addresses.sort(key=lambda value: tuple(int(part) for part in value.split(".")))
+    if preferred in addresses:
+        addresses.remove(preferred)
+        addresses.insert(0, preferred)
+    return addresses
+
+
+def network_metadata(bind_host: str, port: int) -> dict[str, Any]:
+    """Describe how a remote application should reach this service.
+
+    The llama-server ports intentionally remain loopback-only; the public integration surface is
+    the gateway on ``port``.  Keeping this shape in the API means clients do not need to infer
+    whether a deployment is local or LAN-backed from the process command line.
+    """
+    lan_enabled = bind_host not in LOOPBACK_HOSTS
+    host_for_url = "127.0.0.1" if bind_host in {"0.0.0.0", "::"} else bind_host
+    base_url = f"http://{host_for_url}:{port}"
+    advertised = (
+        [f"http://{address}:{port}" for address in local_network_addresses()]
+        if lan_enabled
+        else []
+    )
+    advertised_openai = [f"{url}/v1" for url in advertised]
+    return {
+        "bind_host": bind_host,
+        "port": int(port),
+        "lan_enabled": lan_enabled,
+        "base_url": base_url,
+        # Prefer a usable LAN address when one is available; otherwise fall back to loopback.
+        "openai_base_url": advertised_openai[0] if advertised_openai else f"{base_url}/v1",
+        "advertised_urls": advertised,
+        "advertised_openai_base_urls": advertised_openai,
+        "model_server_ports": "loopback_only",
+    }
 
 
 class ResourceSampler:
@@ -320,6 +388,10 @@ class RunStore:
 
     def _initialize(self) -> None:
         with self.lock, self.connect() as connection:
+            found = connection.execute("PRAGMA user_version").fetchone()[0]
+            if found > RUN_SCHEMA_VERSION:
+                raise RuntimeError(f"{self.path} is schema v{found}, newer than this code (v{RUN_SCHEMA_VERSION}). "
+                                   "Update Dual-GPU Studio before opening it; nothing was changed.")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS deployments (
@@ -448,19 +520,51 @@ class RunStore:
                 "agent_role": "TEXT",
                 "workload_kind": "TEXT NOT NULL DEFAULT 'evaluation'",
                 "host_os_json": "TEXT",
+                # explicit OS tag so a combined Windows + Linux history never has to guess
+                "origin_os": "TEXT",
+                "origin_os_inferred": "INTEGER NOT NULL DEFAULT 0",
+                # file identity independent of path, so models match across Windows and Linux
+                "model_fingerprint": "TEXT",
             }
             for name, data_type in migrations.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {data_type}")
+            self._tag_untagged_runs(connection)
+            connection.execute(f"PRAGMA user_version = {RUN_SCHEMA_VERSION}")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_deployment_id ON runs(deployment_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_client_id ON runs(client_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_label ON runs(task_label)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs(project_id, created_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_origin_os ON runs(origin_os, created_at DESC)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(agent_session_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_coding_task_id ON runs(coding_task_id)")
             client_columns = {row[1] for row in connection.execute("PRAGMA table_info(clients)")}
             if "project_id" not in client_columns:
                 connection.execute("ALTER TABLE clients ADD COLUMN project_id TEXT")
+
+    @staticmethod
+    def _tag_untagged_runs(connection: sqlite3.Connection) -> None:
+        """Fill the new `origin_os` column (NULL -> value only; nothing already stored is changed).
+        A run that captured host_os keeps that system; older runs predate capture and ran on Windows,
+        which is recorded with `origin_os_inferred = 1` so the guess stays distinguishable."""
+        connection.execute(
+            "UPDATE runs SET origin_os = json_extract(host_os_json, '$.system'), origin_os_inferred = 0 "
+            "WHERE origin_os IS NULL AND host_os_json IS NOT NULL AND json_valid(host_os_json) "
+            "AND json_extract(host_os_json, '$.system') IS NOT NULL"
+        )
+        connection.execute("UPDATE runs SET origin_os = 'Windows', origin_os_inferred = 1 WHERE origin_os IS NULL")
+
+    def mark_interrupted(self) -> int:
+        """Runs still 'running' when the service starts cannot be running: their process died with
+        the previous service. Mark them 'interrupted' (kept, never deleted) instead of leaving them
+        'running' forever. Call once at startup, before requests are served."""
+        with self.lock, self.connect() as connection:
+            return connection.execute(
+                "UPDATE runs SET status = 'interrupted', finished_at = COALESCE(finished_at, ?), "
+                "error_text = COALESCE(error_text, 'The service stopped before this request finished.') "
+                "WHERE status = 'running'",
+                (utc_now(),),
+            ).rowcount
 
     def begin_deployment(self, deployment_id: str, mode: str, profile: dict[str, Any]) -> None:
         with self.lock, self.connect() as connection:
@@ -510,8 +614,8 @@ class RunStore:
                     model_name, model_path, lane_keys_json, device_json, context_window,
                     reasoning_budget, request_json, configuration_json, client_id, task_label,
                     project_id, agent_session_id, coding_task_id, agent_role, workload_kind,
-                    host_os_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    host_os_json, origin_os, model_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -537,6 +641,8 @@ class RunStore:
                     record.get("agent_role"),
                     record.get("workload_kind", "evaluation"),
                     json.dumps(record.get("host_os") or os_info(), ensure_ascii=False),
+                    (record.get("host_os") or os_info()).get("system"),
+                    gguf_fingerprint(record.get("model_path")),
                 ),
             )
 
@@ -785,6 +891,7 @@ class RunStore:
         offset: int = 0,
         project_id: str | None = None,
         workload_kind: str | None = None,
+        host_os: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
         offset = max(0, offset)
@@ -796,6 +903,9 @@ class RunStore:
         if workload_kind:
             conditions.append("workload_kind = ?")
             params.append(workload_kind)
+        if host_os:
+            conditions.append("origin_os = ?")
+            params.append(host_os)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.lock, self.connect() as connection:
             rows = connection.execute(
@@ -804,7 +914,8 @@ class RunStore:
             ).fetchall()
         return [self._decode(row) for row in rows]
 
-    def count_runs(self, project_id: str | None = None, workload_kind: str | None = None) -> int:
+    def count_runs(self, project_id: str | None = None, workload_kind: str | None = None,
+                   host_os: str | None = None) -> int:
         conditions: list[str] = []
         params: list[Any] = []
         if project_id:
@@ -813,6 +924,9 @@ class RunStore:
         if workload_kind:
             conditions.append("workload_kind = ?")
             params.append(workload_kind)
+        if host_os:
+            conditions.append("origin_os = ?")
+            params.append(host_os)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.lock, self.connect() as connection:
             return int(connection.execute(f"SELECT COUNT(*) FROM runs{where}", params).fetchone()[0])
@@ -825,7 +939,7 @@ class RunStore:
 
     def _dashboard_runs(
         self, project_id: str | None = None, workload_kind: str | None = None,
-        start_date: str | None = None, end_date: str | None = None,
+        start_date: str | None = None, end_date: str | None = None, host_os: str | None = None,
     ) -> list[dict[str, Any]]:
         conditions: list[str] = []
         params: list[Any] = []
@@ -835,6 +949,9 @@ class RunStore:
         if workload_kind:
             conditions.append("workload_kind = ?")
             params.append(workload_kind)
+        if host_os:
+            conditions.append("origin_os = ?")
+            params.append(host_os)
         # created_at is ISO text, so lexicographic bounds match chronological ones and use
         # the created_at index. start is inclusive; end covers its whole day.
         if start_date:
@@ -884,12 +1001,12 @@ class RunStore:
 
     def dashboard(
         self, project_id: str | None = None, workload_kind: str | None = None,
-        start_date: str | None = None, end_date: str | None = None,
+        start_date: str | None = None, end_date: str | None = None, host_os: str | None = None,
     ) -> dict[str, Any]:
         # Dashboard aggregates intentionally use the complete matching history (optionally
         # narrowed to a date range). The prior implementation called recent(1000), which
         # was silently capped to 500 records.
-        runs = self._dashboard_runs(project_id, workload_kind, start_date, end_date)
+        runs = self._dashboard_runs(project_id, workload_kind, start_date, end_date, host_os)
 
         def nums(path: tuple[str, str], selected: list[dict[str, Any]] = runs) -> list[float]:
             parent, child = path
@@ -1069,7 +1186,7 @@ class RunStore:
         daily_list = list(daily.values()) if (start_date or end_date) else list(daily.values())[-14:]
         return {
             "generated_at": utc_now(),
-            "filters": {"start_date": start_date, "end_date": end_date},
+            "filters": {"start_date": start_date, "end_date": end_date, "os": host_os},
             "summary": {
                 "total_runs": len(runs),
                 "completed_runs": len(completed),
@@ -1151,7 +1268,7 @@ class RunStore:
         # back-dated defaults (LM Studio / Windows) for runs predating that capture. See
         # infer_backend/infer_os. Nothing persisted is rewritten.
         item["backend"] = infer_backend(item)
-        item["os"] = infer_os(item)
+        item["os"] = item.get("origin_os") or infer_os(item)
         return item
 
 
@@ -1170,15 +1287,22 @@ class ChatHistoryStore:
         "id", "created_at", "project_id", "client_id", "agent_role", "agent_session_id",
         "coding_task_id", "model_name", "target", "workload_kind",
         "input_tokens", "cached_input_tokens", "output_tokens", "thinking_tokens", "total_tokens",
-        "tokens_per_second", "latency_ms", "finish_reason",
+        "tokens_per_second", "latency_ms", "finish_reason", "status",
+        "request_json",
         "messages_json", "tools_json", "output_text", "reasoning_text", "tool_calls_json",
+        "resources_json", "error_text",
     )
 
     def __init__(self, path: Path, enabled: bool = False):
         self.path = path
         self.enabled = enabled
-        self._queue: queue.Queue = queue.Queue(maxsize=20000)
+        # Unbounded producer queue: enqueue stays O(1) and inference never waits on storage, while
+        # every model request remains eligible for durable logging instead of being silently dropped.
+        self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
+        # health counters: batches that fell back to the JSONL file, and records that could not be saved anywhere
+        self.write_failures = 0
+        self.records_lost = 0
         if not enabled:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1215,27 +1339,36 @@ class ChatHistoryStore:
                     tokens_per_second REAL,
                     latency_ms REAL,
                     finish_reason TEXT,
+                    status TEXT,
+                    request_json TEXT,
                     messages_json TEXT,
                     tools_json TEXT,
                     output_text TEXT,
                     reasoning_text TEXT,
-                    tool_calls_json TEXT
+                    tool_calls_json TEXT,
+                    resources_json TEXT,
+                    error_text TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_chat_turns_created_at ON chat_turns(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_chat_turns_project ON chat_turns(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_chat_turns_model ON chat_turns(model_name, created_at DESC);
                 """
             )
+            existing = {row[1] for row in connection.execute("PRAGMA table_info(chat_turns)")}
+            for column, kind in {
+                "status": "TEXT",
+                "request_json": "TEXT",
+                "resources_json": "TEXT",
+                "error_text": "TEXT",
+            }.items():
+                if column not in existing:
+                    connection.execute(f"ALTER TABLE chat_turns ADD COLUMN {column} {kind}")
 
     def enqueue(self, record: dict[str, Any]) -> None:
-        # Hot path: a single non-blocking put. History must never block or fail a request,
-        # so a full queue drops the record rather than applying backpressure to inference.
+        # Hot path: one non-blocking put; serialization and persistence stay on the worker.
         if not self.enabled:
             return
-        try:
-            self._queue.put_nowait(record)
-        except queue.Full:
-            pass
+        self._queue.put_nowait(record)
 
     @staticmethod
     def _row(record: dict[str, Any]) -> tuple[Any, ...]:
@@ -1253,19 +1386,35 @@ class ChatHistoryStore:
             usage.get("input_tokens"), usage.get("cached_input_tokens"), usage.get("output_tokens"),
             usage.get("thinking_tokens"), usage.get("total_tokens"),
             timing.get("tokens_per_second"), timing.get("end_to_end_duration_ms"),
-            record.get("finish_reason"),
+            record.get("finish_reason"), record.get("status", "completed"),
+            dump(record.get("request")),
             dump(record.get("messages")), dump(record.get("tools")),
             record.get("output_text"), record.get("reasoning_text"), dump(record.get("tool_calls")),
+            dump(record.get("resources")), record.get("error_text"),
         )
 
     def _flush(self, batch: list[dict[str, Any]]) -> None:
         placeholders = ", ".join(["?"] * len(self._COLUMNS))
         statement = f"INSERT OR REPLACE INTO chat_turns ({', '.join(self._COLUMNS)}) VALUES ({placeholders})"
+        for attempt in range(3):
+            try:
+                with self.connect() as connection:
+                    connection.executemany(statement, [self._row(item) for item in batch])
+                return
+            except sqlite3.Error:
+                if attempt < 2:
+                    time.sleep(0.05 * (2**attempt))
+        # Preserve the records even when SQLite remains unavailable. This worker is the only
+        # writer, so appending JSONL needs no additional lock and never touches inference latency.
+        self.write_failures += 1
+        fallback = self.path.with_name(self.path.stem + ".fallback.jsonl")
         try:
-            with self.connect() as connection:
-                connection.executemany(statement, [self._row(item) for item in batch])
-        except sqlite3.Error:
-            pass  # best-effort archive; never crash the server over a logging failure
+            with fallback.open("a", encoding="utf-8") as stream:
+                for item in batch:
+                    stream.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            self.records_lost += len(batch)
+            print(f"[history] could not persist {len(batch)} record(s): {exc}", flush=True)
 
     def _run(self) -> None:
         while True:
@@ -1303,16 +1452,29 @@ class ChatHistoryStore:
 
     def query(self, project_id: str | None = None, start_date: str | None = None,
               end_date: str | None = None, limit: int = 100, offset: int = 0,
-              include_content: bool = False) -> list[dict[str, Any]]:
+              include_content: bool = False, model_name: str | None = None,
+              target: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
-        columns = [col for col in self._COLUMNS
-                   if include_content or not col.endswith(("_json", "_text"))]
+        content_columns = {
+            "request_json", "messages_json", "tools_json", "output_text", "reasoning_text",
+            "tool_calls_json", "resources_json",
+        }
+        columns = [col for col in self._COLUMNS if include_content or col not in content_columns]
         conditions: list[str] = []
         params: list[Any] = []
         if project_id:
             conditions.append("project_id = ?")
             params.append(project_id)
+        if model_name:
+            conditions.append("model_name = ?")
+            params.append(model_name)
+        if target:
+            conditions.append("target = ?")
+            params.append(target)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
         if start_date:
             conditions.append("created_at >= ?")
             params.append(start_date)
@@ -1329,7 +1491,7 @@ class ChatHistoryStore:
         for row in rows:
             item = dict(row)
             if include_content:
-                for key in ("messages_json", "tools_json", "tool_calls_json"):
+                for key in ("request_json", "messages_json", "tools_json", "tool_calls_json", "resources_json"):
                     if item.get(key) is not None:
                         item[key[:-5]] = json.loads(item.pop(key))
                     else:
@@ -1353,6 +1515,7 @@ class UsageLedger:
         self.path = path
         self.enabled = enabled
         self._pending: dict[tuple[str, str, str], dict[str, int]] = {}
+        self.write_failures = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._flush_interval = flush_interval
@@ -1431,6 +1594,7 @@ class UsageLedger:
                 )
         except sqlite3.Error:
             # Never lose counts over a transient write error: fold them back in.
+            self.write_failures += 1
             with self._lock:
                 for (p, c, d), v in pending.items():
                     slot = self._pending.setdefault((p, c, d), {"requests": 0, "input_tokens": 0, "output_tokens": 0})
@@ -1599,6 +1763,7 @@ class ServerHandle:
             "reasoning_mode": self.model.reasoning_mode,
             "reasoning_effort": self.model.reasoning_effort,
             "draft_model": self.model.draft_model or None,
+            "spec_type": self.model.spec_type or None,
             "runtime": self.runtime(),
             "inflight": self.inflight,  # requests being answered right now (Unload waits for them)
             "resident_gb": self.resident_gb,
@@ -1635,6 +1800,7 @@ class DeploymentManager:
         self._abort_drain = threading.Event()  # set by "Stop now": ends the wait for running requests
         # Always running: the loop reads policy.residency_guard each tick, so the UI can switch it live.
         threading.Thread(target=self._residency_loop, name="residency-guard", daemon=True).start()
+        threading.Thread(target=self._supervise_loop, name="crash-supervisor", daemon=True).start()
 
     def _candidate_model_roots(self) -> list[Path]:
         candidates: list[Path] = []
@@ -1791,6 +1957,7 @@ class DeploymentManager:
                 "display": lane.display,
                 "match": lane.match,
                 "vram_gb": lane.vram_gb,
+                "auto_use": lane.auto_use,
                 "capacity_gb": round(lane_capacity_gb(self.config, lane), 2),
                 "port": lane.port,
                 "backend": lane.backend,
@@ -1820,6 +1987,89 @@ class DeploymentManager:
         if self.lease_guard is not None:
             self.lease_guard({lane.key for spec in specs for lane in spec["lanes"]})
 
+    def _supervise_loop(self) -> None:
+        while not self._guard_stop.wait(5.0):
+            try:
+                self.supervise_once()
+            except Exception as exc:  # noqa: BLE001 - the supervisor must never take the service down
+                print(f"[supervisor] error: {exc}", flush=True)
+
+    def _emit(self, kind: str, severity: str, payload: dict[str, Any], lane: str | None = None) -> None:
+        sink = self.__dict__.get("on_event")
+        print(f"[supervisor] {kind}: {payload}", flush=True)
+        if sink is not None:
+            sink(kind, severity, payload, lane)
+
+    def supervise_once(self, now: float | None = None) -> list[str]:
+        """Find servers that died while still registered (a deliberate stop removes the handle first, so a dead
+        handle is a crash). Each crash is recorded once; with `policy.auto_restart` the same server is restarted on
+        the same lane after a back-off, until it crash-loops. Returns the notable things done, for tests."""
+        now = time.time() if now is None else now
+        tracker = self.__dict__.setdefault("_crash_tracker", CrashTracker(
+            getattr(self.config.policy, "auto_restart_max", 3), getattr(self.config.policy, "auto_restart_window_s", 600)))
+        tracker.clock = lambda: now
+        seen = self.__dict__.setdefault("_crashes_seen", set())
+        pending = self.__dict__.setdefault("_restart_due", {})
+        done: list[str] = []
+        with self.lock:
+            snapshot = list(self.handles.items())
+        for target, handle in snapshot:
+            proc = handle.process.proc
+            if proc is None or proc.poll() is None:
+                continue
+            key = (target, proc.pid)
+            if key in seen:
+                continue
+            seen.add(key)
+            lanes = [lane.key for lane in handle.lanes]
+            lane = lanes[0] if lanes else None
+            self._emit("server_crash", "error", {"target": target, "model": handle.model.name, "lanes": lanes,
+                                                 "exit_code": proc.returncode, "pid": proc.pid}, lane)
+            if not getattr(self.config.policy, "auto_restart", False):
+                continue
+            verdict, delay = tracker.record_crash(target)
+            if verdict == "give_up":
+                pending.pop(target, None)
+                self._emit("crash_loop", "error", {"target": target, "model": handle.model.name, "lanes": lanes,
+                                                   "detail": f"{tracker.count(target)} crashes within "
+                                                             f"{tracker.window_s:.0f}s; automatic restart stopped"}, lane)
+                done.append(f"gave up on {target}")
+            else:
+                pending[target] = now + delay
+                done.append(f"restart of {target} in {delay:.0f}s")
+        for target, due in list(pending.items()):
+            if due > now:
+                continue
+            handle = self.handles.get(target)
+            if handle is None or (handle.process.proc is not None and handle.process.proc.poll() is None):
+                pending.pop(target, None)
+                continue
+            if not self.transition_lock.acquire(blocking=False):
+                continue  # a deploy or swap is running: try again on the next tick
+            try:
+                pending.pop(target, None)
+                lanes = [lane.key for lane in handle.lanes]
+                lane = lanes[0] if lanes else None
+                try:
+                    handle.process.restart()   # same process object: same lane, device and model, never another GPU
+                    self._emit("server_restarted", "info", {"target": target, "model": handle.model.name, "lanes": lanes}, lane)
+                    with self.lock:
+                        if self.state == "degraded" and all(h.process.proc is not None and h.process.proc.poll() is None
+                                                            for h in self.handles.values()):
+                            self.state, self.error = "ready", None
+                    done.append(f"restarted {target}")
+                except Exception as exc:  # noqa: BLE001
+                    self._emit("restart_failed", "error", {"target": target, "error": str(exc)[:300]}, lane)
+                    verdict, delay = tracker.record_crash(target)
+                    if verdict == "restart":
+                        pending[target] = now + delay
+                    else:
+                        self._emit("crash_loop", "error", {"target": target, "detail": "restart keeps failing; stopped trying"}, lane)
+                    done.append(f"restart of {target} failed")
+            finally:
+                self.transition_lock.release()
+        return done
+
     def _mark_dead_lanes(self) -> None:
         """Caller holds self.lock. A deployment whose lane server has exited is not ready, whatever
         the last successful deploy reported; without this, status and chat routing keep trusting it."""
@@ -1845,6 +2095,7 @@ class DeploymentManager:
                 "deployment_id": self.deployment_id,
                 "servers": [handle.public() for handle in self.handles.values()],
                 "metrics": self.sampler.latest(),
+                "split_canary": dict(self.__dict__.get("split_canary_results", {})),
             }
 
     def deploy(self, profile: dict[str, Any]) -> dict[str, Any]:
@@ -1876,6 +2127,7 @@ class DeploymentManager:
                     self._admit_vram(spec)
                     process = self._make_process(spec, run_dir)
                     process.start()
+                    self._check_split(spec, process)
                     handle = ServerHandle(spec["target"], spec["model"], spec["lanes"], process, spec.get("workload_kind"))
                     with self.lock:
                         started[spec["target"]] = handle
@@ -2026,9 +2278,19 @@ class DeploymentManager:
         self._orphan_cache = (time.monotonic(), found)
         return found
 
-    def reap_orphans(self, lanes: list[LaneConfig] | None = None) -> list[dict[str, Any]]:
+    def reap_orphans(self, lanes: list[LaneConfig] | None = None, only_ours: bool = False) -> list[dict[str, Any]]:
+        """Stop leftover servers. `only_ours` (used by every automatic path) stops only servers this service
+        recorded starting; a llama-server someone else started is left alone. The explicit "Stop orphan"
+        action calls this without it."""
         control = get_host().control
         reaped = self.lane_orphans(lanes)
+        registry = LlamaServerProcess.registry
+        if only_ours and registry is not None:
+            for orphan in reaped:
+                if not registry.owns(orphan["pid"]):
+                    print(f"[manager] leaving llama-server pid {orphan['pid']} on port {orphan['port']}: "
+                          "this service did not start it", flush=True)
+            reaped = [orphan for orphan in reaped if registry.owns(orphan["pid"])]
         for orphan in reaped:
             print(f"[manager] stopping orphaned llama-server pid {orphan['pid']} on port {orphan['port']}", flush=True)
             control.terminate_tree(orphan["pid"])
@@ -2037,7 +2299,7 @@ class DeploymentManager:
 
     def _reap_orphans_safely(self, lanes: list[LaneConfig] | None = None) -> None:
         try:
-            self.reap_orphans(lanes)
+            self.reap_orphans(lanes, only_ours=True)
         except Exception as exc:  # noqa: BLE001 -- freeing leftovers is best effort
             print(f"[manager] could not stop orphaned servers: {exc}", flush=True)
 
@@ -2185,6 +2447,15 @@ class DeploymentManager:
         path = resolve_model_path(self.config, model)
         if not path.exists():
             raise AppError(f"Model file does not exist: {path}")
+        if "draft-mtp" in {part.strip() for part in model.spec_type.split(",")}:
+            try:
+                embedded_mtp = has_embedded_mtp(path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise AppError(f"Could not inspect model for embedded MTP tensors: {exc}") from exc
+            if not embedded_mtp:
+                raise AppError(
+                    f"Model '{model.name}' enables draft-mtp but its GGUF contains no nextn tensors."
+                )
         if model.draft_model:
             draft_path = resolve_model_path(self.config, replace(model, path=model.draft_model))
             if not draft_path.exists():
@@ -2276,14 +2547,19 @@ class DeploymentManager:
         capacity = sum(lane_capacity_gb(self.config, lane) for lane in lanes)
         lane_label = "+".join(lane.key for lane in lanes)
         draft_note = f" + {draft_gb:.2f} GB draft model" if draft_gb else ""
-        weights = size + draft_gb
+        path = resolve_model_path(self.config, model)
+        lane_args = [arg for lane in lanes for arg in getattr(lane, "extra_args", [])]
+        # weights kept on the CPU (--cpu-moe / --n-cpu-moe / -ngl) do not take VRAM
+        offloaded = offloaded_weights_gb(path, size, model.extra_args, lane_args, gpu_layers=model.gpu_layers)
+        if offloaded:
+            draft_note += f" - {offloaded:.2f} GB held in system RAM"
+        weights = size - offloaded + draft_gb
         if weights > capacity:
             raise AppError(
                 f"{model.name} ({size:.2f} GB{draft_note}) needs {weights:.2f} GB but {lane_label} "
                 f"has a safe model-file budget of {capacity:.2f} GB. Choose another GPU/model or multi-GPU mode."
             )
-        path = resolve_model_path(self.config, model)
-        kv_gb, _note = estimate_kv_cache_gb(path, model.ctx_size)
+        kv_gb, _note = kv_estimate(path, model.ctx_size, model.extra_args, lane_args)
         if kv_gb is None:
             return
         draft_kv_gb = 0.0
@@ -2302,6 +2578,38 @@ class DeploymentManager:
                 "choose another GPU, or use multi-GPU mode."
             )
 
+    def _check_split(self, spec: dict[str, Any], process: Any) -> None:
+        """After a model is split across GPUs, prove its output is sane (see canary.py). Policy `split_canary`:
+        "off" skips it, "warn" records a failure in `split_canary_results` and the log, "refuse" also stops the
+        server and fails the load."""
+        mode = str(getattr(self.config.policy, "split_canary", "warn"))
+        if not spec.get("multi") or mode == "off":
+            return
+        result = run_split_canary(process.base_url, spec["model"].name)
+        self.__dict__.setdefault("split_canary_results", {})[spec["target"]] = {**result, "model": spec["model"].name}
+        if result["ok"]:
+            return
+        print(f"[canary] split model {spec['model'].name}: {result['detail']}", flush=True)
+        if mode == "refuse":
+            process.stop()
+            raise AppError(f"{spec['model'].name} was refused: it is split across GPUs and failed the correctness canary "
+                           f"({result['detail']}). Use a single GPU, a different llama.cpp build, or set "
+                           "policy.split_canary = \"warn\" to accept it anyway.", HTTPStatus.CONFLICT)
+
+    def automatic_lanes(self) -> list[LaneConfig]:
+        """Lanes automatic features may use. A lane switched to `auto_use = false` is never chosen by auto-placement,
+        on-demand loading or routing; explicit requests naming it still work."""
+        lanes = [lane for lane in self.config.lanes if getattr(lane, "auto_use", True)]
+        if not lanes:
+            raise AppError("Every GPU lane is switched off for automatic use (lane `auto_use = false`); name a lane explicitly.",
+                           HTTPStatus.CONFLICT)
+        return lanes
+
+    def set_lane_auto_use(self, lane_key: str, enabled: bool) -> dict[str, Any]:
+        lane = self._lane(lane_key)
+        lane.auto_use = bool(enabled)
+        return {"lane": lane.key, "auto_use": lane.auto_use}
+
     def _auto_lane_for_model(
         self,
         model_name: str,
@@ -2314,7 +2622,7 @@ class DeploymentManager:
         This intentionally uses ``check_fit`` rather than model file size alone: at a 51k
         context, KV cache can make a model that appears to fit the 9070 require the 9700.
         """
-        candidates = sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        candidates = sorted(self.automatic_lanes(), key=lambda lane: lane.vram_gb)
         for lane in candidates:
             verdict = self.check_fit(
                 model_name, lane.key, context_window, input_tokens, max_output_tokens
@@ -2526,8 +2834,12 @@ class DeploymentManager:
         multi-GPU spec is split in --tensor-split proportion (else by lane VRAM), in the same
         largest-lane-first device order LlamaServerProcess.for_multi_gpu launches with."""
         model = spec["model"]
-        kv_gb, _note = estimate_kv_cache_gb(resolve_model_path(self.config, model), spec["context"])
-        total = (model_size_gb(self.config, model) + self._draft_footprint_gb(model)
+        path = resolve_model_path(self.config, model)
+        lane_args = [arg for lane in spec["lanes"] for arg in getattr(lane, "extra_args", [])]
+        kv_gb, _note = kv_estimate(path, spec["context"], model.extra_args, lane_args)
+        offloaded = offloaded_weights_gb(path, model_size_gb(self.config, model), model.extra_args, lane_args,
+                                         gpu_layers=model.gpu_layers)
+        total = (model_size_gb(self.config, model) - offloaded + self._draft_footprint_gb(model)
                  + (kv_gb or 0.0) + self.config.policy.vram_headroom_gb)
         lanes = sorted(spec["lanes"], key=lambda lane: lane.vram_gb, reverse=True) if spec["multi"] else spec["lanes"]
         try:
@@ -2601,7 +2913,7 @@ class DeploymentManager:
         when no single GPU can hold it -- every lane together. Preference: a free lane, then a
         lane whose occupants are idle, least recently used first. Leased lanes are skipped."""
         raw = {"model": requested, "workload_kind": "coding_agent"}
-        lanes = [self._lane(lane_key)] if lane_key else sorted(self.config.lanes, key=lambda lane: lane.vram_gb)
+        lanes = [self._lane(lane_key)] if lane_key else sorted(self.automatic_lanes(), key=lambda lane: lane.vram_gb)
         options: list[dict[str, Any]] = []
         reasons: list[str] = []
         for lane in lanes:
@@ -2611,7 +2923,7 @@ class DeploymentManager:
                 options.append(spec)
             except AppError as exc:
                 reasons.append(f"{lane.key}: {exc}")
-        if not options and lane_key is None and len(self.config.lanes) > 1:
+        if not options and lane_key is None and len(self.automatic_lanes()) > 1 and all(getattr(l, "auto_use", True) for l in self.config.lanes):
             try:
                 spec = self._validate_profile("single_large_model", {"mode": "single_large_model", "model": raw})[0]
                 self._check_leases([spec])
@@ -2749,6 +3061,7 @@ class DeploymentManager:
                 self._admit_vram(spec)
                 process = self._make_process(spec, run_dir)
                 process.start()
+                self._check_split(spec, process)
             except BaseException as exc:
                 message = f"{spec['target']}: {exc}"
                 with self.lock:
@@ -3087,6 +3400,7 @@ class ChatService:
                     "coding_task_id": coding_task_id, "model_name": handle.model.name,
                     "target": target, "workload_kind": workload_kind, "usage": usage,
                     "timing": timing, "finish_reason": choice.get("finish_reason"),
+                    "status": "completed", "request": request_payload, "resources": resources,
                     "messages": messages, "tools": payload.get("tools"), "output_text": output,
                     "reasoning_text": reasoning, "tool_calls": message.get("tool_calls"),
                 })
@@ -3115,6 +3429,17 @@ class ChatService:
             }
             self.store.finish_run(run_id, final)
             self.store.save_samples(run_id, samples, started)
+            if self.history.enabled and payload.get("store_history") is not False:
+                self.history.enqueue({
+                    "id": run_id, "created_at": utc_now(),
+                    "project_id": project_id, "client_id": client["id"] if client else None,
+                    "agent_role": agent_role, "agent_session_id": agent_session_id,
+                    "coding_task_id": coding_task_id, "model_name": handle.model.name,
+                    "target": target, "workload_kind": workload_kind, "status": "failed",
+                    "request": request_payload, "messages": messages, "tools": payload.get("tools"),
+                    "usage": {}, "timing": final["timing"], "resources": resources,
+                    "error_text": str(exc),
+                })
             delivery = self._deliver_to_client(client, run_id, target, handle, final)
             result = {"run_id": run_id, "model": handle.model.name, **final}
             if delivery is not None:
@@ -3340,19 +3665,71 @@ class ChatService:
 class ChatbotHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # One thread per connection was unbounded: a burst of polls or a runaway client could exhaust threads. Above
+    # this many in-flight connections new ones get an immediate 503 + Retry-After instead of queueing forever.
+    max_connections = 128
 
-    def __init__(self, address: tuple[str, int], app_state: "ApplicationState"):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        app_state: "ApplicationState",
+        cors_origins: list[str] | tuple[str, ...] | None = None,
+        max_connections: int | None = None,
+    ):
+        if max_connections:
+            self.max_connections = max_connections
+        self._slots = threading.BoundedSemaphore(self.max_connections)
+        self.rejected_connections = 0
         super().__init__(address, RequestHandler)
         self.app_state = app_state
+        self.cors_origins = frozenset(
+            origin.strip() for origin in (cors_origins or []) if origin and origin.strip()
+        )
+        if hasattr(app_state, "network"):
+            app_state.network = network_metadata(self.server_address[0], self.server_address[1])
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.rejected_connections += 1
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Length: 0\r\n"
+                                b"Connection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 class ApplicationState:
     def __init__(self, config_path: Path, data_dir: Path):
         self.config_path = config_path
         self.config = load_config(config_path)
+        self.network: dict[str, Any] = {
+            "bind_host": "127.0.0.1",
+            "port": 8090,
+            "lan_enabled": False,
+            "base_url": "http://127.0.0.1:8090",
+            "openai_base_url": "http://127.0.0.1:8090/v1",
+            "advertised_urls": [],
+            "advertised_openai_base_urls": [],
+            "model_server_ports": "loopback_only",
+        }
         self.control: ServiceControl | None = None  # set by main(); the UI's restart/stop need it
         self.data_dir = data_dir
+        self.host_os = os_info().get("system", sys.platform)
+        self._ttl: dict[str, tuple[float, Any]] = {}
+        self._ttl_lock = threading.Lock()
+        LlamaServerProcess.registry = ProcessRegistry(data_dir / "managed_servers.json")
+        self.backups: list[dict[str, Any]] = []  # filled by main() before the databases are opened
         self.store = RunStore(data_dir / "chatbot.sqlite3")
+        self.interrupted_runs = self.store.mark_interrupted()
         history_path = (
             Path(self.config.project.chat_history_path)
             if self.config.project.chat_history_path
@@ -3367,10 +3744,18 @@ class ApplicationState:
         self.leases = LeaseStore(training_db)
         self.manager.lease_guard = self._lease_guard
         windows_reader, _why = WindowsGpuReader.try_create() if sys.platform == "win32" else (None, None)
-        self.hardware = HardwareSampler(
-            self.config.lanes, on_samples=self._persist_hardware_samples, on_system=self._persist_system_sample,
-            smi=AmdSmiReader() if sys.platform.startswith("linux") else None, windows_reader=windows_reader,
+        self.hardware_log = HardwareLog(
+            self.training, self.host_os, self.hardware_lane_context, host_sensors=make_host_sensors(data_dir),
+            system_latest=lambda: self.hardware.system_latest,
         )
+        self.manager.on_event = lambda kind, severity, payload, lane=None: self.hardware_log.record_event(kind, severity, payload, lane)
+        self.hardware = HardwareSampler(
+            self.config.lanes, on_samples=self.hardware_log.on_gpu_samples,
+            smi=make_amd_smi_reader() if sys.platform.startswith("linux") else None, windows_reader=windows_reader,
+        )
+        self.archive = HardwareArchive(data_dir / "archive", self.training.connect, self.host_os)
+        self._archive_stop = threading.Event()
+        self.exchange = None  # set by main() when --exchange-dir is given
         self.kernel_faults = KernelFaultWatcher(self._record_kernel_fault)
         self.eval_queue = EvalQueue(training_db, capacity=self.config.evaluation.queue_capacity)
         self.benchmarks = BenchmarkRunner(
@@ -3429,21 +3814,65 @@ class ApplicationState:
                                           "lease_id": lease["id"], "expires_at": None})
         return holders
 
-    def _persist_hardware_samples(self, samples: list[dict[str, Any]]) -> None:
-        # Samples are kept in SQLite only while a training run is live; the idle dashboard
-        # keeps just the in-memory ring buffer so it adds no write load.
-        if self.training.has_active_runs():
-            self.training.add_hardware_samples(samples)
+    def cached(self, key: str, ttl: float, produce: Any) -> Any:
+        """Short-lived answer cache for endpoints the dashboard polls (the full-history dashboard aggregate cost
+        the service 9 h of CPU in three days). Entries expire after `ttl` seconds; data is never stored here."""
+        now = time.monotonic()
+        with self._ttl_lock:
+            hit = self._ttl.get(key)
+            if hit is not None and now - hit[0] < ttl:
+                return hit[1]
+        value = produce()
+        with self._ttl_lock:
+            self._ttl[key] = (time.monotonic(), value)
+            if len(self._ttl) > 64:  # bounded: drop the oldest entries
+                for stale in sorted(self._ttl, key=lambda k: self._ttl[k][0])[:16]:
+                    del self._ttl[stale]
+        return value
 
-    def _persist_system_sample(self, sample: dict[str, Any]) -> None:
-        if self.training.has_active_runs():
-            self.training.add_system_sample(sample["ts"], sample["cpu_pct"], sample["ram_used_pct"], sample["swap_used_bytes"])
+    def hardware_lane_context(self) -> dict[str, dict[str, Any]]:
+        """Lanes a GPU is in use on right now -> what is using it. Idle lanes are absent, so the hardware
+        log writes nothing for them. Read lock-free: the sampler thread must never wait on a model load."""
+        context: dict[str, dict[str, Any]] = {}
+        for target, handle in list(self.manager.handles.items()):
+            for lane in handle.lanes:
+                context[lane.key] = {"model": handle.model.name, "kind": "inference", "target": target}
+        try:
+            for lane, holder in self.leases.lane_holders().items():
+                entry = context.setdefault(lane, {})
+                entry.setdefault("kind", holder.get("kind"))
+                entry["holder"] = holder.get("holder")
+            for run in self.training.live_runs():
+                for lane in run["lanes"]:
+                    entry = context.setdefault(lane, {})
+                    entry.setdefault("kind", "training")
+                    entry["run_id"] = run["id"]
+        except Exception:  # noqa: BLE001 - a locked database must not stop inference logging
+            pass
+        return context
 
     def _record_kernel_fault(self, kind: str, severity: str, payload: dict[str, Any]) -> None:
         self.training.add_event_to_active_runs(kind, severity, payload)
+        self.hardware_log.record_event(kind, severity, payload)
+
+    def _archive_loop(self) -> None:
+        # first pass right away (writes every past day once), then hourly so today's file stays current
+        while True:
+            self.archive.archive_all()
+            if self.exchange is not None:
+                self.exchange.sync()
+            if self._archive_stop.wait(3600):
+                return
 
     def start_telemetry(self) -> None:
-        self.training.prune_hardware(older_than_days=30)
+        # No retention delete: telemetry is history. Daily compressed archives are written beside the database.
+        threading.Thread(target=self._archive_loop, name="telemetry-archive", daemon=True).start()
+        try:  # checkpoints a trainer wrote but never reported (the service listed none for a finished run)
+            recovered = self.service.rescan_unreported_checkpoints()
+            if recovered:
+                print(f"[checkpoints] registered unreported checkpoints from disk: {recovered}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[checkpoints] rescan failed: {exc}", flush=True)
         self.hardware.start()
         self.kernel_faults.start()
         if self.eval_worker is not None:
@@ -3456,6 +3885,15 @@ class ApplicationState:
 
     def stop_telemetry(self) -> None:
         self.hardware.stop()
+        self.hardware_log.close()
+        self._archive_stop.set()
+        self.archive.archive_all()
+        if self.exchange is not None:
+            try:
+                self.exchange.export_runs()
+                self.exchange.export_training_snapshot(force=True)
+            except Exception as exc:  # noqa: BLE001 - an unplugged share must not block shutdown
+                print(f"[exchange] final export failed: {exc}", flush=True)
         self.kernel_faults.stop()
         if self.eval_worker is not None:
             self.eval_worker.stop()
@@ -3472,7 +3910,9 @@ class ApplicationState:
     def bootstrap(self) -> dict[str, Any]:
         return {
             "app_version": APP_VERSION,
+            "api_version": API_VERSION,
             "config_path": str(self.config_path),
+            "network": self.network,
             "catalog": self.manager.catalog(),
             "status": self.manager.status(),
             "runs": self.store.recent(20),
@@ -3485,6 +3925,42 @@ class ApplicationState:
                 "reasoning_effort": "default",
                 "workload_kind": "coding_agent",
             },
+        }
+
+    def health(self) -> dict[str, Any]:
+        status = self.manager.status()
+        return {
+            "status": "ok",
+            "service": "dual-gpu-studio",
+            "app_version": APP_VERSION,
+            "api_version": API_VERSION,
+            "ready": status.get("state") == "ready",
+            "state": status.get("state"),
+            "mode": status.get("mode"),
+            "network": self.network,
+            "host_os": self.host_os,
+            "telemetry": self.telemetry_health(),
+        }
+
+    def telemetry_health(self) -> dict[str, Any]:
+        """Everything that can silently stop telemetry, in one place: missing sensor sources, write errors,
+        archive state, backups and interrupted runs."""
+        snapshot = self.hardware.snapshot(history_points=1)
+        smi = self.hardware.smi
+        return {
+            "gpu_sampler": {"available": snapshot["available"], "reason": snapshot["unavailable_reason"],
+                            **snapshot["sampler"]},
+            "throttle_source": getattr(smi, "source", None) if smi is not None and smi.available else None,
+            "amd_smi": snapshot["amd_smi"],
+            "hardware_log": self.hardware_log.status(),
+            "archive": {"last_run": self.archive.last_run, "last_error": self.archive.last_error,
+                        "files": len(self.archive.files())},
+            "backups": self.backups,
+            "interrupted_runs_marked": self.interrupted_runs,
+            "exchange": self.exchange.status() if self.exchange is not None else None,
+            "storage_warnings": datasafe.storage_warnings(self.data_dir),
+            "archive_write_failures": {"history": self.history.write_failures, "history_records_lost": self.history.records_lost,
+                                       "usage": self.usage.write_failures},
         }
 
     def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3585,12 +4061,15 @@ class ServiceControl:
         return self.state.data_dir / self.RESTORE_FILE
 
     def info(self) -> dict[str, Any]:
+        network = getattr(self.state, "network", None) or network_metadata(self.args.host, self.args.port)
         return {
             "pid": os.getpid(),
             "started_at": self.started_at,
             "uptime_seconds": round(time.monotonic() - self._started),
             "host": self.args.host,
             "port": self.args.port,
+            "api_version": API_VERSION,
+            "network": network,
             "config_path": str(self.state.config_path),
             "data_dir": str(self.state.data_dir),
             "app_version": APP_VERSION,
@@ -3640,9 +4119,14 @@ class ServiceControl:
         self.server.shutdown()
 
     def replacement_command(self) -> list[str]:
-        return [sys.executable, str(Path(__file__).resolve()), "--config", str(self.state.config_path),
-                "--host", self.args.host, "--port", str(self.args.port), "--data-dir", str(self.state.data_dir),
-                "--no-browser", "--replace-pid", str(os.getpid())]
+        command = [
+            sys.executable, str(Path(__file__).resolve()), "--config", str(self.state.config_path),
+            "--host", self.args.host, "--port", str(self.args.port), "--data-dir", str(self.state.data_dir),
+            "--no-browser", "--replace-pid", str(os.getpid()),
+        ]
+        for origin in getattr(self.args, "cors_origin", []) or []:
+            command.extend(["--cors-origin", origin])
+        return command
 
     def _spawn_replacement(self) -> None:
         command = self.replacement_command()
@@ -3653,8 +4137,15 @@ class ServiceControl:
             subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                              **detached_process_kwargs())
 
-    def restore_after_restart(self) -> bool:
-        """On startup: reload the deployment a restart with `reload_models` saved, if it is fresh."""
+    def restore_after_restart(self, allowed: bool = True) -> bool:
+        """Reload a saved deployment only for this app's controlled replacement process.
+
+        An ordinary/manual launch (including one after a Windows reboot) discards any
+        leftover restore file so it cannot unexpectedly load a GPU model.
+        """
+        if not allowed:
+            self.restore_path.unlink(missing_ok=True)
+            return False
         try:
             raw = self.restore_path.read_text(encoding="utf-8")
         except OSError:
@@ -3684,9 +4175,48 @@ class ServiceControl:
 class RequestHandler(BaseHTTPRequestHandler):
     server: ChatbotHTTPServer
     protocol_version = "HTTP/1.1"
+    # Seconds a connection may sit silent (a half-open client, an idle keep-alive) before its thread is released.
+    timeout = 300
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(f"[{self.log_date_time_string()}] {self.address_string()} {format % args}")
+        # BaseHTTPRequestHandler.log_request passes (request line, status, size); errors pass other shapes.
+        if len(args) >= 2 and is_routine_poll(str(args[0]), args[1]):
+            return
+        logging.getLogger(LOGGER_NAME).info(f"[{self.log_date_time_string()}] {self.address_string()} {format % args}")
+
+    def _cors_origin(self) -> str | None:
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return None
+        allowed = getattr(self.server, "cors_origins", frozenset())
+        if origin in allowed:
+            return origin
+        if "*" in allowed:
+            return "*"
+        return None
+
+    def _write_cors_headers(self) -> None:
+        origin = self._cors_origin()
+        if origin is None:
+            return
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS)
+        self.send_header("Access-Control-Expose-Headers", "X-DGPU-Run-ID, X-DGPU-API-Version")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin")
+
+    def _write_common_headers(self) -> None:
+        self.send_header("X-DGPU-API-Version", API_VERSION)
+        self._write_cors_headers()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        # A configured origin gets a normal preflight response. An unconfigured origin receives
+        # no allow headers, so browsers reject it without making state-changing requests.
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._write_common_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -3698,10 +4228,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/bootstrap":
             self._send_json(HTTPStatus.OK, self.server.app_state.bootstrap())
             return
+        if path == "/api/health":
+            state = self.server.app_state
+            self._send_json(HTTPStatus.OK, self._cached("health", 2.0, state.health))
+            return
         if path == "/api/status":
             manager = self.server.app_state.manager
-            self._send_json(HTTPStatus.OK, {**manager.status(), "orphans": manager.orphans_cached(),
-                                            "transitioning": manager.transition_lock.locked()})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    **manager.status(),
+                    "api_version": API_VERSION,
+                    "network": self.server.app_state.network,
+                    "orphans": manager.orphans_cached(),
+                    "transitioning": manager.transition_lock.locked(),
+                },
+            )
             return
         if path == "/api/service":
             try:
@@ -3725,10 +4267,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST,
                                 {"error": "start_date and end_date must be YYYY-MM-DD."})
                 return
-            self._send_json(
-                HTTPStatus.OK,
-                self.server.app_state.store.dashboard(project_id, workload_kind, start_date, end_date),
-            )
+            try:
+                host_os = normalize_os((query.get("os") or [None])[0])
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            state = self.server.app_state
+            self._send_json(HTTPStatus.OK, self._cached(
+                f"dashboard:{project_id}:{workload_kind}:{start_date}:{end_date}:{host_os}", 5.0,
+                lambda: state.store.dashboard(project_id, workload_kind, start_date, end_date, host_os)))
             return
         if path == "/api/usage":
             start_date = (query.get("start_date") or [None])[0]
@@ -3759,14 +4306,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "limit and offset must be integers"})
                 return
+            try:
+                host_os = normalize_os((query.get("os") or [None])[0])
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             project_id = (query.get("project_id") or [None])[0]
             workload_kind = (query.get("workload_kind") or [None])[0]
             store = self.server.app_state.store
             self._send_json(
                 HTTPStatus.OK,
                 {
-                    "runs": store.recent(limit, offset, project_id, workload_kind),
-                    "total": store.count_runs(project_id, workload_kind),
+                    "runs": store.recent(limit, offset, project_id, workload_kind, host_os),
+                    "total": store.count_runs(project_id, workload_kind, host_os),
                     "limit": max(1, min(limit, 500)),
                     "offset": max(0, offset),
                 },
@@ -3796,8 +4348,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             include_content = (query.get("content") or ["0"])[0].lower() in {"1", "true", "yes"}
             self._send_json(HTTPStatus.OK, {
                 "enabled": True,
-                "turns": history.query((query.get("project_id") or [None])[0], start_date, end_date,
-                                       min(max(1, limit), 500), max(0, offset), include_content),
+                "turns": history.query(
+                    project_id=(query.get("project_id") or [None])[0],
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=min(max(1, limit), 500),
+                    offset=max(0, offset),
+                    include_content=include_content,
+                    model_name=(query.get("model_name") or [None])[0],
+                    target=(query.get("target") or [None])[0],
+                    status=(query.get("status") or [None])[0],
+                ),
                 "limit": min(max(1, limit), 500), "offset": max(0, offset),
             })
             return
@@ -3820,6 +4381,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     for record in records
                 ]
             self._send_json(HTTPStatus.OK, {"object": "list", "data": data})
+            return
+        if path.startswith("/api/runs/") and path.endswith("/hardware"):
+            self._hardware_for_run(path.split("/")[3])
             return
         if path.startswith("/api/runs/"):
             run_id = path.rsplit("/", 1)[-1]
@@ -3845,6 +4409,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             except AppError as exc:
                 self._send_json(exc.status, {"error": str(exc)})
             return
+        if path.startswith("/api/hardware/"):
+            self._hardware_get(path, query)
+            return
         if path == "/api/hardware" or path.startswith("/api/training/"):
             try:
                 result = self._training_get(path, query)
@@ -3866,6 +4433,8 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
+            if path in JSON_ONLY_CONTROL_POSTS:
+                self._require_json_content_type()  # a web page cannot trigger these with a blind form POST
             payload = self._read_json()
             if path == "/v1/chat/completions" or (
                 path.startswith("/v1/") and path.endswith("/chat/completions")
@@ -3884,6 +4453,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/models/refresh":
                 self.server.app_state.manager.refresh_models()
                 result = {"catalog": self.server.app_state.manager.catalog()}
+            elif path == "/api/lanes/auto-use":
+                if "lane" not in payload or not isinstance(payload.get("enabled"), bool):
+                    raise AppError("lane and enabled (true/false) are required.")
+                result = self.server.app_state.manager.set_lane_auto_use(str(payload["lane"]), payload["enabled"])
             elif path == "/api/unload":
                 lane = payload.get("lane")
                 expected = payload.get("model")
@@ -4032,6 +4605,81 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise AppError(str(exc), exc.status) from exc
         raise AppError("Not found.", HTTPStatus.NOT_FOUND)
 
+    def _cached(self, key: str, ttl: float, produce: Any) -> Any:
+        cache = getattr(self.server.app_state, "cached", None)
+        return cache(key, ttl, produce) if cache else produce()
+
+    @staticmethod
+    def _epoch(value: Any) -> float | None:
+        """Query values may be epoch seconds or an ISO timestamp."""
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+    def _hardware_get(self, path: str, query: dict[str, list[str]]) -> None:
+        """Saved hardware log: /api/hardware/{log,history,summary,alerts,events,export,archive}.
+        Ranges are `start`/`end` (epoch seconds or ISO); default is the last hour."""
+        state = self.server.app_state
+        log = state.hardware_log
+
+        def arg(name: str) -> str | None:
+            return (query.get(name) or [None])[0]
+
+        try:
+            end = self._epoch(arg("end")) or time.time()
+            start = self._epoch(arg("start"))
+            start = end - 3600 if start is None else start
+            host_os = normalize_os(arg("os"))
+            name = path.removeprefix("/api/hardware/")
+            if name == "log":
+                self._send_json(HTTPStatus.OK, {**log.status(), "telemetry": state.telemetry_health(),
+                                                "archive": state.archive.list_days()})
+            elif name == "history":
+                self._send_json(HTTPStatus.OK, log.history(start, end, int(arg("max_points") or 600), host_os))
+            elif name == "summary":
+                self._send_json(HTTPStatus.OK, log.summary(start, end, arg("lane"), host_os))
+            elif name == "alerts":
+                self._send_json(HTTPStatus.OK, {"alerts": log.alerts_between(
+                    self._epoch(arg("start")), self._epoch(arg("end")), open_only=arg("open") == "1", host_os=host_os)})
+            elif name == "events":
+                self._send_json(HTTPStatus.OK, {"events": log.events_between(
+                    self._epoch(arg("start")), self._epoch(arg("end")), host_os=host_os)})
+            elif name == "range":
+                self._send_json(HTTPStatus.OK, log.data_range(host_os))
+            elif name == "archive":
+                self._send_json(HTTPStatus.OK, {"files": state.archive.list_days(), "last_run": state.archive.last_run,
+                                                "exchange": state.exchange.status() if state.exchange else None})
+            elif name == "export":
+                fmt = (arg("format") or "csv").lower()
+                if fmt not in ("csv", "jsonl"):
+                    raise AppError("format must be csv or jsonl.")
+                content_type, body = log.export(start, end, fmt, arg("table") or "hardware_samples", state.archive, host_os)
+                self._send_bytes(HTTPStatus.OK, body.encode("utf-8"), content_type)
+            else:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        except AppError as exc:
+            self._send_json(exc.status, {"error": str(exc)})
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid query parameter: {exc}"})
+
+    def _hardware_for_run(self, run_id: str) -> None:
+        """Hardware summary and series over one inference run's own time window."""
+        state = self.server.app_state
+        run = state.store.get(run_id)
+        if run is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Run not found"})
+            return
+        start = self._epoch(run["created_at"])
+        end = self._epoch(run.get("finished_at")) or time.time()
+        self._send_json(HTTPStatus.OK, {
+            "run_id": run_id, "start": start, "end": end,
+            "summary": state.hardware_log.summary(start, end),
+            "history": state.hardware_log.history(start, end, 300),
+        })
+
     def _training_get(self, path: str, query: dict[str, list[str]]) -> Any:
         state = self.server.app_state
         if path == "/api/hardware":
@@ -4048,6 +4696,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         self.send_header("Content-Disposition", f'attachment; filename="{response.filename}"')
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._write_common_headers()
         self.end_headers()
         with open(response.path, "rb") as handle:
             while chunk := handle.read(1 << 20):
@@ -4129,24 +4778,34 @@ class RequestHandler(BaseHTTPRequestHandler):
         return self._resolve_project()[0]
 
     def _proxy_openai_completions(self, path: str, payload: dict[str, Any], infill: bool = False) -> None:
-        """Thin passthrough for inline autocomplete (FIM `/v1/completions` and `/infill`).
+        """Proxy FIM autocomplete while asynchronously archiving per-model input/output telemetry.
 
-        Deliberately minimal: autocomplete fires on nearly every typing pause, so this does NO
-        per-request run row, GPU sampling, or history logging. It DOES record lightweight
-        project usage (request count, and tokens for non-streamed responses) into the daily
-        rollup ledger, which is an O(1) in-memory accumulate -- so every connection's usage is
-        tracked without the per-request overhead or DB bloat a full run row would add. It routes
-        through a loaded lane (dual-GPU) and counts in-flight so a deploy change drains it.
+        Autocomplete can fire on every typing pause, so it deliberately avoids synchronous run-row
+        writes and GPU probes. The shared background sampler supplies resource telemetry and the
+        full request/response is queued to ChatHistoryStore in O(1), off the inference path.
         """
         state = self.server.app_state
-        _target, handle = self._resolve_lane_handle(path, payload)
+        target, handle = self._resolve_lane_handle(path, payload)
         connection_type = self.headers.get("X-DGPU-Connection-Type") or "autocomplete"
-        project_id = self._request_project_id()
+        project_id, client = self._resolve_project()
         suffix = "/infill" if infill else "/v1/completions"
         request_payload = dict(payload)
         request_payload["model"] = handle.model.name
         stream = bool(request_payload.get("stream"))
-        input_tokens = output_tokens = 0
+        history_on = (
+            state.chat.history.enabled
+            and payload.get("store_history") is not False
+            and self.headers.get("X-DGPU-No-History", "").lower() not in {"1", "true", "yes"}
+        )
+        run_id = str(uuid.uuid4())
+        baseline = state.manager.sampler.latest()
+        started = time.monotonic()
+        backend_payload: dict[str, Any] = {}
+        output_parts: list[str] = []
+        finish_reason: str | None = None
+        status = "completed"
+        error_text: str | None = None
+        concurrent_at_start: int | None = None
         try:
             request = urlrequest.Request(
                 f"{handle.process.base_url}{suffix}",
@@ -4154,12 +4813,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
                 method="POST",
             )
-            with handle.serving(claimed=True), urlrequest.urlopen(request, timeout=120) as response:
+            with handle.serving(claimed=True) as concurrent_at_start, urlrequest.urlopen(request, timeout=120) as response:
                 if stream:
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
+                    self.send_header("X-DGPU-Run-ID", run_id)
+                    self._write_common_headers()
                     self.end_headers()
                     self.close_connection = True
                     done = False
@@ -4169,29 +4830,97 @@ class RequestHandler(BaseHTTPRequestHandler):
                             break
                         self.wfile.write(line)
                         self.wfile.flush()
-                        if done and not line.strip():
+                        stripped = line.strip()
+                        if done and not stripped:
                             break  # emit [DONE]'s terminating blank line, then stop
-                        if line.strip() == b"data: [DONE]":
+                        if stripped == b"data: [DONE]":
                             done = True
+                            continue
+                        if not stripped.startswith(b"data:"):
+                            continue
+                        try:
+                            chunk = json.loads(stripped[5:].strip())
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        backend_payload.update({
+                            key: value for key, value in chunk.items()
+                            if key != "choices" and value is not None
+                        })
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            choice = choices[0]
+                            delta = choice.get("delta") or {}
+                            text = choice.get("text") or delta.get("content") or ""
+                            if text:
+                                output_parts.append(str(text))
+                            if choice.get("finish_reason") is not None:
+                                finish_reason = str(choice["finish_reason"])
+                    if not done:
+                        raise RuntimeError("Model stream ended before [DONE]; completion may be truncated.")
                 else:
                     body = response.read()
+                    try:
+                        parsed = json.loads(body)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        backend_payload = parsed
+                        choice = (parsed.get("choices") or [{}])[0]
+                        message = choice.get("message") or {}
+                        output = choice.get("text") or message.get("content") or parsed.get("content") or ""
+                        output_parts = [str(output)] if output else []
+                        finish_reason = choice.get("finish_reason")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
+                    self.send_header("X-DGPU-Run-ID", run_id)
+                    self._write_common_headers()
                     self.end_headers()
                     self.wfile.write(body)
-                    try:  # best-effort token counts; usage (OpenAI) or tokens_* (llama infill)
-                        parsed = json.loads(body)
-                        usage = parsed.get("usage") or {}
-                        input_tokens = usage.get("prompt_tokens") or parsed.get("tokens_evaluated") or 0
-                        output_tokens = usage.get("completion_tokens") or parsed.get("tokens_predicted") or 0
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            status = "cancelled"
+            error_text = str(exc)
         except urlerror.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            status = "failed"
+            error_text = detail
             raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
+        except Exception as exc:
+            status = "failed"
+            error_text = str(exc)
+            raise
         finally:
-            state.chat.usage.record(project_id, connection_type, input_tokens, output_tokens)
+            elapsed = time.monotonic() - started
+            usage = ChatService._normalize_usage(backend_payload)
+            if usage.get("input_tokens") is None:
+                usage["input_tokens"] = backend_payload.get("tokens_evaluated")
+            if usage.get("output_tokens") is None:
+                usage["output_tokens"] = backend_payload.get("tokens_predicted")
+            timing = ChatService._normalize_timing(backend_payload, usage, elapsed)
+            timing["concurrent_requests_at_start"] = concurrent_at_start
+            samples = state.chat._sample_window(started, baseline)
+            resources = ChatService._resource_summary(samples, target)
+            state.chat.usage.record(
+                project_id, connection_type, usage.get("input_tokens"), usage.get("output_tokens")
+            )
+            if history_on:
+                state.chat.history.enqueue({
+                    "id": run_id,
+                    "created_at": utc_now(),
+                    "project_id": project_id,
+                    "client_id": client["id"] if client else None,
+                    "model_name": handle.model.name,
+                    "target": target,
+                    "workload_kind": connection_type,
+                    "status": status,
+                    "request": request_payload,
+                    "usage": usage,
+                    "timing": timing,
+                    "resources": resources,
+                    "finish_reason": finish_reason,
+                    "output_text": "".join(output_parts) or None,
+                    "error_text": error_text,
+                })
 
     def _proxy_openai_chat(self, path: str, payload: dict[str, Any]) -> None:
         """Stream an OpenAI-compatible coding-agent request through an active GPU lane.
@@ -4297,6 +5026,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         response_started = False
         concurrent_at_start: int | None = None
+        history_record = {
+            "id": run_id,
+            "project_id": project_id,
+            "client_id": client["id"] if client else None,
+            "agent_role": agent_role,
+            "agent_session_id": session_id,
+            "coding_task_id": coding_task_id,
+            "model_name": handle.model.name,
+            "target": target,
+            "workload_kind": "coding_agent",
+            "request": request_payload,
+            "messages": payload.get("messages"),
+            "tools": payload.get("tools"),
+        }
         try:
             request = urlrequest.Request(
                 f"{handle.process.base_url}/v1/chat/completions",
@@ -4314,6 +5057,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     self.send_header("X-DGPU-Run-ID", run_id)
+                    self._write_common_headers()
                     self.end_headers()
                     self.close_connection = True
                     response_started = True
@@ -4430,13 +5174,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Full content lives only here, in the separate archive -- never in the
                 # metrics DB, whose stored_request/backend_response stay redacted.
                 state.chat.history.enqueue({
-                    "id": run_id, "created_at": utc_now(),
-                    "project_id": project_id, "client_id": client["id"] if client else None,
-                    "agent_role": agent_role, "agent_session_id": session_id,
-                    "coding_task_id": coding_task_id, "model_name": handle.model.name,
-                    "target": target, "workload_kind": "coding_agent", "usage": usage,
+                    **history_record, "created_at": utc_now(), "status": "completed", "usage": usage,
                     "timing": timing, "finish_reason": backend_payload.get("finish_reason"),
-                    "messages": payload.get("messages"), "tools": payload.get("tools"),
+                    "resources": resources,
                     "output_text": "".join(output_parts) or None,
                     "reasoning_text": "".join(reasoning_parts) or None, "tool_calls": tool_calls,
                 })
@@ -4447,15 +5187,24 @@ class RequestHandler(BaseHTTPRequestHandler):
                 backend_payload["dgpu_run_id"] = run_id
                 self._send_json(HTTPStatus.OK, backend_payload)
         except (BrokenPipeError, ConnectionResetError) as exc:
-            self._finish_gateway_failure(run_id, target, started, baseline, "cancelled", str(exc))
+            self._finish_gateway_failure(
+                run_id, target, started, baseline, "cancelled", str(exc),
+                history_record if history_on else None,
+            )
         except urlerror.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            self._finish_gateway_failure(run_id, target, started, baseline, "failed", detail)
+            self._finish_gateway_failure(
+                run_id, target, started, baseline, "failed", detail,
+                history_record if history_on else None,
+            )
             if response_started:
                 return
             raise AppError(f"Model server returned HTTP {exc.code}: {detail}", exc.code) from exc
         except Exception as exc:
-            self._finish_gateway_failure(run_id, target, started, baseline, "failed", str(exc))
+            self._finish_gateway_failure(
+                run_id, target, started, baseline, "failed", str(exc),
+                history_record if history_on else None,
+            )
             if response_started:
                 return
             raise
@@ -4468,6 +5217,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         baseline: dict[str, Any] | None,
         status: str,
         error_text: str,
+        history_record: dict[str, Any] | None = None,
     ) -> None:
         state = self.server.app_state
         try:
@@ -4481,6 +5231,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             }
             state.store.finish_run(run_id, final)
             state.store.save_samples(run_id, samples, started)
+            if history_record is not None and state.chat.history.enabled:
+                state.chat.history.enqueue({
+                    **history_record,
+                    "created_at": utc_now(),
+                    "status": status,
+                    "usage": {},
+                    "timing": final["timing"],
+                    "resources": final["resources"],
+                    "error_text": error_text,
+                })
         except Exception:  # noqa: BLE001
             pass
 
@@ -4538,6 +5298,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._write_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -4659,7 +5420,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="127.0.0.1",
         help="Web UI bind address. Defaults to localhost; use 0.0.0.0 explicitly for LAN access.",
     )
+    parser.add_argument(
+        "--lan",
+        action="store_true",
+        help="Enable trusted-LAN access by binding the gateway to 0.0.0.0 (same as --host 0.0.0.0).",
+    )
     parser.add_argument("--port", type=int, default=8090, help="Web UI port. Defaults to 8090.")
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "Allow a browser app origin to call the API; repeat for multiple origins. "
+            "Use '*' only on a trusted LAN."
+        ),
+    )
     parser.add_argument("--data-dir", default="./chat_runs", help="Directory for SQLite data and server logs.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the UI in the default browser.")
     parser.add_argument("--check", action="store_true", help="Validate configuration and storage, then exit.")
@@ -4674,10 +5450,40 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "One-shot maintenance: delete runs (and their resource samples) older than "
-            "this many days, then continue starting normally. There is no automatic "
-            "retention policy otherwise -- the run database keeps everything forever "
-            "unless this is passed."
+            "One-shot maintenance that DELETES runs (and their resource samples) older than this many days. "
+            "Refused unless --confirm-delete is also given; a verified backup is taken first. Nothing is "
+            "deleted by default: the databases keep everything forever."
+        ),
+    )
+    parser.add_argument("--confirm-delete", action="store_true",
+                        help="Required for --prune-older-than-days, which permanently removes data.")
+    parser.add_argument(
+        "--skip-backup", action="store_true",
+        help="Do not take the verified pre-start database backup (one per app/schema version, kept forever in <data-dir>/backups).",
+    )
+    parser.add_argument(
+        "--exchange-dir", default=None, metavar="DIR",
+        help=("Shared folder (for example on the NTFS partition both operating systems mount) where this install "
+              "writes append-only run and telemetry files and imports the other OS's files. See docs/CROSS_OS_HISTORY.md."),
+    )
+    parser.add_argument(
+        "--import-runs-from",
+        action="append",
+        default=[],
+        metavar="CHATBOT_DB",
+        help=("Before starting, import the inference run history from another install's chatbot.sqlite3 (read-only "
+              "copy; runs already present are skipped; imported rows are tagged with the OS they came from)."),
+    )
+    parser.add_argument(
+        "--import-from",
+        action="append",
+        default=[],
+        metavar="TRAINING_DB",
+        help=(
+            "Before starting, merge the training telemetry (runs, steps, hardware samples, ...) from another "
+            "install's training.sqlite3 into this data directory's, by run id. Repeatable. The other file is "
+            "opened read-only and never modified; runs already present are left untouched, so it is safe to "
+            "pass on every start. Use it to see Windows and Ubuntu runs in one dashboard."
         ),
     )
     return parser
@@ -4685,13 +5491,72 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.lan and args.host in LOOPBACK_HOSTS:
+        args.host = "0.0.0.0"
     if args.replace_pid is not None and not wait_for_exit(args.replace_pid):
         print(f"WARNING: process {args.replace_pid} is still running; starting anyway.")
     config_path = Path(args.config).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser()
     if not data_dir.is_absolute():
         data_dir = (config_path.parent / data_dir).resolve()
+    if args.prune_older_than_days is not None and not args.confirm_delete:
+        print("Refusing --prune-older-than-days without --confirm-delete: it permanently deletes run history.")
+        return 2
+    if args.prune_older_than_days is not None:  # its own timestamped copy, whatever --skip-backup says
+        safety = datasafe.backup_sqlite(data_dir / "chatbot.sqlite3", data_dir / "backups", "before-prune-" + time.strftime("%Y%m%dT%H%M%S"))
+        if safety.error:
+            print(f"ERROR: could not back up before pruning: {safety.error}")
+            return 3
+        print(f"Backed up before pruning -> {safety.path}", flush=True)
+    backups: list[dict[str, Any]] = []
+    if not args.skip_backup:
+        from dual_gpu_setup.training.db import SCHEMA_VERSION
+
+        label = f"pre-v{APP_VERSION}-s{SCHEMA_VERSION}"
+        for name in ("chatbot.sqlite3", "chat_history.sqlite3", "project_usage.sqlite3", "training.sqlite3"):
+            result = datasafe.backup_sqlite(data_dir / name, data_dir / "backups", label)
+            backups.append(result.as_dict())
+            if result.error:
+                print(f"ERROR: backup of {name} failed: {result.error}\n"
+                      "Not starting, so nothing is migrated without a safety copy. Free disk space or pass --skip-backup.")
+                return 3
+            if result.path and not result.skipped:
+                print(f"Backed up {name} -> {result.path} (verified)", flush=True)
+    if args.import_runs_from:
+        from dual_gpu_setup.exchange import import_runs_db, import_usage_db
+
+        before = datasafe.table_counts(data_dir / "chatbot.sqlite3")
+        state_for_schema = RunStore(data_dir / "chatbot.sqlite3")  # create/upgrade the destination schema first
+        for source in args.import_runs_from:
+            result = import_runs_db(state_for_schema.path, Path(source).expanduser(), default_os="Windows")
+            print(f"Imported runs from {source}: {json.dumps(result)}", flush=True)
+            if not result["ok"]:
+                print("WARNING: run history was not imported (see above); the service starts normally.")
+            usage_source = Path(source).expanduser().with_name("project_usage.sqlite3")
+            if usage_source.is_file() and (data_dir / "project_usage.sqlite3").is_file():
+                print(f"Imported usage from {usage_source}: {json.dumps(import_usage_db(data_dir / 'project_usage.sqlite3', usage_source))}",
+                      flush=True)
+        problems = datasafe.verify_counts_not_lower(before, datasafe.table_counts(data_dir / "chatbot.sqlite3"))
+        if problems:
+            print(f"ERROR: row counts dropped during import: {problems}")
+            return 4
+    if args.import_from:
+        from dual_gpu_setup.training.merge import merge_many
+
+        for report in merge_many(data_dir / "training.sqlite3", args.import_from, all_telemetry=True,
+                                 dest_os=os_info().get("system") or None):
+            print(report.summary(), flush=True)
+            if not report.ok:
+                print("WARNING: some runs were not imported (see above); the service starts normally.")
+    setup_service_logging(data_dir)
     state = ApplicationState(config_path, data_dir)
+    state.backups = backups
+    if args.exchange_dir:
+        from dual_gpu_setup.exchange import ExchangeSync
+        from dual_gpu_setup.training.merge import merge_training_db
+
+        state.exchange = ExchangeSync(Path(args.exchange_dir).expanduser(), state.host_os, data_dir, state.store.path,
+                                      data_dir / "training.sqlite3", merge_training=merge_training_db)
     if args.prune_older_than_days is not None:
         result = state.store.prune_older_than(args.prune_older_than_days)
         print(
@@ -4705,15 +5570,17 @@ def main() -> int:
         state.usage.close()
         return 0
 
-    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+    if args.host not in LOOPBACK_HOSTS:
         print("WARNING: This app has no authentication. Binding outside localhost exposes prompts and model controls.")
-    server = ChatbotHTTPServer((args.host, args.port), state)
+    if args.cors_origin:
+        print(f"  CORS origins: {', '.join(args.cors_origin)}")
+    server = ChatbotHTTPServer((args.host, args.port), state, args.cors_origin)
     state.control = ServiceControl(state, args)
     state.control.server = server
     local_url = f"http://127.0.0.1:{args.port}"
     state.benchmarks.server_url = local_url
-    is_lan_enabled = args.host not in {"127.0.0.1", "localhost", "::1"}
-    lan_urls = [f"http://{address}:{args.port}" for address in local_network_addresses()] if is_lan_enabled else []
+    is_lan_enabled = args.host not in LOOPBACK_HOSTS
+    lan_urls = list(state.network["advertised_urls"]) if is_lan_enabled else []
     print("Dual GPU Studio is running")
     print(f"  Local: {local_url}")
     if lan_urls:
@@ -4743,7 +5610,7 @@ def main() -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, stop_server)
     state.start_telemetry()
-    state.control.restore_after_restart()
+    state.control.restore_after_restart(allowed=args.replace_pid is not None)
     try:
         server.serve_forever(poll_interval=0.5)
     finally:

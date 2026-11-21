@@ -68,8 +68,16 @@ def _worker(rank: int, world_size: int, config: dict[str, Any], queue: Any) -> N
     import torch.nn.functional as F
 
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(config["port"]))
+    # Some Windows PyTorch wheels are built without libuv; the legacy TCPStore works for this
+    # local numerical-equivalence diagnostic and keeps the check portable across wheel variants.
+    os.environ.setdefault("USE_LIBUV", "0")
     device = torch.device("cpu") if config["device"] == "cpu" else torch.device(config["device"], rank)
-    dist.init_process_group(config["backend"], rank=rank, world_size=world_size)
+    dist.init_process_group(
+        config["backend"],
+        init_method=f"tcp://127.0.0.1:{config['port']}",
+        rank=rank,
+        world_size=world_size,
+    )
 
     def make_model() -> Any:
         torch.manual_seed(1234)
@@ -113,7 +121,8 @@ def _worker(rank: int, world_size: int, config: dict[str, Any], queue: Any) -> N
         optimizer.step()
         losses.append(float(token_loss.detach()))
     if rank == 0:
-        queue.put({"params": [p.detach().cpu().flatten() for p in model.parameters()]})
+        # Plain lists avoid Windows torch shared-memory handles outliving the spawned worker.
+        queue.put({"params": [p.detach().cpu().flatten().tolist() for p in model.parameters()]})
     dist.destroy_process_group()
 
 
@@ -154,9 +163,18 @@ def run_equivalence_check(world_size: int = 2, steps: int = 3, accumulation: int
 
     config = {"steps": steps, "accumulation": accumulation, "device": device, "backend": backend, "mode": mode, "port": port}
     context = mp.get_context("spawn")
-    queue = context.SimpleQueue()
-    mp.spawn(_worker, args=(world_size, config, queue), nprocs=world_size, join=True)
-    ddp_params = queue.get()["params"]
+    # Consume the result before joining: on Windows a child can block flushing a result larger
+    # than the pipe buffer while the parent waits in mp.spawn(join=True).
+    queue = context.Queue()
+    processes = mp.spawn(_worker, args=(world_size, config, queue), nprocs=world_size, join=False)
+    try:
+        result = queue.get(timeout=120)
+    except Exception:
+        processes.join()
+        raise
+    processes.join()
+    ddp_params = [torch.tensor(values) for values in result["params"]]
+    queue.close()
     reference = _reference(config, world_size)
     worst = max(float((a - b).abs().max()) for a, b in zip(ddp_params, reference))
     return {"max_abs_param_diff": worst, "tolerance": tolerance, "equivalent": worst <= tolerance, "mode": mode,

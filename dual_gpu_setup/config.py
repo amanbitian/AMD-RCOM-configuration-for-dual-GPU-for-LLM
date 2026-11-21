@@ -19,11 +19,11 @@ class ProjectConfig:
     log_dir: str = "./runs"
     cleanup_ports_on_start: bool = True
     start_timeout_seconds: int = 900
-    # Full-conversation archive (opt-in: it retains complete prompts and responses). When on,
-    # every request through /api/chat and the OpenAI gateway is logged -- content plus token
-    # counts -- to a SEPARATE SQLite file, written off the request path. Empty path = default
-    # next to the metrics DB. See CODING_AGENTS.md "Conversation archive".
-    store_chat_history: bool = False
+    # Full per-model request/response archive. Enabled by default so every API route has a durable
+    # input/output + telemetry record in a SEPARATE SQLite file, written off the inference path.
+    # Set false only when the operator explicitly does not want content retained. Empty path =
+    # chat_history.sqlite3 next to the metrics DB.
+    store_chat_history: bool = True
     chat_history_path: str = ""
     # Watertight, zero-config attribution: a client needs no API key or pre-registration. It
     # names itself via its Bearer key or an X-DGPU-Project header and the project is created on
@@ -91,6 +91,15 @@ class PolicyConfig:
     no_mmproj: bool = True
     jinja: bool = True
     kill_busy_ports: bool = True
+    # correctness check after a model is split across both GPUs: "off", "warn" (record a failure) or "refuse" (stop it)
+    split_canary: str = "warn"
+    # Hide the other GPU from a single-lane server (HIP_VISIBLE_DEVICES) so it cannot even enumerate it. Off by default:
+    # enable only after the real-hardware isolation test (`pytest -m rocm_hardware`) passes on this machine.
+    isolate_single_lane: bool = False
+    # Restart a llama-server that died while loaded (same lane, back-off, crash-loop stop). Off by default.
+    auto_restart: bool = False
+    auto_restart_max: int = 3
+    auto_restart_window_s: int = 600
     health_poll_seconds: float = 1.0
     settle_seconds_after_restart: float = 2.0
     # How long to let a lane's in-flight requests finish before stopping its server during a
@@ -127,6 +136,9 @@ class LaneConfig:
     host: str = "127.0.0.1"
     extra_args: list[str] = field(default_factory=list)
     pci_bus: str = ""
+    # False = automatic features (auto-placement, on-demand loading, routing) never put a model on this GPU.
+    # An explicit request that names the lane still works.
+    auto_use: bool = True
 
 
 @dataclass(slots=True)
@@ -139,11 +151,11 @@ class ModelConfig:
     reasoning_mode: str = ""
     reasoning_budget: int | None = None
     reasoning_effort: str = "default"
-    # Speculative decoding (lossless): a small draft model proposes tokens that the
-    # target model verifies, raising tokens/sec without changing the output. draft_model
-    # is a path/glob resolved like `path`; empty disables it. The remaining knobs map to
-    # llama-server --draft-max/--draft-min/--draft-p-min/--gpu-layers-draft (0/None = let
-    # the backend default decide). See CODING_AGENTS.md.
+    # Speculative decoding (lossless): either an external draft model or an embedded head
+    # (Qwen3.8 MTP) proposes tokens that the target verifies. `spec_type` is empty by default,
+    # preserving ordinary decode; use "draft-mtp" only for a GGUF containing nextn tensors.
+    # draft_model is a path/glob resolved like `path`. The remaining knobs map to modern
+    # llama.cpp --spec-draft-* flags, with runtime-compatible legacy spellings when needed.
     draft_model: str = ""
     draft_max: int = 0
     draft_min: int = 0
@@ -160,6 +172,9 @@ class ModelConfig:
     ubatch_size: int = 0
     host: str = ""
     tags: list[str] = field(default_factory=list)
+    # Kept at the end so existing callers that construct ModelConfig positionally retain
+    # their field ordering; configuration loading uses this by keyword.
+    spec_type: str = ""
 
 
 @dataclass(slots=True)
@@ -272,6 +287,11 @@ def load_config(path: str | Path) -> AppConfig:
         no_mmproj=bool(policy_raw.get("no_mmproj", policy_defaults.no_mmproj)),
         jinja=bool(policy_raw.get("jinja", policy_defaults.jinja)),
         kill_busy_ports=bool(policy_raw.get("kill_busy_ports", policy_defaults.kill_busy_ports)),
+        split_canary=str(policy_raw.get("split_canary", policy_defaults.split_canary)).lower(),
+        isolate_single_lane=bool(policy_raw.get("isolate_single_lane", policy_defaults.isolate_single_lane)),
+        auto_restart=bool(policy_raw.get("auto_restart", policy_defaults.auto_restart)),
+        auto_restart_max=int(policy_raw.get("auto_restart_max", policy_defaults.auto_restart_max)),
+        auto_restart_window_s=int(policy_raw.get("auto_restart_window_s", policy_defaults.auto_restart_window_s)),
         health_poll_seconds=float(policy_raw.get("health_poll_seconds", policy_defaults.health_poll_seconds)),
         settle_seconds_after_restart=float(
             policy_raw.get("settle_seconds_after_restart", policy_defaults.settle_seconds_after_restart)
@@ -301,6 +321,7 @@ def load_config(path: str | Path) -> AppConfig:
             host=str(item.get("host", project.host)),
             extra_args=[str(value) for value in item.get("extra_args", [])],
             pci_bus=str(item.get("pci_bus", "")).strip().lower(),
+            auto_use=bool(item.get("auto_use", True)),
         )
         for item in raw.get("lanes", [])
     ]
@@ -317,6 +338,7 @@ def load_config(path: str | Path) -> AppConfig:
                 int(item["reasoning_budget"]) if "reasoning_budget" in item and item["reasoning_budget"] is not None else None
             ),
             draft_model=_expand(str(item.get("draft_model", ""))),
+            spec_type=str(item.get("spec_type", "")),
             draft_max=int(item.get("draft_max", 0)),
             draft_min=int(item.get("draft_min", 0)),
             draft_p_min=float(item.get("draft_p_min", 0.0)),
@@ -399,8 +421,8 @@ def _load_evaluation(raw: dict[str, Any]) -> EvaluationConfig:
 def validate_config(config: AppConfig) -> None:
     if config.evaluation.enabled and config.evaluation.lane not in {lane.key for lane in config.lanes}:
         raise SystemExit(f"[evaluation] lane '{config.evaluation.lane}' is not a configured lane.")
-    if len(config.lanes) != 2:
-        raise SystemExit("This setup expects exactly 2 lanes for a dual-GPU scheduler.")
+    if not 1 <= len(config.lanes) <= 2:
+        raise SystemExit("This setup expects one or two lanes (one lane = start with a single GPU present).")
     if not config.models:
         raise SystemExit("Config must define at least one model.")
 
@@ -416,3 +438,22 @@ def validate_config(config: AppConfig) -> None:
     for model in config.models:
         if model.pin_lane and model.pin_lane not in lane_keys:
             raise SystemExit(f"Model '{model.name}' pins unknown lane '{model.pin_lane}'.")
+        spec_types = {part.strip() for part in model.spec_type.split(",") if part.strip()}
+        valid_spec_types = {
+            "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash", "draft-dspark",
+            "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache",
+        }
+        unknown = spec_types - valid_spec_types
+        if unknown:
+            raise SystemExit(
+                f"Model '{model.name}' has unsupported spec_type value(s): {', '.join(sorted(unknown))}."
+            )
+        if "draft-mtp" in spec_types and model.draft_model:
+            raise SystemExit(
+                f"Model '{model.name}' cannot combine embedded draft-mtp with draft_model."
+            )
+        if model.draft_max < 0 or model.draft_min < 0 or not 0.0 <= model.draft_p_min <= 1.0:
+            raise SystemExit(
+                f"Model '{model.name}' speculative settings require non-negative draft sizes "
+                "and draft_p_min between 0 and 1."
+            )
