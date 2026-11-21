@@ -25,4 +25,8 @@ include = ["dual_gpu_setup*"]
 testpaths = ["tests"]
 # pytest's default basetemp (a shared dir under the system temp root) can hit permission
 # errors in some sandboxed environments; keeping it inside the repo avoids that.
-addopts = "--basetemp=.pytest_tmp"
+addopts = "--basetemp=.pytest_tmp -m 'not rocm_hardware'"
+markers = [
+    "real_sysfs: the test supplies its own fake /sys and must not have the real-VRAM probe stubbed out",
+    "rocm_hardware: needs the real R9700 + RX 9070 XT on native Linux; run with `pytest -m rocm_hardware` on the workstation only",
+]

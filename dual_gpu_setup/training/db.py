@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _new_connection(path: Path) -> sqlite3.Connection:
@@ -81,6 +81,11 @@ class Database:
         """Create missing tables and add missing columns. Safe to run on every start and on
         databases created by earlier versions."""
         with self.connect() as connection:
+            found = connection.execute("PRAGMA user_version").fetchone()[0]
+            if found > SCHEMA_VERSION:
+                # an install running newer code (the other OS, or a newer checkout) already upgraded this file
+                raise RuntimeError(f"{self.path} is schema v{found}, newer than this code (v{SCHEMA_VERSION}). "
+                                   "Update Dual-GPU Studio before opening it; nothing was changed.")
             connection.executescript(script)
             for table, columns in (additions or {}).items():
                 existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}

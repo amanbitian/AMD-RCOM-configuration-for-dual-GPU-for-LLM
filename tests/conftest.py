@@ -24,6 +24,10 @@ def _release_sqlite_handles():
     # later tests. Forcing a collection after each test finalizes those connections in time.
     yield
     gc.collect()
+    # ApplicationState installs a process registry on the class; never let it leak into the next test
+    from dual_gpu_setup.server import LlamaServerProcess
+
+    LlamaServerProcess.registry = None
 
 
 class _GuardedControl:
@@ -51,6 +55,17 @@ class _GuardedHost:
 
     def __getattr__(self, name):
         return getattr(self._real, name)
+
+
+@pytest.fixture(autouse=True)
+def _never_read_real_vram(request, monkeypatch):
+    """lane_free_vram_gb reads the amdgpu kernel files on Linux; unit tests must not see this machine's real GPUs.
+    A test that exercises the probe itself points it at a fake sysfs and opts out with @pytest.mark.real_sysfs."""
+    if request.node.get_closest_marker("real_sysfs"):
+        return
+    import dual_gpu_setup.lmstudio as lmstudio
+
+    monkeypatch.setattr(lmstudio, "free_from_sysfs", lambda lanes, sysfs_root="/sys": {})
 
 
 @pytest.fixture(autouse=True)
@@ -96,12 +111,18 @@ def _encode_value(value: Any) -> tuple[int, bytes]:
     raise TypeError(f"Unsupported fixture value type: {type(value)!r}")
 
 
-def write_gguf(path: Path, metadata: dict[str, Any]) -> Path:
-    """Write a minimal valid GGUF file (version 3, zero tensors) with the given metadata."""
-    body = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", len(metadata))
+def write_gguf(path: Path, metadata: dict[str, Any], tensors: list[str] | None = None) -> Path:
+    """Write a minimal GGUF header; optional tensor entries contain no tensor data."""
+    tensors = tensors or []
+    body = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", len(tensors)) + struct.pack("<Q", len(metadata))
     for key, value in metadata.items():
         value_type, encoded = _encode_value(value)
         body += _encode_string(key) + struct.pack("<I", value_type) + encoded
+    for name in tensors:
+        # One f32 scalar dimension, with offset zero. The header reader deliberately stops
+        # before tensor data, so no payload is needed for these inventory tests.
+        body += _encode_string(name) + struct.pack("<I", 1) + struct.pack("<Q", 1)
+        body += struct.pack("<I", 0) + struct.pack("<Q", 0)
     path.write_bytes(body)
     return path
 
@@ -110,8 +131,8 @@ def write_gguf(path: Path, metadata: dict[str, Any]) -> Path:
 def gguf_writer(tmp_path: Path):
     """Returns a function(name, metadata) -> Path that writes a fixture GGUF under tmp_path."""
 
-    def _write(name: str, metadata: dict[str, Any]) -> Path:
-        return write_gguf(tmp_path / name, metadata)
+    def _write(name: str, metadata: dict[str, Any], tensors: list[str] | None = None) -> Path:
+        return write_gguf(tmp_path / name, metadata, tensors)
 
     return _write
 

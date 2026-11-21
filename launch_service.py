@@ -10,9 +10,12 @@ this script exists specifically to close that gap from outside the HTTP layer.
 Behavior:
   - If the service is already running and healthy at --host:--port, this exits immediately
     (status 0) without touching it -- safe to call before every session.
-  - Otherwise, it starts app.py as a detached background process (it keeps running after
-    this launcher exits), waits until it reports healthy, then exits. The launcher itself
-    does not stay resident.
+  - If the service is not running, this is status-only unless the caller passes --start.
+    This prevents login-time clients and other background integrations from silently
+    starting the service and loading GPU models after a reboot.
+  - With --start, it starts app.py as a detached background process (it keeps running
+    after this launcher exits), waits until it reports healthy, then exits. The launcher
+    itself does not stay resident.
   - Run from a terminal it opens the UI in your browser (also when the service was already
     running). Run by another program (no terminal attached) it stays silent. `--open-browser`
     and `--no-browser` override that.
@@ -40,15 +43,27 @@ from dual_gpu_setup.host_info import default_config_name, detached_process_kwarg
 
 
 def _probe(base_url: str, timeout: float = 2.0) -> dict | None:
-    """Returns the /api/status payload if base_url is our service and healthy, else None."""
+    """Return this service's health payload, with a legacy status fallback."""
+    try:
+        with urlrequest.urlopen(f"{base_url}/api/health", timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if (
+            isinstance(payload, dict)
+            and payload.get("service") == "dual-gpu-studio"
+            and "state" in payload
+        ):
+            return payload
+        # A successful but differently identified health endpoint belongs to another service.
+        return None
+    except (urlerror.URLError, TimeoutError, OSError, ValueError):
+        pass
+    # Older Dual GPU Studio releases predate /api/health. Keep status probing for a rolling update.
     try:
         with urlrequest.urlopen(f"{base_url}/api/status", timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urlerror.URLError, TimeoutError, OSError, ValueError):
         return None
-    if not isinstance(payload, dict) or "state" not in payload:
-        return None
-    return payload
+    return payload if isinstance(payload, dict) and "state" in payload else None
 
 
 def interactive() -> bool:
@@ -77,8 +92,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the dual-GPU TOML configuration, forwarded to app.py.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host app.py should bind to if started.")
+    parser.add_argument(
+        "--lan",
+        action="store_true",
+        help="Start app.py with trusted-LAN access (equivalent to --host 0.0.0.0).",
+    )
     parser.add_argument("--port", type=int, default=8090, help="Port app.py should bind to if started.")
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="Allow a browser app origin to call the API; repeat for multiple origins.",
+    )
     parser.add_argument("--data-dir", default="./chat_runs", help="Data directory forwarded to app.py.")
+    parser.add_argument(
+        "--start",
+        action="store_true",
+        help="Explicitly permit starting the service when it is not already running.",
+    )
     parser.add_argument(
         "--open-browser",
         action="store_true",
@@ -100,17 +132,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.lan and args.host in {"127.0.0.1", "localhost", "::1"}:
+        args.host = "0.0.0.0"
     probe_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
     base_url = f"http://{probe_host}:{args.port}"
 
     open_browser = wants_browser(args, interactive())
     status = _probe(base_url)
     if status is not None:
+        network = status.get("network") if isinstance(status, dict) else None
+        if args.lan and isinstance(network, dict) and not network.get("lan_enabled"):
+            print(json.dumps({
+                "started": False,
+                "already_running": True,
+                "base_url": base_url,
+                "error": "A localhost-only service is already using this port; restart it with --lan.",
+            }, indent=2))
+            return 1
         if open_browser:
             webbrowser.open(base_url)
         print(json.dumps({"already_running": True, "base_url": base_url, "status": status,
                           "host_os": os_info(), "browser_opened": open_browser}, indent=2))
         return 0
+
+    if not args.start:
+        print(json.dumps({
+            "started": False,
+            "start_blocked": True,
+            "base_url": base_url,
+            "error": "Service is not running. Pass --start to start it explicitly.",
+        }, indent=2))
+        return 2
 
     app_path = Path(__file__).with_name("app.py")
     command = [
@@ -121,6 +173,8 @@ def main() -> int:
         "--port", str(args.port),
         "--data-dir", args.data_dir,
     ]
+    for origin in args.cors_origin:
+        command.extend(["--cors-origin", origin])
     command.append("--no-browser")  # this launcher opens the tab itself, once the service is healthy
 
     log_dir = Path(args.data_dir).expanduser()

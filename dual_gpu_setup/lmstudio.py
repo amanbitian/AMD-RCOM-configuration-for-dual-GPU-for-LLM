@@ -233,7 +233,30 @@ def lane_free_vram_gb(config: AppConfig, lanes: list[LaneConfig]) -> dict[str, f
     adapters = get_host().gpu.adapter_memory()
     if adapters:
         return free_from_adapters(lanes, adapters)
-    return free_from_device_listing(config, lanes)
+    free = free_from_sysfs(lanes)
+    missing = [lane for lane in lanes if lane.key not in free]
+    if missing:  # a card the kernel files do not describe: ask llama-server for just those
+        free.update(free_from_device_listing(config, missing))
+    return free
+
+
+def free_from_sysfs(lanes: list[LaneConfig], sysfs_root: str = "/sys") -> dict[str, float]:
+    """Linux: free VRAM straight from the amdgpu kernel files the telemetry sampler already reads. The old route
+    started a `llama-server --list-devices` process, which initialises every card (waking an idle one) on each check."""
+    if not sys.platform.startswith("linux"):
+        return {}
+    from dual_gpu_setup.training.hardware import _read_int, assign_lanes, discover_gpus
+
+    gpus, _reason = discover_gpus(sysfs_root, "linux")
+    assign_lanes(gpus, lanes)
+    free: dict[str, float] = {}
+    for gpu in gpus:
+        if gpu.lane is None:
+            continue
+        total, used = _read_int(gpu.device_path / "mem_info_vram_total"), _read_int(gpu.device_path / "mem_info_vram_used")
+        if total is not None and used is not None:
+            free[gpu.lane] = max(0.0, (total - used) / 1024**3)
+    return free
 
 
 def free_from_adapters(lanes: list[LaneConfig], adapters: list[dict[str, Any]]) -> dict[str, float]:

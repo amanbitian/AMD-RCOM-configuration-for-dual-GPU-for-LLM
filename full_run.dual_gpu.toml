@@ -5,12 +5,10 @@ log_dir = "./runs"
 host = "127.0.0.1"
 cleanup_ports_on_start = true
 start_timeout_seconds = 900
-# Full-conversation archive (opt-in). When true, every request through /api/chat and the
-# OpenAI gateway is logged -- full prompts, responses, reasoning, tool calls, and token
-# counts -- to a SEPARATE SQLite file, written off the request path. The metrics database
-# stays lean and redacted. Read it back via GET /api/chat-history. Default path is
-# chat_history.sqlite3 next to the metrics DB; override with chat_history_path.
-# store_chat_history = true
+# Full per-model archive: prompts/request payloads, responses, reasoning, tool calls, token/timing
+# telemetry, and resource summaries. Written asynchronously to a separate SQLite file so the
+# inference path stays fast. Set false only when content retention is not wanted.
+store_chat_history = true
 # chat_history_path = "G:/llm-archive/chat_history.sqlite3"
 
 [discovery]
@@ -57,11 +55,11 @@ vram_admission = true
 vram_headroom_gb = 1.0
 # OpenAI gateway: a request whose "model" is a catalog model loads it on demand, evicting the
 # least recently used idle model(s). Busy models are never stopped; the caller gets 503 + retry.
-auto_load_models = true
+auto_load_models = false
 # Windows can move an idle server's VRAM into system RAM (measured: 16.85 GB -> 0 GB resident,
 # next request 10 s). The guard re-warms such servers on a reserved slot (servers start with
 # --parallel 2 --kv-unified; real requests stay on slot 0). Set false to keep one plain slot.
-residency_guard = true
+residency_guard = false
 residency_check_seconds = 15
 
 [[lanes]]
@@ -132,6 +130,11 @@ ctx_size = 151552
 parallel = 8
 extra_args = ["--kv-unified"]
 pin_lane = "r9700"
+# This file contains an embedded MTP head, but do not enable it on this 151K/8-slot
+# throughput profile without a controlled test. For a single-stream profile use:
+# spec_type = "draft-mtp"
+# draft_max = 2
+# draft_p_min = 0.1
 
 [[models]]
 name = "Qwen3.8-27B-UD-Q3_K_XL"

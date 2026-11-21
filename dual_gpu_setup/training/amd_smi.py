@@ -118,3 +118,132 @@ class AmdSmiReader:
     def close(self) -> None:
         if self.available:
             _call(self._module, "amdsmi_shut_down")
+
+def _find_throttle(node: Any) -> Any:
+    """First value stored under a key containing 'throttle', anywhere in nested JSON."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if "throttle" in str(key).lower():
+                return value
+        for value in node.values():
+            found = _find_throttle(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_throttle(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _throttle_flag(value: Any) -> int | None:
+    """Non-zero when any throttle reason is active; None for N/A. The raw bit layout differs by ASIC,
+    so only active / not active is reported."""
+    if value is None or isinstance(value, bool):
+        return None if value is None else int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "n/a", "na", "none"):
+            return None if text != "none" else 0
+        try:
+            return int(text, 0)
+        except ValueError:
+            return 1 if text not in ("0", "inactive", "false", "no") else 0
+    if isinstance(value, dict):
+        flags = [_throttle_flag(v) for v in value.values()]
+        known = [f for f in flags if f is not None]
+        return None if not known else int(any(known))
+    if isinstance(value, list):
+        return int(any(_throttle_flag(v) for v in value))
+    return None
+
+
+class AmdSmiCli:
+    """Fallback when the `amdsmi` Python module is missing: reads throttle status from the `amd-smi`
+    command (installed with ROCm). The command is slow, so it runs on a background thread every
+    `refresh_s` seconds and `merge` only reads the cached result."""
+
+    def __init__(self, binary: str, runner: Any = None, refresh_s: float = 5.0, autostart: bool = True):
+        import threading
+
+        self.binary = binary
+        self.available = True
+        self.reason: str | None = None
+        self.source = "amd-smi cli"
+        self._runner = runner or self._run
+        self._cache: dict[str, int | None] = {}
+        self._refresh_s = refresh_s
+        self._stop = threading.Event()
+        if autostart:
+            threading.Thread(target=self._loop, name="amd-smi-cli", daemon=True).start()
+
+    def _run(self, *args: str) -> Any:
+        import json
+        import subprocess
+
+        done = subprocess.run([self.binary, *args, "--json"], capture_output=True, text=True, timeout=30)
+        if done.returncode != 0:
+            raise RuntimeError((done.stderr or done.stdout or "amd-smi failed").strip()[:200])
+        return json.loads(done.stdout)
+
+    def refresh(self) -> None:
+        try:
+            listing = self._runner("list")
+            metrics = self._runner("metric")
+            if isinstance(metrics, dict):
+                metrics = metrics.get("gpu_data") or list(metrics.values())
+            by_index = {}
+            for entry in metrics if isinstance(metrics, list) else []:
+                if isinstance(entry, dict):
+                    by_index[int(entry.get("gpu", len(by_index)))] = entry
+            cache: dict[str, int | None] = {}
+            for entry in listing if isinstance(listing, list) else []:
+                bdf = str(entry.get("bdf", "")).lower()
+                if bdf:
+                    cache[bdf] = _throttle_flag(_find_throttle(by_index.get(int(entry.get("gpu", -1)), {})))
+            self._cache = cache
+            self.reason = None if any(v is not None for v in cache.values()) else "amd-smi reports throttle status as N/A on this GPU"
+        except Exception as exc:  # noqa: BLE001
+            self.reason = f"amd-smi query failed: {exc}"
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self.refresh()
+            self._stop.wait(self._refresh_s)
+
+    def read(self, pci_bus: str) -> dict[str, Any]:
+        value = self._cache.get(pci_bus.lower())
+        return {} if value is None else {"throttle_status": value}
+
+    def merge(self, sample: dict[str, Any]) -> dict[str, Any]:
+        extra = self.read(sample["pci_bus"])
+        if extra:
+            sample.update(extra)
+            sample["amd_smi_fields"] = ["throttle_status"]
+            sample.get("unavailable", {}).pop("throttle_status", None)
+        return sample
+
+    def close(self) -> None:
+        self._stop.set()
+
+
+def make_reader() -> Any:
+    """The best available AMD SMI source: the Python module, else the `amd-smi` command, else the
+    failed module reader (whose `reason` says exactly what is missing, for the health page)."""
+    import shutil
+
+    reader = AmdSmiReader()
+    if reader.available:
+        reader.source = "amdsmi python"
+        return reader
+    binary = shutil.which("amd-smi")
+    if binary:
+        fallback = AmdSmiCli(binary)
+        fallback.module_reason = reader.reason
+        return fallback
+    reader.source = None
+    return reader
+

@@ -187,3 +187,87 @@ def test_pin_lane_still_enforced_alongside_new_check(tmp_path: Path, gguf_writer
             assert "pinned" in str(exc)
     finally:
         manager.shutdown()
+
+
+# --- CPU-offloaded experts and KV-cache precision (capacity check used to ignore both) ---------------
+
+_MOE_ARCH = {
+    "general.architecture": "qwen3moe",
+    "qwen3moe.block_count": 48,
+    "qwen3moe.embedding_length": 4096,
+    "qwen3moe.attention.head_count": 32,
+    "qwen3moe.attention.head_count_kv": 4,
+    "qwen3moe.expert_count": 128,
+}
+
+
+def _write_config_with_args(tmp_path: Path, model_path: Path, size_gb: float, model_args: str, lane_vram_gb: float = 25.0) -> Path:
+    config_path = _write_config(tmp_path, model_path, size_gb, lane_vram_gb)
+    config_path.write_text(config_path.read_text(encoding="utf-8") + f"extra_args = {model_args}\n", encoding="utf-8")
+    return config_path
+
+
+def test_cache_type_arguments_are_read_and_unknown_types_fall_back_to_f16():
+    from dual_gpu_setup.orchestrator import cache_types_from_args
+
+    assert cache_types_from_args(["--cache-type-k", "q8_0", "-ctv", "Q4_0"]) == ("q8_0", "q4_0")
+    assert cache_types_from_args(["-ctk", "q8_0"], ["--cache-type-k", "f32"]) == ("f32", "f16")   # lane (last) wins
+    assert cache_types_from_args(["--cache-type-k", "nonsense"], None) == ("f16", "f16")
+
+
+def test_quantised_kv_cache_is_counted_at_its_real_size(gguf_writer):
+    from dual_gpu_setup.orchestrator import estimate_kv_cache_gb
+
+    path = gguf_writer("dense.gguf", _DENSE_ARCH)
+    f16, _ = estimate_kv_cache_gb(path, 32768)
+    q8, _ = estimate_kv_cache_gb(path, 32768, "q8_0", "q8_0")
+    mixed, _ = estimate_kv_cache_gb(path, 32768, "q8_0", "f16")
+    assert f16 == pytest.approx(4.0) and q8 == pytest.approx(4.0 * (34 / 32) / 2) and f16 > mixed > q8
+
+
+def test_experts_held_on_the_cpu_do_not_count_against_vram(tmp_path: Path, gguf_writer):
+    from dual_gpu_setup.orchestrator import offloaded_weights_gb
+
+    path = gguf_writer("moe.gguf", _MOE_ARCH)
+    assert offloaded_weights_gb(path, 59.0, ["--n-cpu-moe", "24"]) == pytest.approx(59 * 0.9 * 24 / 48)
+    assert offloaded_weights_gb(path, 59.0, ["--cpu-moe"]) == pytest.approx(59 * 0.9)
+    assert offloaded_weights_gb(path, 59.0, []) == 0.0
+    assert offloaded_weights_gb(path, 59.0, [], gpu_layers=24) == pytest.approx(59 * 0.5)          # -ngl below the layer count
+    assert offloaded_weights_gb(gguf_writer("dense.gguf", _DENSE_ARCH), 19.0, ["--n-cpu-moe", "9"]) == 0.0  # not an MoE model
+    assert offloaded_weights_gb(tmp_path / "missing.gguf", 59.0, ["--cpu-moe"]) == 0.0              # unknown stays strict
+
+
+def test_a_59gb_moe_model_with_experts_on_the_cpu_is_accepted_on_a_32gb_card(tmp_path: Path, gguf_writer):
+    model_path = gguf_writer("moe.gguf", _MOE_ARCH)
+    # 59 GB file, 90% experts, 40 of 48 layers' experts in RAM -> ~16 GB of weights in VRAM; budget 32 * 0.9 = 28.8 GB
+    accepted = make_manager(_write_config_with_args(tmp_path, model_path, 59.0, '["--n-cpu-moe", "40"]', 32.0), tmp_path)
+    try:
+        accepted._validate_profile("single_gpu", {"model": {"model": "test-model", "lane": "testlane", "context_window": 4096}})
+    finally:
+        accepted.shutdown()
+    other = tmp_path / "plain"
+    other.mkdir()
+    refused = make_manager(_write_config(other, model_path, 59.0, 32.0), other)
+    try:
+        with pytest.raises(app.AppError, match="needs 59.00 GB"):
+            refused._validate_profile("single_gpu", {"model": {"model": "test-model", "lane": "testlane", "context_window": 4096}})
+    finally:
+        refused.shutdown()
+
+
+def test_a_quantised_kv_cache_lets_a_context_fit_that_f16_would_refuse(tmp_path: Path, gguf_writer):
+    model_path = gguf_writer("dense.gguf", _DENSE_ARCH)
+    request = {"model": {"model": "test-model", "lane": "testlane", "context_window": 32768}}
+    f16 = make_manager(_write_config(tmp_path, model_path, 19.0), tmp_path)
+    try:
+        with pytest.raises(app.AppError, match="KV cache"):
+            f16._validate_profile("single_gpu", request)                   # 19 + 4.0 GB > 22.5 GB (the existing case)
+    finally:
+        f16.shutdown()
+    other = tmp_path / "q8"
+    other.mkdir()
+    q8 = make_manager(_write_config_with_args(other, model_path, 19.0, '["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]'), other)
+    try:
+        q8._validate_profile("single_gpu", request)                        # 19 + 2.1 GB fits
+    finally:
+        q8.shutdown()

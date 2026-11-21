@@ -120,3 +120,63 @@ def read_metadata(path: Path, wanted_keys: set[str] | None = None) -> dict[str, 
             else:
                 _skip_value(f, value_type)
         return metadata
+
+
+def tensor_names(path: Path) -> list[str]:
+    """Return tensor names from the GGUF header without reading tensor data."""
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != _MAGIC:
+            raise GGUFParseError(f"Not a GGUF file (bad magic {magic!r}): {path}")
+        version = _read_u32(f)
+        if version < 2:
+            raise GGUFParseError(f"Unsupported GGUF version {version}: {path}")
+        tensor_count = _read_u64(f)
+        kv_count = _read_u64(f)
+        for _ in range(kv_count):
+            _read_value(f, _STRING_TYPE)
+            _skip_value(f, _read_u32(f))
+
+        names: list[str] = []
+        for _ in range(tensor_count):
+            names.append(_read_value(f, _STRING_TYPE))
+            dimension_count = _read_u32(f)
+            for _ in range(dimension_count):
+                _read_u64(f)
+            _read_u32(f)  # tensor type
+            _read_u64(f)  # tensor-data offset
+        return names
+
+
+def has_embedded_mtp(path: Path) -> bool:
+    """Qwen GGUFs expose their embedded MTP prediction head as `*.nextn.*` tensors."""
+    return any(".nextn." in name.lower() for name in tensor_names(path))
+
+
+_FINGERPRINTS: dict[tuple[str, int, int], str] = {}
+
+
+def fingerprint(path: str | Path | None) -> str | None:
+    """Identity of a model file that does not depend on where it lives: `<size>-<sha256 of the first, middle and
+    last MiB>`. Windows and Linux see the same GGUF under different paths; matching on this keeps their run
+    history comparable. Cached per (path, size, mtime) so the hot path reads each file once."""
+    if not path:
+        return None
+    import hashlib
+    import os
+
+    try:
+        stat = os.stat(path)
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+        if key in _FINGERPRINTS:
+            return _FINGERPRINTS[key]
+        digest, chunk = hashlib.sha256(), 1024 * 1024
+        with open(path, "rb") as handle:
+            for offset in sorted({0, max(0, stat.st_size // 2 - chunk // 2), max(0, stat.st_size - chunk)}):
+                handle.seek(offset)
+                digest.update(handle.read(chunk))
+        value = f"{stat.st_size}-{digest.hexdigest()[:32]}"
+    except OSError:
+        return None
+    _FINGERPRINTS[key] = value
+    return value

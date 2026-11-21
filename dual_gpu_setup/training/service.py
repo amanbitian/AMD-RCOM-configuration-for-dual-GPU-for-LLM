@@ -13,10 +13,13 @@ from typing import Any, Callable
 
 from dual_gpu_setup.config import AppConfig
 from dual_gpu_setup.host_info import os_info
+from dual_gpu_setup.osfilter import normalize_os
 from dual_gpu_setup.scheduling.leases import LeaseError, LeaseStore
 
 from . import analysis, memory_forecast, selection
 from .benchmarks import BenchmarkRunner
+from .checkpoints import discover_checkpoints
+from .quality import ingest_metrics_jsonl, quality_series
 from .evaluation import EvalQueue
 from .hardware import HardwareSampler, map_torch_devices
 from .store import TrainingError, TrainingStore
@@ -120,6 +123,69 @@ class TrainingService:
             self.eval_queue.submit(run_id, int(payload["step"]), str(payload["path"]), designated=designated)
         return result
 
+    def scan_checkpoints(self, run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Register checkpoints found on disk that the trainer never reported (or whose report was lost).
+        The directory is the request's `directory`, else the run's own `<out_dir>/<run_name>` from its
+        recorded config. Already-registered paths are left alone and nothing is queued for evaluation."""
+        row = self.store.get_run(run_id)
+        config = row.get("config") or {}
+        directory = (payload or {}).get("directory")
+        if not directory and config.get("out_dir"):
+            directory = str(Path(str(config["out_dir"])).expanduser() / str(config.get("run_name") or row["name"]))
+        if not directory:
+            raise TrainingError("directory is required: this run recorded no out_dir in its config.")
+        known = {c["path"] for c in self.store.checkpoints(run_id)}
+        # Several runs can share one output directory (a resume continues in place). A checkpoint belongs to the run
+        # that was alive when it was written: not past that run's last step, and written inside its time window.
+        # `all: true` skips the check for a directory that only ever held this run.
+        everything = bool((payload or {}).get("all"))
+        window_start = float(row["started_at"]) - 300
+        window_end = float(row.get("finished_at") or self.store.clock()) + 900
+        added, skipped, foreign = [], 0, 0
+        for item in discover_checkpoints(directory):
+            if item["path"] in known:
+                skipped += 1
+                continue
+            last_step = int(row.get("last_step") or 0)
+            if not everything and ((last_step and item["step"] > last_step)
+                                   or not window_start <= item["mtime"] <= window_end):
+                foreign += 1
+                continue
+            self.store.add_checkpoint(run_id, item)
+            added.append({"step": item["step"], "valid": item["valid"], "path": item["path"]})
+        return {"directory": str(directory), "added": added, "already_registered": skipped, "belong_to_another_run": foreign}
+
+    def _metrics_file(self, run_id: str, payload: dict[str, Any] | None = None) -> Path | None:
+        row = self.store.get_run(run_id)
+        config = row.get("config") or {}
+        given = (payload or {}).get("path")
+        if given:
+            return Path(str(given)).expanduser()
+        if config.get("out_dir"):
+            return Path(str(config["out_dir"])).expanduser() / str(config.get("run_name") or row["name"]) / "metrics.jsonl"
+        return None
+
+    def ingest_trainer_metrics(self, run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Read validation metrics from the trainer's own metrics.jsonl (default `<out_dir>/<run_name>/metrics.jsonl`)."""
+        path = self._metrics_file(run_id, payload)
+        if path is None:
+            raise TrainingError("path is required: this run recorded no out_dir in its config.")
+        return {"path": str(path), **ingest_metrics_jsonl(self.store, run_id, path)}
+
+    def rescan_unreported_checkpoints(self) -> dict[str, int]:
+        """At startup: runs that have no checkpoints recorded but have a run directory on disk. Best effort."""
+        found: dict[str, int] = {}
+        for run in self.store.list_runs(limit=500)["runs"]:
+            try:
+                if not self.store.checkpoints(run["id"]):
+                    added = self.scan_checkpoints(run["id"])["added"]
+                    if added:
+                        found[run["id"]] = len(added)
+                self.ingest_trainer_metrics(run["id"])  # idempotent; also fills validation loss the trainer only logged locally
+            except Exception:  # noqa: BLE001 - a missing directory or odd config must not block startup
+                continue
+        return found
+
     def finish_run(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         result = self.store.finish_run(run_id, payload)
         self.leases.release_holder(f"training:{run_id}")
@@ -167,7 +233,11 @@ class TrainingService:
             return (query.get(name) or [default])[0]
 
         if path == "/api/training/runs":
-            return self.store.list_runs(int(q("limit", "100")), int(q("offset", "0")))
+            try:
+                host_os = normalize_os(q("os"))
+            except ValueError as exc:
+                raise TrainingError(str(exc)) from exc
+            return self.store.list_runs(int(q("limit", "100")), int(q("offset", "0")), host_os)
         if path == "/api/training/compare":
             ids = [i for i in (q("ids", "") or "").split(",") if i]
             if len(ids) < 2:
@@ -211,6 +281,8 @@ class TrainingService:
         if sub == "series":
             max_points = int(q("max_points", "600"))
             return {"steps": store.series(run_id, max_points), "hardware": store.hardware_series(run_id, max_points)}
+        if sub == "quality":
+            return quality_series(store, run_id, int(q("window", "100")), int(q("max_points", "800")))
         if sub == "analysis":
             return analysis.analyse_run(store, run_id, self.peak_tflops(store.get_run(run_id)), self._vram_totals())
         if sub == "alerts":
@@ -279,6 +351,12 @@ class TrainingService:
         if match:
             self.benchmarks.cancel(match.group(1))
             return {"ok": True}
+        match = re.fullmatch(r"/api/training/runs/([\w-]+)/metrics/ingest", path)
+        if match:
+            return self.ingest_trainer_metrics(match.group(1), payload)
+        match = re.fullmatch(r"/api/training/runs/([\w-]+)/checkpoints/scan", path)
+        if match:
+            return self.scan_checkpoints(match.group(1), payload)
         match = re.fullmatch(r"/api/training/runs/([\w-]+)/checkpoints/(\d+)/(designate|promote|demote)", path)
         if match:
             run_id, step, action = match.group(1), int(match.group(2)), match.group(3)

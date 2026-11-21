@@ -55,6 +55,19 @@ def test_wanted_keys_skips_everything_else(gguf_writer):
     }
 
 
+def test_tensor_inventory_detects_embedded_mtp_without_reading_data(gguf_writer):
+    path = gguf_writer(
+        "mtp.gguf",
+        {"general.architecture": "qwen35"},
+        ["blk.0.attn_q.weight", "blk.64.nextn.eh_proj.weight"],
+    )
+    assert gguf.tensor_names(path) == ["blk.0.attn_q.weight", "blk.64.nextn.eh_proj.weight"]
+    assert gguf.has_embedded_mtp(path) is True
+
+    plain = gguf_writer("plain.gguf", {"general.architecture": "qwen35"}, ["output.weight"])
+    assert gguf.has_embedded_mtp(plain) is False
+
+
 def test_bad_magic_raises(tmp_path: Path):
     path = tmp_path / "not_gguf.bin"
     path.write_bytes(b"NOPE" + b"\x00" * 20)

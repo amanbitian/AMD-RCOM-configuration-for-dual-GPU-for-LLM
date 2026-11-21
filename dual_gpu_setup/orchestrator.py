@@ -98,7 +98,65 @@ def resolve_context_window(
     return effective
 
 
-def estimate_kv_cache_gb(model_path: Path, context_size: int) -> tuple[float | None, str]:
+# Bytes per cached element for llama.cpp's --cache-type-k / --cache-type-v (block size and header included).
+CACHE_TYPE_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+                    "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
+
+
+def cache_types_from_args(*arg_lists: list[str] | None) -> tuple[str, str]:
+    """(K type, V type) a llama-server command line will use: the last `--cache-type-k/-ctk` and
+    `--cache-type-v/-ctv` found in the given argument lists (model first, lane last wins); f16 when absent.
+    An unknown type is treated as f16, the llama.cpp default, which can only over-estimate."""
+    k = v = "f16"
+    for args in arg_lists:
+        args = [str(a) for a in (args or [])]
+        for index, arg in enumerate(args[:-1]):
+            if arg in ("--cache-type-k", "-ctk"):
+                k = args[index + 1].lower()
+            elif arg in ("--cache-type-v", "-ctv"):
+                v = args[index + 1].lower()
+    return (k if k in CACHE_TYPE_BYTES else "f16"), (v if v in CACHE_TYPE_BYTES else "f16")
+
+
+def offloaded_weights_gb(model_path: Path, size_gb: float, *arg_lists: list[str] | None, gpu_layers: int | None = None) -> float:
+    """Weights that stay in system RAM instead of VRAM: `--cpu-moe` / `--n-cpu-moe N` keep the expert tensors of
+    N (or all) layers on the CPU, and `-ngl N` below the layer count keeps whole layers there. The capacity check
+    used to count the entire file, which refused a 59 GB mixture-of-experts model that runs fine with its experts
+    on the CPU. Returns 0 whenever the layer count is unknown, so the check stays as strict as before."""
+    args: list[str] = [str(a) for lst in arg_lists for a in (lst or [])]
+    try:
+        meta = gguf.read_metadata(model_path, wanted_keys=None)
+    except (OSError, gguf.GGUFParseError):
+        return 0.0
+    arch = meta.get("general.architecture")
+    layers = meta.get(f"{arch}.block_count") if arch else None
+    if not layers:
+        return 0.0
+    moe_layers = 0
+    for index, arg in enumerate(args):
+        if arg == "--cpu-moe":
+            moe_layers = layers
+        elif arg == "--n-cpu-moe" and index + 1 < len(args):
+            try:
+                moe_layers = max(0, min(layers, int(args[index + 1])))
+            except ValueError:
+                pass
+    expert_share = 0.9 if meta.get(f"{arch}.expert_count") else 0.0  # experts are most of an MoE model's bytes
+    offloaded = size_gb * expert_share * moe_layers / layers
+    ngl = gpu_layers
+    for index, arg in enumerate(args[:-1]):
+        if arg in ("-ngl", "--n-gpu-layers", "--gpu-layers"):
+            try:
+                ngl = int(args[index + 1])
+            except ValueError:
+                pass
+    if ngl is not None and 0 <= ngl < layers:
+        offloaded += (size_gb - offloaded) * (1 - ngl / layers)
+    return max(0.0, min(size_gb, offloaded))
+
+
+def estimate_kv_cache_gb(model_path: Path, context_size: int, cache_type_k: str = "f16",
+                         cache_type_v: str = "f16") -> tuple[float | None, str]:
     """Best-effort KV-cache VRAM estimate from a model's own GGUF architecture metadata.
 
     Returns (estimate_gb, note). `estimate_gb` is None when the architecture has a feature
@@ -150,13 +208,14 @@ def estimate_kv_cache_gb(model_path: Path, context_size: int) -> tuple[float | N
     if not (sliding_window and isinstance(pattern, list) and len(pattern) == n_layers):
         pattern = None  # no usable per-layer pattern -- treat every layer as full context
 
-    bytes_per_element = 2  # llama.cpp's default fp16 KV cache
+    bytes_k = CACHE_TYPE_BYTES.get(cache_type_k, 2.0)  # llama.cpp's default is an fp16 cache
+    bytes_v = CACHE_TYPE_BYTES.get(cache_type_v, 2.0)
     total_bytes = 0.0
     for index in range(n_layers):
         effective_ctx = context_size
         if pattern is not None and pattern[index]:
             effective_ctx = min(context_size, sliding_window)
-        total_bytes += bytes_per_element * kv_heads_per_layer[index] * (key_length + value_length) * effective_ctx
+        total_bytes += kv_heads_per_layer[index] * (bytes_k * key_length + bytes_v * value_length) * effective_ctx
     return total_bytes / 1024**3, "ok"
 
 

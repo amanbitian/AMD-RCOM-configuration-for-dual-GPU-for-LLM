@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -323,7 +324,7 @@ def test_dashboard_date_range_filters_runs_and_daily(tmp_path: Path):
     scoped = store.dashboard(start_date="2026-10-05", end_date="2026-10-09")  # inclusive both ends
     assert scoped["summary"]["total_runs"] == 2
     assert {bucket["date"] for bucket in scoped["daily"]} == {"2026-10-05", "2026-10-09"}
-    assert scoped["filters"] == {"start_date": "2026-10-05", "end_date": "2026-10-09"}
+    assert scoped["filters"] == {"start_date": "2026-10-05", "end_date": "2026-10-09", "os": None}
     # End date includes its whole day; start/end may be given alone; no filter sees everything.
     assert store.dashboard(end_date="2026-10-01")["summary"]["total_runs"] == 1
     assert store.dashboard(start_date="2026-10-05")["summary"]["total_runs"] == 2
@@ -380,7 +381,10 @@ def test_chat_history_archives_content_and_scalar_tokens(tmp_path: Path):
         "usage": {"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20,
                   "thinking_tokens": 5, "total_tokens": 120},
         "timing": {"tokens_per_second": 25.0, "end_to_end_duration_ms": 900.0},
-        "finish_reason": "stop", "messages": [{"role": "user", "content": "hi"}],
+        "finish_reason": "stop", "status": "completed",
+        "request": {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        "resources": {"avg_gpu_utilization_pct": 75.0},
+        "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function"}], "output_text": "hello", "reasoning_text": "think",
         "tool_calls": [{"function": {"name": "read", "arguments": "{}"}}],
     })
@@ -394,13 +398,69 @@ def test_chat_history_archives_content_and_scalar_tokens(tmp_path: Path):
 
     full = history.query(include_content=True)[0]
     assert full["messages"] == [{"role": "user", "content": "hi"}]
+    assert full["request"]["model"] == "m"
+    assert full["resources"]["avg_gpu_utilization_pct"] == 75.0
+    assert full["status"] == "completed"
     assert full["output_text"] == "hello" and full["reasoning_text"] == "think"
     assert full["tool_calls"][0]["function"]["name"] == "read"
 
     assert history.query(project_id="p1") and history.query(project_id="nope") == []
+    assert history.query(model_name="m", target="r9700", status="completed")
+    assert history.query(model_name="other") == []
     assert history.query(start_date="2026-10-09", end_date="2026-10-09")  # end date inclusive
     assert history.query(end_date="2026-10-08") == []
     history.close()
+
+
+def test_chat_history_migrates_existing_database(tmp_path: Path):
+    path = tmp_path / "old.sqlite3"
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("""
+            CREATE TABLE chat_turns (
+                id TEXT PRIMARY KEY, created_at TEXT NOT NULL, project_id TEXT, client_id TEXT,
+                agent_role TEXT, agent_session_id TEXT, coding_task_id TEXT, model_name TEXT,
+                target TEXT, workload_kind TEXT, input_tokens INTEGER, cached_input_tokens INTEGER,
+                output_tokens INTEGER, thinking_tokens INTEGER, total_tokens INTEGER,
+                tokens_per_second REAL, latency_ms REAL, finish_reason TEXT, messages_json TEXT,
+                tools_json TEXT, output_text TEXT, reasoning_text TEXT, tool_calls_json TEXT
+            )
+        """)
+
+    history = app.ChatHistoryStore(path, enabled=True)
+    history.enqueue({
+        "id": "new", "created_at": "2026-11-12T00:00:00+00:00", "status": "completed",
+        "request": {"prompt": "hello"}, "resources": {"gpu": 1}, "output_text": "world",
+    })
+    history.flush()
+    row = history.query(include_content=True)[0]
+    assert row["request"] == {"prompt": "hello"}
+    assert row["resources"] == {"gpu": 1}
+    assert row["output_text"] == "world"
+    history.close()
+
+
+def test_chat_history_falls_back_to_jsonl_after_sqlite_failure(tmp_path: Path, monkeypatch):
+    import sqlite3
+
+    path = tmp_path / "history.sqlite3"
+    history = app.ChatHistoryStore(path, enabled=True)
+    history.close()
+    monkeypatch.setattr(
+        history,
+        "connect",
+        lambda: (_ for _ in ()).throw(sqlite3.OperationalError("database unavailable")),
+    )
+
+    history._flush([{
+        "id": "fallback", "created_at": "2026-11-12T00:00:00+00:00",
+        "request": {"prompt": "keep me"}, "output_text": "kept",
+    }])
+
+    fallback = tmp_path / "history.fallback.jsonl"
+    saved = json.loads(fallback.read_text(encoding="utf-8").splitlines()[0])
+    assert saved["request"]["prompt"] == "keep me" and saved["output_text"] == "kept"
 
 
 def test_serving_reports_concurrency_including_the_new_request():

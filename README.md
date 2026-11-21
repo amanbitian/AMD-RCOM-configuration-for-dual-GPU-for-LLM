@@ -59,7 +59,7 @@ The web app ([app.py](app.py)) gives you a full local console for loading, chatt
 
 ![Service page with the running process, a model loaded on each GPU with the requests it is answering, and the loading and memory policy settings](docs/screenshots/service.png)
 
-**Setup wizard** — a first-run guide, opened from any page's header. It walks through four steps: connect a project, choose GPUs, set up the coding agents, and confirm. The project step creates the project record and the shared key both coding agents use. Project prompts and completions from coding agents are redacted by default, while performance telemetry is kept.
+**Setup wizard** — a first-run guide, opened from any page's header. It walks through four steps: connect a project, choose GPUs, set up the coding agents, and confirm. The project step creates the project record and the shared key both coding agents use. The metrics DB keeps redacted coding content plus performance telemetry; the separate per-model archive keeps complete API inputs, outputs, and telemetry by default.
 
 ![First-run setup wizard, step 1, asking for a project name, repository path, optional git remote and metrics file](docs/screenshots/setup-wizard.png)
 
@@ -139,7 +139,7 @@ The **Service** page runs everything that would otherwise need a terminal:
 
 - **Restart service** stops the models, starts a fresh process on the same port, and (optionally)
   loads the same models again. The page reconnects by itself. **Stop service** stops everything; start
-  it again with `python launch_service.py`.
+  it again with `python launch_service.py --start`.
 - **Loaded models** lists each GPU's model with its llama.cpp build, how much of it is in VRAM and how many
   requests it is answering, and unloads one GPU while the other keeps running. **Unload everything** frees
   both GPUs. A model that is mid-answer gets up to 30 s to finish; a bar at the top of every page says so
@@ -318,13 +318,16 @@ Dual GPU Studio is running
 ```
 
 The default browser opens at `http://127.0.0.1:8090`. Use `--no-browser` to prevent automatic browser launch, or choose another UI port with `--port`.
-(`launch_service.py` starts the same service in the background and opens the browser when you run it from a terminal; a program launching it gets no browser.)
+(`launch_service.py --start` starts the same service in the background and opens the browser when you run it from a terminal; without `--start` it never launches a stopped service.)
 
 ```powershell
 python .\app.py --config .\example.dual_gpu.toml --port 8095 --no-browser
 ```
 
-To deliberately allow LAN access, pass `--host 0.0.0.0` and follow [local_network_setup.md](local_network_setup.md).
+To deliberately allow LAN access, pass `--lan` (equivalent to `--host 0.0.0.0`) and follow
+[local_network_setup.md](local_network_setup.md). Other applications can discover the advertised
+OpenAI-compatible URL with `GET /api/health`; use `--cors-origin <origin>` when the caller is a
+browser app hosted on another origin.
 
 The run database (`chat_runs/chatbot.sqlite3`) keeps every run and resource sample forever by
 default — there's no automatic retention policy. To prune old data, pass
@@ -344,6 +347,8 @@ The app provides:
 - separate selectable entries for every installed quantization, with model search and fit warnings;
 - editable context-window and Low/Medium/High reasoning-budget controls;
 - persistent prompts, responses, token usage, timings, and resource summaries in `chat_runs/chatbot.sqlite3`;
+- an asynchronous full per-model archive in `chat_runs/chat_history.sqlite3`, covering chat,
+  streaming chat, completions, and infill without blocking inference;
 - persisted deployment records and raw per-run resource samples for later auditing;
 - live process CPU, process/system RAM, dedicated VRAM, and shared GPU-memory status;
 - an Overview dashboard with token, throughput, latency, model, activity, and resource figures;
@@ -985,13 +990,13 @@ is a one-shot command (not an always-on daemon) that starts it if needed and exi
 healthy:
 
 ```powershell
-python launch_service.py --config .\example.dual_gpu.toml
+python launch_service.py --start --config .\example.dual_gpu.toml
 ```
 
 On Ubuntu, use your edited Linux config (or omit `--config` to select the Ubuntu example):
 
 ```bash
-python3 launch_service.py --config ./dual_gpu.toml
+python3 launch_service.py --start --config ./dual_gpu.toml
 ```
 
 ### Integration Option 7: Connect from curl or Postman

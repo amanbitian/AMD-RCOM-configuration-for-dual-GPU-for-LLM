@@ -1,9 +1,16 @@
 # Client Integration API
 
-Any other codebase running on this machine can drive the dual-GPU orchestrator over
-plain HTTP while `app.py` is running (default `http://127.0.0.1:8090`). This is
+Any other codebase on this machine or a trusted computer on the same LAN can drive the
+dual-GPU orchestrator over plain HTTP while `app.py` is running (default
+`http://127.0.0.1:8090`). This is
 additive to the existing dashboard UI — the UI keeps using `/api/deploy`, `/api/chat`,
 etc. exactly as before. Nothing below changes how metrics are computed.
+
+For a remote computer, start the GPU host with `app.py --lan` (or `--host 0.0.0.0`) and
+discover the correct address with `GET /api/health`. Use the returned `network.advertised_urls`
+value as the base host and append `/v1` for OpenAI-compatible clients. The remote computer
+does not need the models or GPU drivers; both GPUs remain on the host. `--lan` exposes the
+gateway only, while the individual llama-server ports remain loopback-only.
 
 This is a walkthrough of the flow. For the exhaustive field-by-field request/response
 reference of every endpoint (this one and the rest of the app's API), see
@@ -17,16 +24,40 @@ lane-pinned streaming gateway URLs, see [CODING_AGENTS.md](CODING_AGENTS.md).
 Every endpoint below needs `app.py` already running — there's no HTTP "start" endpoint,
 because if the service is down there's nothing listening to receive that request. If your
 codebase wants to trigger the service on demand rather than assuming a human already started
-it, run [launch_service.py](launch_service.py) as a command before calling anything else:
+it, run [launch_service.py](launch_service.py) with the explicit `--start` flag:
 
 ```bash
 # Windows or Ubuntu; omitting --config selects the OS-specific example.
-python launch_service.py --config /path/to/dual_gpu.toml
+python launch_service.py --start --config /path/to/dual_gpu.toml
 ```
 
+For a GPU host serving another computer on the LAN:
+
+```bash
+python launch_service.py --start --lan --config /path/to/dual_gpu.toml --no-browser
+```
+
+For a browser app on a different origin, add `--cors-origin http://client-host:3000` (repeat it
+for each allowed origin). CORS is not needed for native Python, .NET, Java, or similar clients.
+
+The first request from a remote client should be:
+
+```text
+GET http://<gpu-host-ip>:8090/api/health
+```
+
+It returns `api_version`, `ready`, and `network.openai_base_url`/`network.advertised_urls`.
+
+Every inference request is attributed to its resolved model and retained in the asynchronous
+per-model archive by default. Query `GET /api/chat-history?content=1` for the complete request,
+output, status/error, token/timing data, and resource summary. `X-DGPU-No-History: true` opts one
+sensitive request out without disabling aggregate telemetry.
+Use `model_name`, `target`, and `status` query parameters to retrieve one model/GPU/result class.
+
 This is a one-shot command, not an always-on daemon: it checks whether the service is already
-healthy at the given host/port and exits immediately if so; otherwise it starts `app.py` as a
-detached background process, waits until it reports healthy, prints its `base_url`, and exits.
+healthy at the given host/port and exits immediately if so. When the service is down it is
+status-only unless `--start` is present; with that explicit flag it starts `app.py` as a detached
+background process, waits until it reports healthy, prints its `base_url`, and exits.
 The service itself keeps running after the launcher exits — the launcher does not stay
 resident. Safe to call before every session; it's idempotent. Run by hand from a terminal it also
 opens the UI in your browser; a program launching it (no terminal) gets none, and `--open-browser` /
@@ -41,7 +72,7 @@ from pathlib import Path
 repo = Path("/path/to/Dual_gpu_setup")
 config = Path("/path/to/dual_gpu.toml")
 result = subprocess.run(
-    [sys.executable, str(repo / "launch_service.py"), "--config", str(config)],
+    [sys.executable, str(repo / "launch_service.py"), "--start", "--config", str(config)],
     capture_output=True, text=True, check=True,
 )
 base_url = json.loads(result.stdout)["base_url"]  # e.g. http://127.0.0.1:8090

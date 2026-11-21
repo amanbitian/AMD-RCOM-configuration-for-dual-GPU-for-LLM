@@ -33,13 +33,13 @@ Only the Dual GPU Studio web port needs to be reachable from the client. The und
 From the project directory on Windows, run:
 
 ```powershell
-python .\app.py --config .\example.dual_gpu.toml --host 0.0.0.0
+python .\app.py --config .\example.dual_gpu.toml --lan
 ```
 
 On Ubuntu, use the edited native llama.cpp config:
 
 ```bash
-python3 app.py --config ./dual_gpu.toml --host 0.0.0.0 --port 8090 --no-browser
+python3 app.py --config ./dual_gpu.toml --lan --port 8090 --no-browser
 ```
 
 The terminal prints the local address and one or more detected local-network addresses. Open a displayed **Local network** URL on the client.
@@ -49,14 +49,15 @@ The equivalent explicit command is:
 ```powershell
 python .\app.py `
   --config .\example.dual_gpu.toml `
-  --host 0.0.0.0 `
+  --lan `
   --port 8090 `
   --no-browser
 ```
 
 What these options mean:
 
-- `--host 0.0.0.0` makes the web application listen on all host network interfaces.
+- `--lan` makes the web application listen on all host network interfaces (equivalent to
+  `--host 0.0.0.0`).
 - `--port 8090` exposes the web application on TCP port 8090.
 - `--no-browser` prevents the host from opening a local browser automatically.
 - `--config` selects the GPU, model, and runtime configuration.

@@ -70,7 +70,7 @@ Model:    r9700
 The URL pins Cline to the `r9700` lane and records its role as `developer`. Streaming is relayed
 without waiting for the whole completion. Coding prompts and completions are redacted from the
 telemetry database by default; token counts, timing, model identity, project, lane, and GPU samples
-are still stored.
+are still stored there. The separate per-model archive retains full inputs and outputs by default.
 
 ## 4. Configure OpenCode as QA/reviewer
 
@@ -141,8 +141,9 @@ X-DGPU-Task-Label: <free-form category>
 X-DGPU-Capture-Content: true
 ```
 
-`X-DGPU-Capture-Content` is opt-in. Without it, coding-agent prompt and completion contents are not
-persisted.
+`X-DGPU-Capture-Content` is opt-in for the metrics database. Without it, coding-agent content stays
+redacted there, while the separate per-model archive still retains full content unless the request
+sends `X-DGPU-No-History: true`.
 
 ## What the dashboard tracks
 
@@ -179,6 +180,24 @@ until their native choices are identifiable; we do not invent effort-to-token ma
 
 ## Speculative decoding (faster responses, same output)
 
+Qwen3.8 GGUFs can carry an embedded MTP prediction head. When the file contains
+`*.nextn.*` tensors, enable it without a second model file:
+
+```toml
+[[models]]
+name = "Qwen3.8-27B-MTP"
+path = ".../Qwen3.8-27B-Q4_K_M.gguf"
+spec_type = "draft-mtp"
+draft_max = 2
+draft_p_min = 0.1
+```
+
+Deployment inspects the GGUF tensor inventory and refuses `draft-mtp` when the embedded head
+is absent. Start with one serving slot and benchmark widths 2-4 on real prompts before combining
+MTP with a large shared context or high parallelism. The runtime must support `--spec-type`.
+
+An external draft remains available for models without an embedded prediction head:
+
 To raise tokens/sec without changing accuracy, pair a model with a small **draft model** on
 the same GPU lane. The draft proposes tokens and the target model verifies each one, so the
 generated text is identical to running the target alone — only throughput changes. The draft
@@ -198,8 +217,8 @@ draft_p_min = 0.0     # optional; min draft-token probability to keep speculatin
 draft_gpu_layers = 999  # optional; draft layers on GPU (defaults to policy.gpu_layers)
 ```
 
-These map to llama-server `--model-draft`, `--gpu-layers-draft`, `--device-draft` (pinned to
-the target's lane), `--draft-max`, `--draft-min`, and `--draft-p-min`. The draft's footprint
+These map to llama-server's modern `--spec-draft-*` arguments (or compatible legacy spellings
+for older runtimes), with the draft pinned to the target's lane. The draft's footprint
 is added to the lane's VRAM budget when the context window is auto-sized (an explicit
 `context_window` still wins — size it yourself if you set one). Deploy fails fast if the draft
 file is missing.
@@ -241,11 +260,11 @@ Two databases, by design:
 - **Metrics DB** (`chatbot.sqlite3`) — always on. Token counts, timing, resources, and
   configuration for every run. Prompts and responses are **redacted** here unless a caller
   sends `X-DGPU-Capture-Content: true`. This keeps it small and the dashboard fast.
-- **Conversation archive** (`chat_history.sqlite3`, opt-in) — the full history of every app
+- **Per-model archive** (`chat_history.sqlite3`, enabled by default) — the full history of every app
   that uses this repo: complete input messages, tool schemas, output text, reasoning, tool
   calls, plus the same token counts, in their own file.
 
-Enable it in the TOML:
+It is enabled by default; the explicit TOML setting is:
 
 ```toml
 [project]
@@ -253,11 +272,11 @@ store_chat_history = true
 # chat_history_path = "G:/llm-archive/chat_history.sqlite3"  # optional; default is next to the metrics DB
 ```
 
-**It never slows inference.** Writes go through an in-memory queue to a background worker that
+**It does not block inference.** Writes go through an in-memory queue to a background worker that
 batches the commits; the request path only does an O(1) enqueue, and JSON serialization plus
-the DB write happen off-thread. If the queue ever fills, records are dropped rather than
-applying backpressure to a model request. A per-request `X-DGPU-No-History: true` header (or
-`"store_history": false` in an `/api/chat` body) skips archiving a sensitive turn.
+the DB write happen off-thread. SQLite failures are retried and then written to
+`chat_history.fallback.jsonl` rather than dropped. A per-request `X-DGPU-No-History: true` header
+(or `"store_history": false` in an inference body) skips archiving a sensitive turn.
 
 **Read it back** with `GET /api/chat-history` — query params `project_id`, `start_date` /
 `end_date` (YYYY-MM-DD, inclusive), `limit`, `offset`, and `content=1` to include the full

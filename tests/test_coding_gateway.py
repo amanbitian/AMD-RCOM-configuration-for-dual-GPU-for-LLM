@@ -13,6 +13,7 @@ import pytest
 
 import app
 from dual_gpu_setup.config import LaneConfig, ModelConfig, load_config
+from dual_gpu_setup.lmstudio import RuntimeInfo
 from dual_gpu_setup.server import LlamaServerProcess
 
 
@@ -68,6 +69,8 @@ def test_stream_preserves_tool_calls_and_usage_without_blocking_sampling(gateway
     assert sent["stream_options"]["include_usage"] is True
     assert "stream_options" not in payload
     assert handler.wfile.getvalue() == wire
+    assert any(call.args == ("X-DGPU-API-Version", app.API_VERSION)
+               for call in handler.send_header.call_args_list)
     run = store.get(store.recent(1)[0]["id"])
     assert run["status"] == "completed"
     assert run["finish_reason"] == "tool_calls"
@@ -237,6 +240,34 @@ def test_no_draft_flags_when_speculation_disabled(tmp_path, monkeypatch):
     assert "--device-draft" not in command
 
 
+def test_embedded_mtp_uses_modern_runtime_flags(tmp_path, monkeypatch):
+    config = load_config(Path(__file__).resolve().parents[1] / "example.dual_gpu.toml")
+    model_path = tmp_path / "model.gguf"
+    model_path.touch()
+    model = ModelConfig(
+        "test", str(model_path), spec_type="draft-mtp", draft_max=2, draft_p_min=0.1
+    )
+    modern_flags = frozenset({
+        "--spec-type", "--spec-draft-n-max", "--spec-draft-n-min",
+        "--spec-draft-p-min", "--fit", "--load-mode", "--cache-ram",
+    })
+    monkeypatch.setattr(
+        LlamaServerProcess,
+        "runtime",
+        lambda _: RuntimeInfo("llama-server.exe", "llama.cpp", flags=modern_flags),
+    )
+    process = LlamaServerProcess(
+        config=config, backend="rocm", device="ROCm0", port=8081, model=model,
+        model_path=model_path, ctx_size=16384, host="127.0.0.1", run_dir=tmp_path,
+    )
+    command = process.build_command()
+    assert command[command.index("--spec-type") + 1] == "draft-mtp"
+    assert command[command.index("--spec-draft-n-max") + 1] == "2"
+    assert command[command.index("--spec-draft-p-min") + 1] == "0.1"
+    assert "--model-draft" not in command
+    assert "--spec-draft-model" not in command
+
+
 def test_speculative_acceptance_rate_from_backend_timings():
     timing = app.ChatService._normalize_timing(
         {"timings": {"predicted_ms": 1000, "draft_n": 20, "draft_n_accepted": 15}},
@@ -353,6 +384,60 @@ def test_completions_proxy_forwards_to_lane_without_recording_a_run(gateway, mon
     # Autocomplete must stay cheap: no run row, no GPU sampling, no history overhead.
     assert store.count_runs() == 0
     sampler.capture.assert_not_called()
+
+
+def test_completions_archive_full_request_output_and_telemetry(gateway, monkeypatch, tmp_path):
+    handler, store, sampler = gateway
+    history = app.ChatHistoryStore(tmp_path / "autocomplete.sqlite3", enabled=True)
+    handler.server.app_state.chat.history = history
+    body = json.dumps({
+        "choices": [{"text": "print(1)", "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        "timings": {"predicted_ms": 100},
+    }).encode()
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(body)))
+
+    handler._proxy_openai_completions(
+        "/v1/r9700/autocomplete/completions", {"prompt": "def f():", "max_tokens": 8}
+    )
+    history.flush()
+
+    turn = history.query(include_content=True)[0]
+    assert turn["model_name"] == "test-model" and turn["target"] == "r9700"
+    assert turn["request"]["prompt"] == "def f():"
+    assert turn["output_text"] == "print(1)"
+    assert turn["input_tokens"] == 5 and turn["output_tokens"] == 3
+    assert turn["status"] == "completed" and isinstance(turn["resources"], dict)
+    assert any(call.args == ("X-DGPU-Run-ID", turn["id"]) for call in handler.send_header.call_args_list)
+    assert any(call.args == ("X-DGPU-API-Version", app.API_VERSION)
+               for call in handler.send_header.call_args_list)
+    assert store.count_runs() == 0  # high-frequency autocomplete stays out of the synchronous metrics DB
+    sampler.capture.assert_not_called()
+    history.close()
+
+
+def test_streamed_completions_archive_reassembled_output(gateway, monkeypatch, tmp_path):
+    handler, _store, _sampler = gateway
+    history = app.ChatHistoryStore(tmp_path / "autocomplete-stream.sqlite3", enabled=True)
+    handler.server.app_state.chat.history = history
+    wire = (
+        b'data: {"choices":[{"text":"pri"}]}\n\n'
+        b'data: {"choices":[{"text":"nt(1)","finish_reason":"stop"}],'
+        b'"usage":{"prompt_tokens":5,"completion_tokens":3}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    monkeypatch.setattr(app.urlrequest, "urlopen", Mock(return_value=io.BytesIO(wire)))
+
+    handler._proxy_openai_completions(
+        "/v1/r9700/autocomplete/completions", {"prompt": "def f():", "stream": True}
+    )
+    history.flush()
+
+    turn = history.query(include_content=True)[0]
+    assert turn["output_text"] == "print(1)"
+    assert turn["input_tokens"] == 5 and turn["output_tokens"] == 3
+    assert turn["finish_reason"] == "stop"
+    history.close()
 
 
 def test_infill_proxy_hits_infill_endpoint(gateway, monkeypatch):

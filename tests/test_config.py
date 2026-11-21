@@ -45,6 +45,7 @@ def test_loads_with_every_optional_field_omitted(tmp_path: Path):
 
     assert config.project.name == "dual-gpu"
     assert config.project.host == "127.0.0.1"
+    assert config.project.store_chat_history is True
     assert config.policy.reasoning_budget == 0
     assert config.policy.ctx_max == 49152
     assert config.policy.health_poll_seconds == 1.0
@@ -53,6 +54,7 @@ def test_loads_with_every_optional_field_omitted(tmp_path: Path):
     assert config.models[0].name == "test-model"
     # Speculative-decoding defaults: disabled, with backend-default knobs.
     assert config.models[0].draft_model == ""
+    assert config.models[0].spec_type == ""
     assert config.models[0].draft_max == 0
     assert config.models[0].draft_gpu_layers is None
 
@@ -77,6 +79,7 @@ port = 19002
 name = "test-model"
 path = "test.gguf"
 draft_model = "draft.gguf"
+spec_type = "draft-simple"
 draft_max = 8
 draft_min = 2
 draft_p_min = 0.9
@@ -86,10 +89,43 @@ draft_gpu_layers = 48
     )
     model = load_config(config_path).models[0]
     assert model.draft_model.endswith("draft.gguf")
+    assert model.spec_type == "draft-simple"
     assert model.draft_max == 8
     assert model.draft_min == 2
     assert model.draft_p_min == 0.9
     assert model.draft_gpu_layers == 48
+
+
+def test_embedded_mtp_fields_parse_without_external_draft(tmp_path: Path):
+    config_path = tmp_path / "mtp.toml"
+    config_path.write_text(
+        """
+[[lanes]]
+key = "a"
+display = "A"
+vram_gb = 32
+port = 19001
+
+[[lanes]]
+key = "b"
+display = "B"
+vram_gb = 16
+port = 19002
+
+[[models]]
+name = "qwen-mtp"
+path = "qwen.gguf"
+spec_type = "draft-mtp"
+draft_max = 2
+draft_p_min = 0.1
+""",
+        encoding="utf-8",
+    )
+    model = load_config(config_path).models[0]
+    assert model.spec_type == "draft-mtp"
+    assert model.draft_model == ""
+    assert model.draft_max == 2
+    assert model.draft_p_min == 0.1
 
 
 def test_discovery_paths_expand_environment_and_resolve_from_config(tmp_path: Path, monkeypatch):
@@ -112,23 +148,19 @@ def test_discovery_paths_expand_environment_and_resolve_from_config(tmp_path: Pa
 
 
 def test_wrong_lane_count_rejected(tmp_path: Path):
-    config_path = tmp_path / "one_lane.toml"
-    config_path.write_text(
-        """
-[[lanes]]
-key = "a"
-display = "A"
-vram_gb = 16
-port = 19001
+    """One lane is allowed (start with a single GPU present); none or more than two is rejected."""
+    lane = '[[lanes]]\nkey = "{k}"\ndisplay = "{k}"\nvram_gb = 16\nport = {p}\n\n'
+    model = '[[models]]\nname = "test-model"\npath = "test.gguf"\n'
+    config_path = tmp_path / "lanes.toml"
 
-[[models]]
-name = "test-model"
-path = "test.gguf"
-""",
-        encoding="utf-8",
-    )
-    with pytest.raises(SystemExit):
-        load_config(config_path)
+    def load(count: int):
+        config_path.write_text("".join(lane.format(k=f"l{i}", p=19001 + i) for i in range(count)) + model, encoding="utf-8")
+        return load_config(config_path)
+
+    assert len(load(1).lanes) == 1 and len(load(2).lanes) == 2
+    for bad in (0, 3):
+        with pytest.raises(SystemExit):
+            load(bad)
 
 
 def test_pinned_model_to_unknown_lane_rejected(tmp_path: Path):
